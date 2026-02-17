@@ -13,6 +13,7 @@ os.chdir(root_dir)
 
 # Import the full FastAPI app
 from main import app
+from mangum import Mangum
 
-# Export for Vercel
-handler = app
+# Wrap FastAPI app with Mangum for serverless compatibility
+handler = Mangum(app, lifespan="off")
