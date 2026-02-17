@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     TWITTER_ACCESS_SECRET: str = ""
     TWITTER_BEARER_TOKEN: str = ""
     
+    # LinkedIn
+    LINKEDIN_ACCESS_TOKEN: str = ""
+    LINKEDIN_ORG_ID: str = ""
+    
+    # Google Analytics 4
+    GA4_PROPERTY_ID: str = ""
+    
     # Database
     DATABASE_URL: str = "postgresql://localhost:5432/sama"
     PGVECTOR_ENABLED: bool = True

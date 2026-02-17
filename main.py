@@ -11,7 +11,7 @@ from typing import AsyncGenerator
 
 from api.routes import (
     seo, content, ads, social, reviews, analytics, orchestrator, automation,
-    seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts
+    seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts, improvements
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -95,6 +95,7 @@ app.include_router(reviews_advanced.router, prefix="/api/reviews", tags=["review
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(automation.router, prefix="/api/automation", tags=["automation"])
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
+app.include_router(improvements.router, prefix="/api", tags=["improvements"])
 
 
 @app.get("/")
