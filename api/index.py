@@ -1,19 +1,34 @@
 """
 Vercel Serverless Entry Point for SAMA 2.0
-Wraps the FastAPI app for Vercel deployment
+Minimal version to test deployment
 """
 
-import sys
-import os
-from pathlib import Path
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-# Add parent directory to path for imports
-root_dir = str(Path(__file__).parent.parent)
-sys.path.insert(0, root_dir)
-os.chdir(root_dir)
+# Create minimal app
+app = FastAPI(title="SAMA 2.0", version="2.0.0")
 
-# Import the FastAPI app
-from main import app
+# CORS - allow all
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {
+        "service": "SAMA 2.0",
+        "status": "operational",
+        "version": "2.0.0-minimal"
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 # Export for Vercel
 handler = app
