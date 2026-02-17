@@ -36,23 +36,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:
         logger.warning(f"⚠️ Supabase not configured: {e}")
     
-    # Initialize event bus (optional)
-    try:
-        from shared.event_bus import EventBus
-        event_bus = EventBus()
-        await event_bus.connect()
-        logger.info("✅ Event bus connected")
-    except Exception as e:
-        logger.warning(f"⚠️ Event bus not available: {e}")
-        event_bus = None
+    # Initialize event bus (optional) - skip for now to ensure startup
+    event_bus = None
+    logger.info("⚠️ Event bus skipped (optional)")
     
-    # Setup monitoring (optional)
-    try:
-        from shared.monitoring import setup_monitoring
-        setup_monitoring()
-        logger.info("✅ Monitoring configured")
-    except Exception as e:
-        logger.warning(f"⚠️ Monitoring not configured: {e}")
+    # Setup monitoring (optional) - skip for now to ensure startup
+    logger.info("⚠️ Monitoring skipped (optional)")
     
     logger.info("🎯 SAMA 2.0 is ready!")
     
