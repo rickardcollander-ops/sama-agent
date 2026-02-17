@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import logging
 from typing import AsyncGenerator
 
-from api.routes import seo, content, ads, social, reviews, analytics, orchestrator
+from api.routes import seo, content, ads, social, reviews, analytics, orchestrator, automation
 from shared.config import settings
 from shared.database import init_db, get_supabase
 
@@ -86,6 +86,7 @@ app.include_router(ads.router, prefix="/api/ads", tags=["ads"])
 app.include_router(social.router, prefix="/api/social", tags=["social"])
 app.include_router(reviews.router, prefix="/api/reviews", tags=["reviews"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
+app.include_router(automation.router, prefix="/api/automation", tags=["automation"])
 
 
 @app.get("/")
