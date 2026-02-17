@@ -10,5 +10,31 @@
       "src": "/(.*)",
       "dest": "api/index.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/automation/daily-workflow",
+      "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/automation/weekly-seo-audit",
+      "schedule": "0 3 * * 1"
+    },
+    {
+      "path": "/api/automation/weekly-report",
+      "schedule": "0 6 * * 1"
+    },
+    {
+      "path": "/api/automation/content-refresh",
+      "schedule": "0 4 1 * *"
+    },
+    {
+      "path": "/api/ads/optimize-daily",
+      "schedule": "0 5 * * *"
+    },
+    {
+      "path": "/api/reviews/scrape/all",
+      "schedule": "0 2 * * *"
+    }
   ]
 }

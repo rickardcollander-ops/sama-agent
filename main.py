@@ -9,7 +9,10 @@ from contextlib import asynccontextmanager
 import logging
 from typing import AsyncGenerator
 
-from api.routes import seo, content, ads, social, reviews, analytics, orchestrator, automation
+from api.routes import (
+    seo, content, ads, social, reviews, analytics, orchestrator, automation,
+    seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts
+)
 from shared.config import settings
 from shared.database import init_db, get_supabase
 
@@ -81,12 +84,17 @@ app.add_middleware(
 # Include routers
 app.include_router(orchestrator.router, prefix="/api/orchestrator", tags=["orchestrator"])
 app.include_router(seo.router, prefix="/api/seo", tags=["seo"])
+app.include_router(seo_advanced.router, prefix="/api/seo", tags=["seo-advanced"])
 app.include_router(content.router, prefix="/api/content", tags=["content"])
+app.include_router(content_advanced.router, prefix="/api/content", tags=["content-advanced"])
 app.include_router(ads.router, prefix="/api/ads", tags=["ads"])
+app.include_router(ads_advanced.router, prefix="/api/ads", tags=["ads-advanced"])
 app.include_router(social.router, prefix="/api/social", tags=["social"])
 app.include_router(reviews.router, prefix="/api/reviews", tags=["reviews"])
+app.include_router(reviews_advanced.router, prefix="/api/reviews", tags=["reviews-advanced"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(automation.router, prefix="/api/automation", tags=["automation"])
+app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 
 
 @app.get("/")

@@ -196,3 +196,67 @@ async def disable_automation():
         "success": True,
         "message": "Automation disabled. Workflows will not run automatically."
     }
+
+
+@router.post("/content-refresh")
+async def run_content_refresh_workflow():
+    """
+    Monthly content refresh workflow
+    Identifies and refreshes content older than 30 days
+    """
+    try:
+        from agents.content_advanced import advanced_content_generator
+        
+        # Identify content to refresh
+        content_to_refresh = await advanced_content_generator.identify_content_for_refresh()
+        
+        if not content_to_refresh:
+            return {
+                "success": True,
+                "message": "No content needs refreshing",
+                "refreshed_count": 0
+            }
+        
+        # Refresh top 5 oldest pieces
+        refreshed = []
+        for content in content_to_refresh[:5]:
+            result = await advanced_content_generator.refresh_content(content["id"])
+            if result.get("success"):
+                refreshed.append(content["id"])
+        
+        return {
+            "success": True,
+            "message": f"Refreshed {len(refreshed)} content pieces",
+            "refreshed_count": len(refreshed),
+            "total_identified": len(content_to_refresh)
+        }
+        
+    except Exception as e:
+        logger.error(f"Content refresh workflow failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/weekly-report")
+async def generate_weekly_report():
+    """
+    Generate comprehensive weekly master report
+    Runs every Monday at 07:00 CET (06:00 UTC)
+    """
+    try:
+        from agents.reporting import report_generator
+        
+        result = await report_generator.generate_weekly_master_report()
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": "Weekly report generated",
+                "report_id": result["report"]["report_id"],
+                "summary": result["report"]["summary"]
+            }
+        else:
+            raise HTTPException(status_code=500, detail=result.get("error"))
+            
+    except Exception as e:
+        logger.error(f"Weekly report generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
