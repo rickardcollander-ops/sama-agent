@@ -68,28 +68,28 @@ async def track_keywords():
 @router.get("/keywords")
 async def get_keywords():
     """Get all tracked keywords"""
-    from agents.models import Keyword
-    from shared.database import AsyncSessionLocal
-    from sqlalchemy import select
+    from shared.database import get_supabase
     
     try:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(Keyword))
-            keywords = result.scalars().all()
-            
-            return {
-                "total": len(keywords),
-                "keywords": [
-                    {
-                        "keyword": kw.keyword,
-                        "intent": kw.intent,
-                        "priority": kw.priority,
-                        "current_position": kw.current_position,
-                        "target_page": kw.target_page
-                    }
-                    for kw in keywords
-                ]
-            }
+        sb = get_supabase()
+        result = sb.table("seo_keywords").select("*").limit(100).execute()
+        keywords = result.data or []
+        
+        return {
+            "total": len(keywords),
+            "keywords": [
+                {
+                    "keyword": kw.get("keyword", ""),
+                    "intent": kw.get("intent", ""),
+                    "priority": kw.get("priority", ""),
+                    "current_position": kw.get("current_position", 0),
+                    "current_clicks": kw.get("current_clicks", 0),
+                    "current_impressions": kw.get("current_impressions", 0),
+                    "target_page": kw.get("target_page", "")
+                }
+                for kw in keywords
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -97,29 +97,25 @@ async def get_keywords():
 @router.get("/keywords/top-performers")
 async def get_top_performers():
     """Get top performing keywords (position <= 10)"""
-    from agents.models import Keyword
-    from shared.database import AsyncSessionLocal
-    from sqlalchemy import select
+    from shared.database import get_supabase
     
     try:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Keyword).where(Keyword.current_position <= 10)
-            )
-            keywords = result.scalars().all()
-            
-            return {
-                "count": len(keywords),
-                "keywords": [
-                    {
-                        "keyword": kw.keyword,
-                        "position": kw.current_position,
-                        "clicks": kw.current_clicks,
-                        "impressions": kw.current_impressions
-                    }
-                    for kw in keywords
-                ]
-            }
+        sb = get_supabase()
+        result = sb.table("seo_keywords").select("*").lte("current_position", 10).execute()
+        keywords = result.data or []
+        
+        return {
+            "count": len(keywords),
+            "keywords": [
+                {
+                    "keyword": kw.get("keyword", ""),
+                    "position": kw.get("current_position", 0),
+                    "clicks": kw.get("current_clicks", 0),
+                    "impressions": kw.get("current_impressions", 0)
+                }
+                for kw in keywords
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
