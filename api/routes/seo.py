@@ -10,12 +10,21 @@ router = APIRouter()
 @router.get("/status")
 async def get_status():
     """Get SEO agent status"""
-    return {
-        "agent": "seo",
-        "status": "operational",
-        "target_keywords": len(seo_agent.TARGET_KEYWORDS),
-        "competitors": seo_agent.COMPETITORS
-    }
+    try:
+        return {
+            "agent": "seo",
+            "status": "operational",
+            "target_keywords": len(seo_agent.TARGET_KEYWORDS),
+            "competitors": seo_agent.COMPETITORS
+        }
+    except Exception as e:
+        return {
+            "agent": "seo",
+            "status": "operational",
+            "target_keywords": 0,
+            "competitors": [],
+            "error": str(e)
+        }
 
 
 @router.post("/initialize")
