@@ -5,6 +5,11 @@ Centralized settings management using Pydantic
 
 from pydantic_settings import BaseSettings
 from typing import List
+from dotenv import load_dotenv
+import os
+
+# Load .env.local file
+load_dotenv(".env.local")
 
 
 class Settings(BaseSettings):

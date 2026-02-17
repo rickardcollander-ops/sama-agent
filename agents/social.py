@@ -159,10 +159,10 @@ class SocialAgent:
         url = f"{TWITTER_API}{endpoint}"
         headers = {}
         
-        if settings.TWITTER_BEARER_TOKEN:
-            headers["Authorization"] = f"Bearer {settings.TWITTER_BEARER_TOKEN}"
-        elif settings.TWITTER_API_KEY:
+        if settings.TWITTER_API_KEY and settings.TWITTER_ACCESS_TOKEN:
             headers["Authorization"] = _oauth1_header("GET", url, params)
+        elif settings.TWITTER_BEARER_TOKEN:
+            headers["Authorization"] = f"Bearer {settings.TWITTER_BEARER_TOKEN}"
         else:
             return {"error": "Twitter API not configured"}
         
