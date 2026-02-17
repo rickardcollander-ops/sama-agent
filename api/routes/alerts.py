@@ -23,6 +23,18 @@ class RejectionRequest(BaseModel):
     reason: str
 
 
+@router.get("/logs")
+async def get_activity_logs(limit: int = 20, offset: int = 0):
+    """Get activity logs from Supabase"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("agent_logs").select("*").order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        return {"logs": result.data or []}
+    except Exception as e:
+        return {"logs": [], "error": str(e)}
+
+
 @router.get("/pending")
 async def get_pending_approvals():
     """Get all alerts requiring approval"""

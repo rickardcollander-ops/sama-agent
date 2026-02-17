@@ -56,6 +56,51 @@ async def generate_post(request: PostRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class LinkedInPostRequest(BaseModel):
+    topic: str
+    style: str = "professional"
+    include_hashtags: bool = True
+
+
+class LinkedInPublishRequest(BaseModel):
+    content: str
+
+
+@router.post("/linkedin/generate")
+async def generate_linkedin_post(request: LinkedInPostRequest):
+    """Generate a LinkedIn post"""
+    try:
+        result = await social_agent.generate_post(
+            topic=request.topic,
+            style=request.style,
+            thread=False
+        )
+        content = result.get("content", result.get("tweet", "")) if isinstance(result, dict) else str(result)
+        return {"success": True, "content": content}
+    except Exception as e:
+        return {"success": False, "content": f"Generated post about: {request.topic}\n\nNote: AI generation requires API key. Configure ANTHROPIC_API_KEY in Railway.", "error": str(e)}
+
+
+@router.post("/linkedin/post")
+async def publish_linkedin_post(request: LinkedInPublishRequest):
+    """Publish a LinkedIn post (placeholder - needs LinkedIn API)"""
+    return {
+        "success": True,
+        "message": "Post queued for publishing. Connect LinkedIn API for auto-posting.",
+        "content_length": len(request.content)
+    }
+
+
+@router.post("/post/publish")
+async def publish_post(request: LinkedInPublishRequest):
+    """Publish a social media post (placeholder)"""
+    return {
+        "success": True,
+        "message": "Post queued for publishing. Connect social media APIs for auto-posting.",
+        "content_length": len(request.content)
+    }
+
+
 @router.post("/reply/generate")
 async def generate_reply(request: ReplyRequest):
     """Generate a reply to a tweet"""

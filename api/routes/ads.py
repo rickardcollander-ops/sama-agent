@@ -72,6 +72,16 @@ async def generate_rsa(request: RSARequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/optimize")
+async def optimize_campaigns():
+    """Quick optimize all campaigns"""
+    try:
+        results = await ads_agent.run_daily_optimization()
+        return {"success": True, "message": "Campaign optimization started", "results": results}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 @router.post("/optimize/bids")
 async def optimize_bids(request: BidOptimizationRequest):
     """Optimize bids based on performance data"""
