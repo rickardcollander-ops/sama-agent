@@ -305,6 +305,110 @@ Analyze what competitors are doing and suggest how to create better content."""
         
         return content_to_refresh
     
+    async def generate_case_study(
+        self,
+        customer_name: str,
+        industry: str,
+        challenge: str,
+        solution: str,
+        results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Generate customer case study
+        
+        Args:
+            customer_name: Customer company name
+            industry: Industry/vertical
+            challenge: Main challenge faced
+            solution: How Successifier helped
+            results: Quantifiable results (metrics)
+        """
+        if not self.client:
+            return {"error": "Anthropic API key not configured"}
+        
+        system_prompt = f"""You are writing a compelling case study for Successifier.
+
+Brand Voice: {brand_voice['tone']}
+
+Generate a professional case study that showcases customer success.
+
+Requirements:
+- Engaging narrative structure
+- Quantifiable results prominently featured
+- Customer quotes (realistic)
+- Before/after comparison
+- Clear problem-solution-results flow
+- SEO-optimized
+- 1500-2000 words
+
+Format as JSON:
+{{
+  "title": "How [Customer] Achieved [Result] with Successifier",
+  "meta_description": "...",
+  "executive_summary": "...",
+  "customer_profile": {{
+    "name": "...",
+    "industry": "...",
+    "size": "...",
+    "location": "..."
+  }},
+  "challenge": "Detailed challenge description",
+  "solution": "How Successifier addressed it",
+  "implementation": "Implementation process",
+  "results": [
+    {{"metric": "...", "value": "...", "description": "..."}}
+  ],
+  "customer_quote": "...",
+  "conclusion": "...",
+  "cta": "..."
+}}"""
+        
+        user_prompt = f"""Create case study:
+
+Customer: {customer_name}
+Industry: {industry}
+Challenge: {challenge}
+Solution: {solution}
+Results: {', '.join(f'{k}: {v}' for k, v in results.items())}
+
+Make it compelling and data-driven."""
+        
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=4000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+            
+            import json
+            result = json.loads(response.content[0].text)
+            
+            # Save to database
+            sb = self._get_sb()
+            content_data = {
+                "type": "case_study",
+                "title": result["title"],
+                "content": json.dumps(result),
+                "meta_description": result["meta_description"],
+                "customer_name": customer_name,
+                "industry": industry,
+                "status": "draft",
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            sb.table("content_library").insert(content_data).execute()
+            
+            return {
+                "success": True,
+                "type": "case_study",
+                **result
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to generate case study: {e}")
+            return {"error": str(e)}
+    
     async def refresh_content(self, content_id: str) -> Dict[str, Any]:
         """
         Refresh existing content with updated information

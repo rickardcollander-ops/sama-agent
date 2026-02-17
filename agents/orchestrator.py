@@ -130,12 +130,66 @@ Format as JSON."""
     
     def _parse_plan(self, response_text: str) -> Dict[str, Any]:
         """Parse Claude's response into structured plan"""
-        # TODO: Implement robust JSON parsing with fallback
-        # For now, return basic structure
+        import json
+        import re
+        
+        try:
+            # Try to extract JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if json_match:
+                plan_data = json.loads(json_match.group())
+                
+                # Validate and structure the plan
+                tasks = plan_data.get("tasks", [])
+                requires_approval = any(task.get("approval_required", False) for task in tasks)
+                
+                return {
+                    "raw_response": response_text,
+                    "tasks": tasks,
+                    "requires_approval": requires_approval,
+                    "total_tasks": len(tasks),
+                    "agents_involved": list(set(task.get("agent", "unknown") for task in tasks))
+                }
+            else:
+                # Fallback: Parse as text
+                logger.warning("No JSON found in response, using text parsing")
+                return self._parse_plan_from_text(response_text)
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing failed: {e}")
+            return self._parse_plan_from_text(response_text)
+    
+    def _parse_plan_from_text(self, text: str) -> Dict[str, Any]:
+        """Fallback text parsing when JSON fails"""
+        tasks = []
+        
+        # Simple pattern matching for agent tasks
+        agent_patterns = [
+            (r"SEO Agent[:\s]+(.+?)(?=\n\n|\n[A-Z]|$)", "seo_agent"),
+            (r"Content Agent[:\s]+(.+?)(?=\n\n|\n[A-Z]|$)", "content_agent"),
+            (r"Ads Agent[:\s]+(.+?)(?=\n\n|\n[A-Z]|$)", "ads_agent"),
+            (r"Social Agent[:\s]+(.+?)(?=\n\n|\n[A-Z]|$)", "social_agent"),
+            (r"Review Agent[:\s]+(.+?)(?=\n\n|\n[A-Z]|$)", "review_agent"),
+            (r"Analytics Agent[:\s]+(.+?)(?=\n\n|\n[A-Z]|$)", "analytics_agent"),
+        ]
+        
+        for pattern, agent_name in agent_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                action = match.group(1).strip()
+                tasks.append({
+                    "agent": agent_name,
+                    "action": action,
+                    "approval_required": "approval" in action.lower() or "review" in action.lower()
+                })
+        
         return {
-            "raw_response": response_text,
-            "tasks": [],
-            "requires_approval": False
+            "raw_response": text,
+            "tasks": tasks,
+            "requires_approval": any(task.get("approval_required", False) for task in tasks),
+            "total_tasks": len(tasks),
+            "agents_involved": list(set(task.get("agent", "unknown") for task in tasks)),
+            "parsing_method": "text_fallback"
         }
 
 

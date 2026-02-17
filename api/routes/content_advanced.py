@@ -159,3 +159,42 @@ async def refresh_content(request: ContentRefreshRequest):
     except Exception as e:
         logger.error(f"Failed to refresh content: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class CaseStudyRequest(BaseModel):
+    customer_name: str
+    industry: str
+    challenge: str
+    solution: str
+    results: dict
+
+
+@router.post("/case-study")
+async def generate_case_study(request: CaseStudyRequest):
+    """
+    Generate customer case study
+    
+    Creates compelling case study with:
+    - Customer profile
+    - Challenge description
+    - Solution implementation
+    - Quantifiable results
+    - Customer quotes
+    """
+    try:
+        result = await advanced_content_generator.generate_case_study(
+            customer_name=request.customer_name,
+            industry=request.industry,
+            challenge=request.challenge,
+            solution=request.solution,
+            results=request.results
+        )
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to generate case study: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

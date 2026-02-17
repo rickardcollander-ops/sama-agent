@@ -184,3 +184,30 @@ async def get_pillar_link_suggestions(pillar: str):
     except Exception as e:
         logger.error(f"Failed to get pillar link suggestions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/serp/analyze")
+async def analyze_serp(keyword: str, num_results: int = 5):
+    """
+    Analyze top search results for a keyword
+    
+    Returns:
+    - Content length analysis
+    - Heading structure
+    - Schema markup usage
+    - Common topics
+    - Recommendations
+    """
+    try:
+        from agents.seo_serp import serp_analyzer
+        
+        result = await serp_analyzer.analyze_serp(keyword, num_results)
+        
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("error"))
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to analyze SERP: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
