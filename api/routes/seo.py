@@ -140,3 +140,229 @@ async def discover_opportunities():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/analyze")
+async def run_full_analysis():
+    """Run full SEO analysis and return actionable items"""
+    from shared.database import get_supabase
+    
+    actions = []
+    vitals = None
+    keyword_gaps = []
+    technical_issues = []
+    
+    # 1. Core Web Vitals
+    try:
+        vitals = await seo_agent._check_core_web_vitals()
+        if vitals.get("performance_score", 100) < 80:
+            actions.append({
+                "id": "cwv-perf",
+                "type": "technical",
+                "priority": "high",
+                "title": f"Improve Performance Score ({vitals.get('performance_score', 0)}/100)",
+                "description": f"LCP: {vitals.get('lcp', 0)}ms, CLS: {vitals.get('cls', 0)}, FCP: {vitals.get('fcp', 0)}ms",
+                "action": "Optimize images, reduce JS bundle, implement lazy loading",
+                "status": "pending"
+            })
+        if vitals.get("lcp", 0) > 2500:
+            actions.append({
+                "id": "cwv-lcp",
+                "type": "technical",
+                "priority": "critical",
+                "title": f"Fix Slow LCP ({vitals.get('lcp', 0)}ms)",
+                "description": "Largest Contentful Paint exceeds 2500ms threshold",
+                "action": "Preload hero image, optimize server response time, use CDN",
+                "status": "pending"
+            })
+    except Exception as e:
+        vitals = {"error": str(e)}
+    
+    # 2. Technical SEO checks
+    try:
+        tech = await seo_agent._check_technical_seo()
+        for issue in tech.get("critical", []):
+            actions.append({
+                "id": f"tech-{issue.get('type', 'unknown')}-{issue.get('url', '')[:20]}",
+                "type": "technical",
+                "priority": "critical",
+                "title": f"{issue.get('type', '').replace('_', ' ').title()}: {issue.get('url', '')}",
+                "description": issue.get("message", f"Status: {issue.get('status_code', 'N/A')}"),
+                "action": "Fix immediately - affects crawling and indexing",
+                "status": "pending"
+            })
+        for issue in tech.get("high", []):
+            actions.append({
+                "id": f"tech-{issue.get('type', 'unknown')}-{issue.get('url', '')[:20]}",
+                "type": "on_page",
+                "priority": "high",
+                "title": f"{issue.get('type', '').replace('_', ' ').title()}: {issue.get('url', '')}",
+                "description": "Missing SEO element that impacts rankings",
+                "action": "Add missing meta tag or heading element",
+                "status": "pending"
+            })
+        technical_issues = tech
+    except Exception as e:
+        technical_issues = {"error": str(e)}
+    
+    # 3. Keyword analysis - find content gaps
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_keywords").select("*").execute()
+        keywords = result.data or []
+        
+        for kw in keywords:
+            pos = kw.get("current_position", 0)
+            keyword = kw.get("keyword", "")
+            impressions = kw.get("current_impressions", 0)
+            clicks = kw.get("current_clicks", 0)
+            target_page = kw.get("target_page", "")
+            
+            # High impressions but low position = content opportunity
+            if impressions > 50 and pos > 10:
+                actions.append({
+                    "id": f"content-{keyword[:20]}",
+                    "type": "content",
+                    "priority": "high",
+                    "title": f"Create/optimize content for '{keyword}'",
+                    "description": f"Position {pos}, {impressions} impressions but only {clicks} clicks",
+                    "action": f"Generate SEO-optimized blog post targeting '{keyword}'",
+                    "keyword": keyword,
+                    "target_page": target_page,
+                    "status": "pending"
+                })
+                keyword_gaps.append({"keyword": keyword, "position": pos, "impressions": impressions, "clicks": clicks})
+            
+            # Position 4-10 = quick win, push to top 3
+            elif 4 <= pos <= 10 and impressions > 20:
+                actions.append({
+                    "id": f"optimize-{keyword[:20]}",
+                    "type": "on_page",
+                    "priority": "medium",
+                    "title": f"Push '{keyword}' from #{pos} to top 3",
+                    "description": f"{impressions} impressions, {clicks} clicks - close to top 3",
+                    "action": f"Optimize meta title, add internal links, expand content for '{keyword}'",
+                    "keyword": keyword,
+                    "target_page": target_page,
+                    "status": "pending"
+                })
+            
+            # No target page = needs content
+            elif not target_page and impressions > 10:
+                actions.append({
+                    "id": f"newpage-{keyword[:20]}",
+                    "type": "content",
+                    "priority": "medium",
+                    "title": f"Create dedicated page for '{keyword}'",
+                    "description": f"No target page assigned. {impressions} impressions suggest demand.",
+                    "action": f"Generate new landing page or blog post for '{keyword}'",
+                    "keyword": keyword,
+                    "status": "pending"
+                })
+    except Exception as e:
+        keyword_gaps = [{"error": str(e)}]
+    
+    # Sort actions by priority
+    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    actions.sort(key=lambda a: priority_order.get(a.get("priority", "low"), 3))
+    
+    return {
+        "success": True,
+        "summary": {
+            "total_actions": len(actions),
+            "critical": sum(1 for a in actions if a["priority"] == "critical"),
+            "high": sum(1 for a in actions if a["priority"] == "high"),
+            "medium": sum(1 for a in actions if a["priority"] == "medium"),
+        },
+        "core_web_vitals": vitals,
+        "technical_issues": technical_issues,
+        "keyword_gaps": keyword_gaps,
+        "actions": actions
+    }
+
+
+@router.post("/execute")
+async def execute_action(action: dict = None):
+    """Execute an SEO action - routes to appropriate agent"""
+    from agents.content import content_agent
+    
+    if not action:
+        raise HTTPException(status_code=400, detail="No action provided")
+    
+    action_type = action.get("type", "")
+    keyword = action.get("keyword", "")
+    
+    try:
+        if action_type == "content":
+            # Generate blog post via Content Agent
+            result = await content_agent.generate_blog_post(
+                keyword=keyword,
+                content_type="seo_optimized"
+            )
+            return {
+                "success": True,
+                "action_type": "content_generated",
+                "keyword": keyword,
+                "result": result
+            }
+        elif action_type == "on_page":
+            # Generate meta optimization suggestions
+            if seo_agent.client:
+                response = seo_agent.client.messages.create(
+                    model=seo_agent.model,
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": f"""Generate optimized SEO meta tags for the keyword '{keyword}' for successifier.com (a customer success platform):
+
+1. Title tag (max 60 chars)
+2. Meta description (max 155 chars)  
+3. H1 heading
+4. 3 internal link suggestions
+5. 3 related keywords to include in content
+
+Be specific and actionable."""}]
+                )
+                return {
+                    "success": True,
+                    "action_type": "meta_optimization",
+                    "keyword": keyword,
+                    "suggestions": response.content[0].text
+                }
+            else:
+                return {
+                    "success": True,
+                    "action_type": "meta_optimization",
+                    "keyword": keyword,
+                    "suggestions": f"Title: {keyword.title()} | Successifier - Customer Success Platform\nDescription: Learn about {keyword} with Successifier's AI-powered customer success platform.\nH1: {keyword.title()}: Complete Guide"
+                }
+        elif action_type == "technical":
+            return {
+                "success": True,
+                "action_type": "technical_flagged",
+                "message": "Technical issue flagged for development team. Add to sprint backlog."
+            }
+        else:
+            return {"success": False, "message": f"Unknown action type: {action_type}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.get("/audits")
+async def get_audit_history(limit: int = 5):
+    """Get past audit results"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_audits").select("*").order("audit_date", desc=True).limit(limit).execute()
+        return {"audits": result.data or []}
+    except Exception as e:
+        return {"audits": [], "error": str(e)}
+
+
+@router.get("/vitals")
+async def get_core_web_vitals():
+    """Get current Core Web Vitals"""
+    try:
+        vitals = await seo_agent._check_core_web_vitals()
+        return {"success": True, "vitals": vitals}
+    except Exception as e:
+        return {"success": False, "vitals": None, "error": str(e)}
