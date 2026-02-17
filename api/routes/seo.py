@@ -1,6 +1,6 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from agents.seo import seo_agent
 
@@ -282,7 +282,7 @@ async def run_full_analysis():
 
 
 @router.post("/execute")
-async def execute_action(action: dict = None):
+async def execute_action(action: Dict[str, Any] = Body(...)):
     """Execute an SEO action - routes to appropriate agent"""
     from agents.content import content_agent
     
@@ -295,15 +295,22 @@ async def execute_action(action: dict = None):
     try:
         if action_type == "content":
             # Generate blog post via Content Agent
+            title = action.get("title", keyword)
             result = await content_agent.generate_blog_post(
-                keyword=keyword,
-                content_type="seo_optimized"
+                topic=title,
+                target_keyword=keyword,
+                word_count=2000
             )
             return {
                 "success": True,
                 "action_type": "content_generated",
                 "keyword": keyword,
-                "result": result
+                "result": {
+                    "title": result.get("title", ""),
+                    "word_count": result.get("word_count", 0),
+                    "status": result.get("status", "draft"),
+                    "meta_description": result.get("meta_description", "")
+                }
             }
         elif action_type == "on_page":
             # Generate meta optimization suggestions
