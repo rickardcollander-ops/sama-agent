@@ -95,7 +95,10 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
         "http://localhost:3003",
-        "https://app.successifier.com"
+        "https://app.successifier.com",
+        "https://sama-dashboard-alpha.vercel.app",
+        "https://sama-dashboard.vercel.app",
+        "https://*.vercel.app"  # Allow all Vercel preview deployments
     ]
     
     class Config:
