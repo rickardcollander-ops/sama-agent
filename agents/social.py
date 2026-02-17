@@ -1,9 +1,16 @@
 """
 Social Agent - X/Twitter Management and Engagement
 Manages social media presence for successifier.com
+Uses Twitter/X API v2 for real posting, mentions, and engagement data.
 """
 
+import json
 import logging
+import hashlib
+import hmac
+import base64
+import time
+import urllib.parse
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from anthropic import Anthropic
@@ -15,12 +22,64 @@ from .brand_voice import brand_voice
 
 logger = logging.getLogger(__name__)
 
+# Twitter API v2 endpoints
+TWITTER_API = "https://api.twitter.com/2"
+
+
+def is_twitter_configured() -> bool:
+    """Check if Twitter API credentials are configured"""
+    return bool(
+        settings.TWITTER_BEARER_TOKEN
+        or (settings.TWITTER_API_KEY and settings.TWITTER_API_SECRET
+            and settings.TWITTER_ACCESS_TOKEN and settings.TWITTER_ACCESS_SECRET)
+    )
+
+
+def _oauth1_header(method: str, url: str, params: dict = None) -> str:
+    """Generate OAuth 1.0a Authorization header for Twitter API"""
+    import secrets
+    
+    oauth_params = {
+        "oauth_consumer_key": settings.TWITTER_API_KEY,
+        "oauth_nonce": secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(int(time.time())),
+        "oauth_token": settings.TWITTER_ACCESS_TOKEN,
+        "oauth_version": "1.0"
+    }
+    
+    all_params = {**oauth_params}
+    if params:
+        all_params.update(params)
+    
+    # Create signature base string
+    sorted_params = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}" 
+                             for k, v in sorted(all_params.items()))
+    base_string = f"{method.upper()}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(sorted_params, safe='')}"
+    
+    # Create signing key
+    signing_key = f"{urllib.parse.quote(settings.TWITTER_API_SECRET, safe='')}&{urllib.parse.quote(settings.TWITTER_ACCESS_SECRET, safe='')}"
+    
+    # Generate signature
+    signature = base64.b64encode(
+        hmac.new(signing_key.encode(), base_string.encode(), hashlib.sha1).digest()
+    ).decode()
+    
+    oauth_params["oauth_signature"] = signature
+    
+    header = "OAuth " + ", ".join(
+        f'{urllib.parse.quote(k, safe="")}="{urllib.parse.quote(v, safe="")}"'
+        for k, v in sorted(oauth_params.items())
+    )
+    
+    return header
+
 
 class SocialAgent:
     """
     Social Agent responsible for:
-    - X/Twitter post scheduling
-    - Engagement monitoring
+    - X/Twitter post scheduling & publishing (Twitter API v2)
+    - Engagement monitoring (real mentions)
     - Reply generation
     - Thread creation
     - Hashtag strategy
@@ -88,10 +147,207 @@ class SocialAgent:
     }
     
     def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
+    
+    # ── Twitter API v2 methods ─────────────────────────────────────────
+    
+    async def _twitter_get(self, endpoint: str, params: dict = None) -> Dict:
+        """Make authenticated GET request to Twitter API v2"""
+        url = f"{TWITTER_API}{endpoint}"
+        headers = {}
+        
+        if settings.TWITTER_BEARER_TOKEN:
+            headers["Authorization"] = f"Bearer {settings.TWITTER_BEARER_TOKEN}"
+        elif settings.TWITTER_API_KEY:
+            headers["Authorization"] = _oauth1_header("GET", url, params)
+        else:
+            return {"error": "Twitter API not configured"}
+        
+        resp = await self.http_client.get(url, params=params, headers=headers)
+        
+        if resp.status_code != 200:
+            logger.warning(f"Twitter API error: {resp.status_code} {resp.text[:300]}")
+            return {"error": f"API returned {resp.status_code}"}
+        
+        return resp.json()
+    
+    async def _twitter_post(self, endpoint: str, body: dict) -> Dict:
+        """Make authenticated POST request to Twitter API v2 (requires OAuth 1.0a)"""
+        url = f"{TWITTER_API}{endpoint}"
+        
+        if not settings.TWITTER_API_KEY or not settings.TWITTER_ACCESS_TOKEN:
+            return {"error": "Twitter OAuth 1.0a credentials required for posting"}
+        
+        headers = {
+            "Authorization": _oauth1_header("POST", url),
+            "Content-Type": "application/json"
+        }
+        
+        resp = await self.http_client.post(url, json=body, headers=headers)
+        
+        if resp.status_code not in (200, 201):
+            logger.warning(f"Twitter POST error: {resp.status_code} {resp.text[:300]}")
+            return {"error": f"API returned {resp.status_code}", "detail": resp.text[:300]}
+        
+        return resp.json()
+    
+    async def publish_tweet(self, text: str, reply_to: Optional[str] = None) -> Dict[str, Any]:
+        """Publish a tweet via Twitter API v2"""
+        if not is_twitter_configured():
+            return {"status": "not_configured", "message": "Set TWITTER_API_KEY, TWITTER_ACCESS_TOKEN etc."}
+        
+        body = {"text": text[:280]}
+        if reply_to:
+            body["reply"] = {"in_reply_to_tweet_id": reply_to}
+        
+        result = await self._twitter_post("/tweets", body)
+        
+        if "data" in result:
+            tweet_id = result["data"]["id"]
+            logger.info(f"✅ Tweet published: {tweet_id}")
+            return {"status": "published", "tweet_id": tweet_id, "text": text[:280]}
+        
+        return {"status": "error", "detail": result}
+    
+    async def publish_thread(self, tweets: List[str]) -> List[Dict[str, Any]]:
+        """Publish a thread (multiple tweets) via Twitter API v2"""
+        results = []
+        reply_to = None
+        
+        for i, tweet_text in enumerate(tweets):
+            body = {"text": tweet_text[:280]}
+            if reply_to:
+                body["reply"] = {"in_reply_to_tweet_id": reply_to}
+            
+            result = await self._twitter_post("/tweets", body)
+            
+            if "data" in result:
+                reply_to = result["data"]["id"]
+                results.append({"status": "published", "tweet_id": reply_to, "text": tweet_text[:280], "position": i + 1})
+            else:
+                results.append({"status": "error", "position": i + 1, "detail": result})
+                break
+        
+        logger.info(f"✅ Thread published: {len(results)} tweets")
+        return results
+    
+    async def get_mentions(self, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Fetch recent mentions via Twitter API v2"""
+        if not is_twitter_configured():
+            return []
+        
+        # First get our user ID
+        me = await self._twitter_get("/users/me")
+        if "data" not in me:
+            return []
+        
+        user_id = me["data"]["id"]
+        
+        # Fetch mentions
+        data = await self._twitter_get(f"/users/{user_id}/mentions", params={
+            "max_results": min(max_results, 100),
+            "tweet.fields": "created_at,public_metrics,author_id",
+            "expansions": "author_id",
+            "user.fields": "username,public_metrics"
+        })
+        
+        if "data" not in data:
+            return []
+        
+        # Build user lookup
+        users = {}
+        for u in data.get("includes", {}).get("users", []):
+            users[u["id"]] = u
+        
+        mentions = []
+        for tweet in data["data"]:
+            author = users.get(tweet.get("author_id"), {})
+            mentions.append({
+                "id": tweet["id"],
+                "text": tweet["text"],
+                "created_at": tweet.get("created_at"),
+                "user": {
+                    "username": author.get("username", "unknown"),
+                    "followers_count": author.get("public_metrics", {}).get("followers_count", 0)
+                },
+                "metrics": tweet.get("public_metrics", {})
+            })
+        
+        logger.info(f"✅ Fetched {len(mentions)} mentions from Twitter")
+        return mentions
+    
+    async def get_tweet_metrics(self, tweet_ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch engagement metrics for specific tweets"""
+        if not tweet_ids or not is_twitter_configured():
+            return []
+        
+        ids = ",".join(tweet_ids[:100])
+        data = await self._twitter_get("/tweets", params={
+            "ids": ids,
+            "tweet.fields": "public_metrics,created_at"
+        })
+        
+        if "data" not in data:
+            return []
+        
+        results = []
+        for tweet in data["data"]:
+            metrics = tweet.get("public_metrics", {})
+            results.append({
+                "tweet_id": tweet["id"],
+                "text": tweet.get("text", ""),
+                "created_at": tweet.get("created_at"),
+                "likes": metrics.get("like_count", 0),
+                "retweets": metrics.get("retweet_count", 0),
+                "replies": metrics.get("reply_count", 0),
+                "impressions": metrics.get("impression_count", 0),
+                "quotes": metrics.get("quote_count", 0)
+            })
+        
+        return results
+    
+    async def search_competitor_mentions(self, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Search for competitor complaint tweets"""
+        if not settings.TWITTER_BEARER_TOKEN:
+            return []
+        
+        query = '("gainsight" OR "totango" OR "churnzero") (frustrating OR expensive OR slow OR "looking for alternative" OR "switching from") -is:retweet lang:en'
+        
+        data = await self._twitter_get("/tweets/search/recent", params={
+            "query": query,
+            "max_results": min(max_results, 100),
+            "tweet.fields": "created_at,public_metrics,author_id",
+            "expansions": "author_id",
+            "user.fields": "username,public_metrics"
+        })
+        
+        if "data" not in data:
+            return []
+        
+        users = {}
+        for u in data.get("includes", {}).get("users", []):
+            users[u["id"]] = u
+        
+        results = []
+        for tweet in data["data"]:
+            author = users.get(tweet.get("author_id"), {})
+            results.append({
+                "id": tweet["id"],
+                "text": tweet["text"],
+                "created_at": tweet.get("created_at"),
+                "user": {
+                    "username": author.get("username", "unknown"),
+                    "followers_count": author.get("public_metrics", {}).get("followers_count", 0)
+                }
+            })
+        
+        logger.info(f"✅ Found {len(results)} competitor-related tweets")
+        return results
+    
+    # ── Content generation (existing + enhanced) ───────────────────────
     
     async def generate_post(
         self,
@@ -99,18 +355,11 @@ class SocialAgent:
         style: str = "educational",
         thread: bool = False
     ) -> Dict[str, Any]:
-        """
-        Generate X/Twitter post
-        
-        Args:
-            topic: Post topic
-            style: Post style (educational, announcement, engagement)
-            thread: Whether to generate a thread
-        
-        Returns:
-            Generated post(s)
-        """
+        """Generate X/Twitter post"""
         logger.info(f"🐦 Generating Twitter post: {topic}")
+        
+        if not self.client:
+            return {"error": "Anthropic API key not configured", "status": "error"}
         
         system_prompt = brand_voice.get_system_prompt("blog")
         
@@ -163,16 +412,13 @@ Format as plain text.
         content = response.content[0].text.strip()
         
         if thread:
-            import json
             try:
                 tweets = json.loads(content)
             except:
-                # Fallback: split by newlines
                 tweets = [t.strip() for t in content.split('\n') if t.strip()]
         else:
             tweets = [content]
         
-        # Validate character limits
         tweets = [t[:280] for t in tweets]
         
         logger.info(f"✅ Generated {len(tweets)} tweet(s)")
@@ -182,25 +428,48 @@ Format as plain text.
             "style": style,
             "is_thread": thread,
             "tweets": tweets,
-            "status": "draft"
+            "status": "draft",
+            "api_configured": is_twitter_configured()
         }
+    
+    async def generate_and_publish(
+        self,
+        topic: str,
+        style: str = "educational",
+        thread: bool = False
+    ) -> Dict[str, Any]:
+        """Generate and immediately publish a tweet/thread"""
+        post = await self.generate_post(topic, style, thread)
+        
+        if post.get("error"):
+            return post
+        
+        if not is_twitter_configured():
+            post["status"] = "draft_only"
+            post["message"] = "Twitter API not configured. Set TWITTER_* env vars to enable publishing."
+            return post
+        
+        if thread and len(post["tweets"]) > 1:
+            publish_results = await self.publish_thread(post["tweets"])
+            post["publish_results"] = publish_results
+            post["status"] = "published" if all(r.get("status") == "published" for r in publish_results) else "partial"
+        else:
+            result = await self.publish_tweet(post["tweets"][0])
+            post["publish_result"] = result
+            post["status"] = result.get("status", "error")
+        
+        return post
     
     async def generate_reply(
         self,
         original_tweet: str,
         context: Optional[str] = None
     ) -> str:
-        """
-        Generate reply to a tweet
-        
-        Args:
-            original_tweet: Tweet to reply to
-            context: Additional context about the user/situation
-        
-        Returns:
-            Generated reply
-        """
+        """Generate reply to a tweet"""
         logger.info(f"💬 Generating reply to tweet")
+        
+        if not self.client:
+            return "Reply generation requires Anthropic API key."
         
         system_prompt = brand_voice.get_system_prompt("blog")
         
@@ -233,24 +502,11 @@ Format as plain text.
         )
         
         reply = response.content[0].text.strip()[:280]
-        
         logger.info(f"✅ Reply generated")
-        
         return reply
     
-    async def schedule_posts(
-        self,
-        date_range: int = 7
-    ) -> List[Dict[str, Any]]:
-        """
-        Generate content calendar for next N days
-        
-        Args:
-            date_range: Number of days to schedule
-        
-        Returns:
-            List of scheduled posts
-        """
+    async def schedule_posts(self, date_range: int = 7) -> List[Dict[str, Any]]:
+        """Generate content calendar for next N days"""
         logger.info(f"📅 Generating {date_range}-day content calendar")
         
         scheduled_posts = []
@@ -260,11 +516,9 @@ Format as plain text.
             post_date = start_date + timedelta(days=day_offset)
             day_name = post_date.strftime("%A").lower()
             
-            # Get theme for this day
             if day_name in self.CONTENT_CALENDAR:
                 day_config = self.CONTENT_CALENDAR[day_name]
                 
-                # Generate post based on theme
                 post = await self.generate_post(
                     topic=day_config["example"],
                     style="educational",
@@ -277,26 +531,21 @@ Format as plain text.
                     "theme": day_config["theme"],
                     "format": day_config["format"],
                     "post": post,
-                    "scheduled_time": "09:00"  # Default to 9 AM
+                    "scheduled_time": "09:00"
                 })
         
         logger.info(f"✅ Generated {len(scheduled_posts)} scheduled posts")
-        
         return scheduled_posts
     
     async def monitor_mentions(
         self,
-        mentions: List[Dict[str, Any]]
+        mentions: Optional[List[Dict[str, Any]]] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Monitor and prioritize mentions for response
+        """Monitor and prioritize mentions - fetches real data if not provided"""
+        # Fetch real mentions if not provided
+        if mentions is None:
+            mentions = await self.get_mentions(max_results=20)
         
-        Args:
-            mentions: List of mentions from Twitter API
-        
-        Returns:
-            Prioritized mentions with suggested actions
-        """
         logger.info(f"👀 Monitoring {len(mentions)} mentions")
         
         prioritized = []
@@ -306,25 +555,20 @@ Format as plain text.
             text = mention.get("text", "")
             followers = user.get("followers_count", 0)
             
-            # Determine priority and action
             priority = "low"
             action = "monitor"
             
-            # High priority: Existing customers or high-follower accounts
             if followers > 500 or mention.get("is_customer", False):
                 priority = "high"
                 action = "reply_immediately"
-            
-            # Medium priority: Mentions CS/churn topics
             elif any(keyword in text.lower() for keyword in ["churn", "customer success", "cs", "retention"]):
                 priority = "medium"
                 action = "reply_within_24h"
             
-            # Generate suggested reply
             suggested_reply = await self.generate_reply(
                 original_tweet=text,
                 context=f"User has {followers} followers"
-            )
+            ) if self.client else ""
             
             prioritized.append({
                 "mention_id": mention.get("id"),
@@ -336,54 +580,44 @@ Format as plain text.
                 "suggested_reply": suggested_reply
             })
         
-        # Sort by priority
         priority_order = {"high": 0, "medium": 1, "low": 2}
         prioritized.sort(key=lambda x: priority_order[x["priority"]])
         
         logger.info(f"✅ Prioritized mentions: {sum(1 for m in prioritized if m['priority'] == 'high')} high priority")
-        
         return prioritized
     
     async def analyze_engagement(
         self,
-        posts: List[Dict[str, Any]]
+        posts: Optional[List[Dict[str, Any]]] = None,
+        tweet_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """
-        Analyze post engagement and identify top performers
-        
-        Args:
-            posts: List of posts with engagement metrics
-        
-        Returns:
-            Engagement analysis
-        """
-        logger.info(f"📊 Analyzing engagement for {len(posts)} posts")
+        """Analyze post engagement - uses real metrics if tweet_ids provided"""
+        # Fetch real metrics if tweet_ids provided
+        if tweet_ids and not posts:
+            posts = await self.get_tweet_metrics(tweet_ids)
         
         if not posts:
-            return {"total_posts": 0, "top_performers": [], "insights": []}
+            return {"total_posts": 0, "top_performers": [], "insights": [], "api_configured": is_twitter_configured()}
         
-        # Calculate engagement rate for each post
+        logger.info(f"📊 Analyzing engagement for {len(posts)} posts")
+        
         for post in posts:
             impressions = post.get("impressions", 1)
             engagements = post.get("likes", 0) + post.get("retweets", 0) + post.get("replies", 0)
             post["engagement_rate"] = (engagements / impressions * 100) if impressions > 0 else 0
         
-        # Sort by engagement rate
         posts.sort(key=lambda x: x["engagement_rate"], reverse=True)
-        
         top_performers = posts[:5]
         
-        # Generate insights
         insights = []
-        
         avg_engagement = sum(p["engagement_rate"] for p in posts) / len(posts)
         insights.append(f"Average engagement rate: {avg_engagement:.2f}%")
         
-        # Identify best-performing content types
         thread_posts = [p for p in posts if p.get("is_thread", False)]
         if thread_posts:
             thread_avg = sum(p["engagement_rate"] for p in thread_posts) / len(thread_posts)
-            insights.append(f"Threads perform {thread_avg/avg_engagement:.1f}x better than single tweets")
+            if avg_engagement > 0:
+                insights.append(f"Threads perform {thread_avg/avg_engagement:.1f}x better than single tweets")
         
         logger.info(f"✅ Analysis complete: {len(top_performers)} top performers identified")
         

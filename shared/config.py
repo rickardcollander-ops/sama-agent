@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # Google APIs
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REFRESH_TOKEN: str = ""
     GOOGLE_ADS_DEVELOPER_TOKEN: str = ""
     GOOGLE_ADS_CLIENT_ID: str = ""
     GOOGLE_ADS_CLIENT_SECRET: str = ""

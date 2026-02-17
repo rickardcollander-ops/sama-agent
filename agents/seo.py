@@ -12,6 +12,7 @@ import httpx
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.google_auth import get_access_token, is_gsc_configured
 from .models import KEYWORDS_TABLE, SEO_AUDITS_TABLE, BACKLINK_PROFILES_TABLE, COMPETITOR_ANALYSES_TABLE
 
 logger = logging.getLogger(__name__)
@@ -314,27 +315,86 @@ class SEOAgent:
         }
     
     async def _fetch_gsc_data(self) -> Dict[str, Any]:
-        """Fetch Google Search Console summary data"""
-        if not getattr(settings, 'GOOGLE_CLIENT_ID', '') or not getattr(settings, 'GOOGLE_CLIENT_SECRET', ''):
-            return {"status": "not_configured", "message": "Google API credentials not set"}
+        """Fetch Google Search Console summary data via real API"""
+        if not is_gsc_configured():
+            return {"status": "not_configured", "message": "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN"}
         
-        # GSC API requires OAuth2 - return placeholder until OAuth is configured
-        return {
-            "status": "oauth_required",
-            "message": "Configure Google OAuth to enable GSC data",
-            "total_clicks": 0,
-            "total_impressions": 0,
-            "avg_ctr": 0.0,
-            "avg_position": 0.0
-        }
+        token = await get_access_token("gsc")
+        if not token:
+            return {"status": "auth_failed", "message": "Could not get Google access token"}
+        
+        # Query last 28 days
+        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
+        
+        url = f"https://www.googleapis.com/webmasters/v3/sites/{SITE_URL.replace(':', '%3A').replace('/', '%2F')}/searchAnalytics/query"
+        
+        resp = await self.http_client.post(url, json={
+            "startDate": start_date,
+            "endDate": end_date,
+            "dimensions": [],
+            "rowLimit": 1
+        }, headers={"Authorization": f"Bearer {token}"})
+        
+        if resp.status_code != 200:
+            logger.warning(f"GSC API error: {resp.status_code} {resp.text[:200]}")
+            return {"status": "error", "message": f"GSC API returned {resp.status_code}"}
+        
+        data = resp.json()
+        rows = data.get("rows", [])
+        
+        if rows:
+            row = rows[0]
+            return {
+                "status": "ok",
+                "total_clicks": row.get("clicks", 0),
+                "total_impressions": row.get("impressions", 0),
+                "avg_ctr": round(row.get("ctr", 0) * 100, 2),
+                "avg_position": round(row.get("position", 0), 1),
+                "date_range": f"{start_date} to {end_date}"
+            }
+        
+        return {"status": "ok", "total_clicks": 0, "total_impressions": 0, "avg_ctr": 0.0, "avg_position": 0.0}
     
     async def _fetch_gsc_keyword_data(self, limit: int = 50) -> Dict[str, Dict]:
-        """Fetch per-keyword data from GSC"""
-        if not getattr(settings, 'GOOGLE_CLIENT_ID', '') or not getattr(settings, 'GOOGLE_CLIENT_SECRET', ''):
+        """Fetch per-keyword data from Google Search Console"""
+        if not is_gsc_configured():
             return {}
         
-        # Requires OAuth2 - return empty until configured
-        return {}
+        token = await get_access_token("gsc")
+        if not token:
+            return {}
+        
+        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
+        
+        url = f"https://www.googleapis.com/webmasters/v3/sites/{SITE_URL.replace(':', '%3A').replace('/', '%2F')}/searchAnalytics/query"
+        
+        resp = await self.http_client.post(url, json={
+            "startDate": start_date,
+            "endDate": end_date,
+            "dimensions": ["query"],
+            "rowLimit": limit
+        }, headers={"Authorization": f"Bearer {token}"})
+        
+        if resp.status_code != 200:
+            logger.warning(f"GSC keyword query failed: {resp.status_code}")
+            return {}
+        
+        data = resp.json()
+        result = {}
+        
+        for row in data.get("rows", []):
+            query = row["keys"][0].lower()
+            result[query] = {
+                "clicks": row.get("clicks", 0),
+                "impressions": row.get("impressions", 0),
+                "ctr": round(row.get("ctr", 0) * 100, 2),
+                "position": round(row.get("position", 0), 1)
+            }
+        
+        logger.info(f"✅ Fetched GSC data for {len(result)} queries")
+        return result
     
     async def _check_keyword_rankings(self) -> Dict[str, Any]:
         """Check keyword rankings summary"""
