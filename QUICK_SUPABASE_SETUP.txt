@@ -1,0 +1,72 @@
+================================================================================
+SAMA 2.0 - SUPABASE QUICK SETUP
+================================================================================
+
+STEP 1: Enable pgvector in Supabase
+------------------------------------
+1. Go to SQL Editor in Supabase
+2. Click "New query"
+3. Paste and run:
+
+   CREATE EXTENSION IF NOT EXISTS vector;
+
+4. Click Run
+
+
+STEP 2: Get Connection String
+------------------------------------
+1. Go to Project Settings → Database (NOT API Keys)
+2. Scroll to "Connection string"
+3. Select "URI" mode
+4. Copy the string (looks like):
+
+   postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-eu-central-1.pooler.supabase.com:6543/postgres
+
+5. Replace [YOUR-PASSWORD] with your actual database password
+
+
+STEP 3: Create .env.local
+------------------------------------
+Run in PowerShell:
+
+cd c:\Users\cozm0\CascadeProjects\successifier-agents\sama-agent
+copy .env.local.template .env.local
+notepad .env.local
+
+Add these two lines (replace with your actual values):
+
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+DATABASE_URL=postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-eu-central-1.pooler.supabase.com:6543/postgres
+
+
+STEP 4: Initialize Database
+------------------------------------
+cd c:\Users\cozm0\CascadeProjects\successifier-agents\sama-agent
+.\venv\Scripts\Activate.ps1
+python setup.py
+
+Expected output:
+✅ Database connected
+✅ Tables created
+✅ 14 keywords initialized
+
+
+STEP 5: Start SAMA
+------------------------------------
+uvicorn main:app --reload
+
+Open browser: http://localhost:8000/docs
+
+
+STEP 6: Verify in Supabase
+------------------------------------
+Go to Table Editor in Supabase
+You should see new tables:
+- keywords
+- content_library
+- campaigns
+- social_posts
+
+================================================================================
+DONE! SAMA 2.0 is running with Supabase! 🚀
+================================================================================
