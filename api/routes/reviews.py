@@ -32,6 +32,18 @@ class OpportunityRequest(BaseModel):
     customers: List[Dict[str, Any]]
 
 
+@router.get("/recent")
+async def get_recent_reviews(limit: int = 20):
+    """Get recent reviews from Supabase"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("reviews").select("*").order("created_at", desc=True).limit(limit).execute()
+        return {"reviews": result.data or []}
+    except Exception as e:
+        return {"reviews": [], "error": str(e)}
+
+
 @router.get("/status")
 async def get_status():
     """Get Review agent status"""

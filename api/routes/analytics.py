@@ -27,6 +27,18 @@ class InsightsRequest(BaseModel):
     data: Dict[str, Any]
 
 
+@router.get("/metrics")
+async def get_metrics(days: int = 30):
+    """Get daily metrics from Supabase"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("daily_metrics").select("*").order("date", desc=True).limit(days).execute()
+        return {"metrics": result.data or []}
+    except Exception as e:
+        return {"metrics": [], "error": str(e)}
+
+
 @router.get("/status")
 async def get_status():
     """Get Analytics agent status"""
