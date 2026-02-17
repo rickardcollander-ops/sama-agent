@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 # Google Search Console API
 GSC_API = "https://searchconsole.googleapis.com/webmasters/v3"
+# GSC uses sc-domain: format for domain properties
+GSC_SITE_URL = "sc-domain:successifier.com"
+# HTTP URL for PageSpeed and technical checks
 SITE_URL = "https://successifier.com"
 
 
@@ -327,7 +330,8 @@ class SEOAgent:
         end_date = datetime.utcnow().strftime("%Y-%m-%d")
         start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
         
-        url = f"https://www.googleapis.com/webmasters/v3/sites/{SITE_URL.replace(':', '%3A').replace('/', '%2F')}/searchAnalytics/query"
+        encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
+        url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
         
         resp = await self.http_client.post(url, json={
             "startDate": start_date,
@@ -368,7 +372,8 @@ class SEOAgent:
         end_date = datetime.utcnow().strftime("%Y-%m-%d")
         start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
         
-        url = f"https://www.googleapis.com/webmasters/v3/sites/{SITE_URL.replace(':', '%3A').replace('/', '%2F')}/searchAnalytics/query"
+        encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
+        url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
         
         resp = await self.http_client.post(url, json={
             "startDate": start_date,
