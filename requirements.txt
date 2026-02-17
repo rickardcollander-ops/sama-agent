@@ -9,3 +9,5 @@ httpx==0.26.0
 python-dotenv==1.0.1
 redis==5.0.1
 sentry-sdk==1.40.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
