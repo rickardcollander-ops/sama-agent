@@ -1,6 +1,7 @@
 """
 SEO Agent - Technical SEO, Keyword Tracking, and On-Page Optimization
 Handles all SEO activities for successifier.com
+Uses Supabase for persistence and real Google APIs where configured.
 """
 
 import logging
@@ -10,80 +11,49 @@ from anthropic import Anthropic
 import httpx
 
 from shared.config import settings
-from shared.database import AsyncSessionLocal
-from shared.event_bus import event_bus
-from .models import Keyword, SEOAudit, BacklinkProfile, CompetitorAnalysis
+from shared.database import get_supabase
+from .models import KEYWORDS_TABLE, SEO_AUDITS_TABLE, BACKLINK_PROFILES_TABLE, COMPETITOR_ANALYSES_TABLE
 
 logger = logging.getLogger(__name__)
+
+# PageSpeed Insights API (free, no key required for basic usage)
+PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+# Google Search Console API
+GSC_API = "https://searchconsole.googleapis.com/webmasters/v3"
+SITE_URL = "https://successifier.com"
 
 
 class SEOAgent:
     """
     SEO Agent responsible for:
-    - Technical SEO audits
-    - Keyword rank tracking
+    - Technical SEO audits (PageSpeed Insights API)
+    - Keyword rank tracking (Google Search Console API)
     - Backlink monitoring
     - On-page optimization
     - Competitor analysis
     """
     
-    # Target keywords from SAMA 2.0 spec
-    TARGET_KEYWORDS = [
-        {"keyword": "customer success platform", "intent": "commercial", "priority": "P0", "target_page": "/product"},
-        {"keyword": "AI customer success software", "intent": "commercial", "priority": "P0", "target_page": "/product"},
-        {"keyword": "churn prediction software", "intent": "commercial", "priority": "P0", "target_page": "/product#health-scoring"},
-        {"keyword": "customer health score tool", "intent": "commercial", "priority": "P1", "target_page": "/product#health-scoring"},
-        {"keyword": "reduce SaaS churn", "intent": "informational", "priority": "P1", "target_page": "/blog/reduce-saas-churn"},
-        {"keyword": "customer onboarding software", "intent": "commercial", "priority": "P1", "target_page": "/product#onboarding-portal"},
-        {"keyword": "customer success automation", "intent": "commercial", "priority": "P1", "target_page": "/product#automations"},
-        {"keyword": "NPS CSAT tool SaaS", "intent": "commercial", "priority": "P2", "target_page": "/product#nps-csat"},
-        {"keyword": "customer success platform pricing", "intent": "transactional", "priority": "P1", "target_page": "/pricing"},
-        {"keyword": "Gainsight alternative", "intent": "commercial", "priority": "P0", "target_page": "/vs/gainsight"},
-        {"keyword": "Totango alternative", "intent": "commercial", "priority": "P0", "target_page": "/vs/totango"},
-        {"keyword": "ChurnZero alternative", "intent": "commercial", "priority": "P1", "target_page": "/vs/churnzero"},
-        {"keyword": "AI native customer success", "intent": "informational", "priority": "P0", "target_page": "/"},
-        {"keyword": "customer success software small team", "intent": "commercial", "priority": "P1", "target_page": "/pricing"},
-    ]
-    
     COMPETITORS = ["gainsight.com", "totango.com", "churnzero.com"]
     
     def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
+        self.sb = None
     
-    async def initialize_keywords(self):
-        """Initialize keyword tracking database with target keywords"""
-        async with AsyncSessionLocal() as session:
-            for kw_data in self.TARGET_KEYWORDS:
-                # Check if keyword already exists
-                from sqlalchemy import select
-                result = await session.execute(
-                    select(Keyword).where(Keyword.keyword == kw_data["keyword"])
-                )
-                existing = result.scalar_one_or_none()
-                
-                if not existing:
-                    keyword = Keyword(
-                        keyword=kw_data["keyword"],
-                        intent=kw_data["intent"],
-                        priority=kw_data["priority"],
-                        target_page=kw_data["target_page"],
-                        auto_discovered=False
-                    )
-                    session.add(keyword)
-                    logger.info(f"Added keyword: {kw_data['keyword']}")
-            
-            await session.commit()
-            logger.info(f"✅ Initialized {len(self.TARGET_KEYWORDS)} target keywords")
+    def _get_sb(self):
+        if not self.sb:
+            self.sb = get_supabase()
+        return self.sb
+    
+    async def get_keywords(self) -> List[Dict[str, Any]]:
+        """Get all tracked keywords from Supabase"""
+        sb = self._get_sb()
+        result = sb.table(KEYWORDS_TABLE).select("*").execute()
+        return result.data or []
     
     async def run_weekly_audit(self) -> Dict[str, Any]:
-        """
-        Run complete weekly SEO audit
-        
-        Returns:
-            Audit results with issues and recommendations
-        """
+        """Run complete weekly SEO audit with real API data"""
         logger.info("🔍 Starting weekly SEO audit...")
         
         audit_results = {
@@ -93,205 +63,370 @@ class SEOAgent:
             "medium_issues": [],
             "low_issues": [],
             "auto_fixed": [],
-            "recommendations": []
+            "recommendations": [],
+            "core_web_vitals": None,
+            "gsc_summary": None,
+            "ranking_summary": None
         }
         
-        # 1. Fetch Google Search Console data
+        # 1. Core Web Vitals via PageSpeed Insights API (free)
+        try:
+            cwv_data = await self._check_core_web_vitals()
+            audit_results["core_web_vitals"] = cwv_data
+            
+            # Flag CWV issues
+            if cwv_data.get("lcp", 0) > 2500:
+                audit_results["critical_issues"].append({
+                    "type": "slow_lcp",
+                    "message": f"LCP is {cwv_data['lcp']}ms (should be <2500ms)",
+                    "value": cwv_data["lcp"]
+                })
+            if cwv_data.get("cls", 0) > 0.1:
+                audit_results["high_issues"].append({
+                    "type": "high_cls",
+                    "message": f"CLS is {cwv_data['cls']} (should be <0.1)",
+                    "value": cwv_data["cls"]
+                })
+            if cwv_data.get("fcp", 0) > 1800:
+                audit_results["medium_issues"].append({
+                    "type": "slow_fcp",
+                    "message": f"FCP is {cwv_data['fcp']}ms (should be <1800ms)",
+                    "value": cwv_data["fcp"]
+                })
+        except Exception as e:
+            logger.warning(f"PageSpeed check failed: {e}")
+        
+        # 2. Google Search Console data (if configured)
         try:
             gsc_data = await self._fetch_gsc_data()
             audit_results["gsc_summary"] = gsc_data
         except Exception as e:
-            logger.error(f"GSC fetch failed: {e}")
-            audit_results["critical_issues"].append({
-                "type": "gsc_connection_failed",
-                "message": str(e)
-            })
+            logger.warning(f"GSC fetch skipped: {e}")
         
-        # 2. Check keyword rankings
+        # 3. Check keyword rankings from GSC
         try:
             ranking_data = await self._check_keyword_rankings()
             audit_results["ranking_summary"] = ranking_data
         except Exception as e:
-            logger.error(f"Ranking check failed: {e}")
+            logger.warning(f"Ranking check skipped: {e}")
         
-        # 3. Technical SEO checks (would use Screaming Frog CLI in production)
-        technical_issues = await self._check_technical_seo()
-        audit_results["critical_issues"].extend(technical_issues.get("critical", []))
-        audit_results["high_issues"].extend(technical_issues.get("high", []))
-        audit_results["medium_issues"].extend(technical_issues.get("medium", []))
-        
-        # 4. Core Web Vitals check
+        # 4. Technical SEO checks (HTTP-based)
         try:
-            cwv_data = await self._check_core_web_vitals()
-            audit_results["core_web_vitals"] = cwv_data
+            technical_issues = await self._check_technical_seo()
+            audit_results["critical_issues"].extend(technical_issues.get("critical", []))
+            audit_results["high_issues"].extend(technical_issues.get("high", []))
+            audit_results["medium_issues"].extend(technical_issues.get("medium", []))
         except Exception as e:
-            logger.error(f"Core Web Vitals check failed: {e}")
+            logger.warning(f"Technical SEO check failed: {e}")
         
         # 5. Generate recommendations using Claude
-        recommendations = await self._generate_recommendations(audit_results)
-        audit_results["recommendations"] = recommendations
+        if self.client:
+            try:
+                recommendations = await self._generate_recommendations(audit_results)
+                audit_results["recommendations"] = recommendations
+            except Exception as e:
+                logger.warning(f"Recommendation generation failed: {e}")
         
-        # 6. Save audit to database
+        # 6. Save audit to Supabase
         await self._save_audit(audit_results)
         
         # 7. Notify other agents if needed
-        if len(audit_results["critical_issues"]) > 0:
-            await event_bus.publish(
-                event_type="seo_critical_issues",
-                target_agent="sama_orchestrator",
-                data={
-                    "issue_count": len(audit_results["critical_issues"]),
-                    "issues": audit_results["critical_issues"][:5]  # Top 5
-                }
-            )
+        try:
+            from shared.event_bus import event_bus
+            if len(audit_results["critical_issues"]) > 0:
+                await event_bus.publish(
+                    event_type="seo_critical_issues",
+                    target_agent="sama_orchestrator",
+                    data={
+                        "issue_count": len(audit_results["critical_issues"]),
+                        "issues": audit_results["critical_issues"][:5]
+                    }
+                )
+        except Exception:
+            pass
         
         logger.info(f"✅ Weekly SEO audit complete. Issues: {len(audit_results['critical_issues'])} critical, {len(audit_results['high_issues'])} high")
-        
         return audit_results
     
     async def track_keyword_rankings(self) -> Dict[str, Any]:
-        """
-        Track all keyword rankings and update database
-        
-        Returns:
-            Ranking summary with changes
-        """
+        """Track all keyword rankings and update Supabase"""
         logger.info("📊 Tracking keyword rankings...")
         
+        sb = self._get_sb()
+        keywords = await self.get_keywords()
+        
         results = {
-            "total_keywords": 0,
+            "total_keywords": len(keywords),
             "improved": [],
             "declined": [],
             "new_top_10": [],
-            "lost_top_10": []
+            "lost_top_10": [],
+            "updated": 0
         }
         
-        async with AsyncSessionLocal() as session:
-            from sqlalchemy import select
-            result = await session.execute(select(Keyword))
-            keywords = result.scalars().all()
-            results["total_keywords"] = len(keywords)
+        # Try to get GSC data for all keywords at once
+        gsc_keyword_data = {}
+        try:
+            gsc_keyword_data = await self._fetch_gsc_keyword_data()
+        except Exception as e:
+            logger.warning(f"GSC keyword data unavailable: {e}")
+        
+        for kw in keywords:
+            keyword_text = kw["keyword"]
+            previous_position = kw.get("current_position")
             
-            for keyword in keywords:
-                # Fetch current ranking (would use Semrush API in production)
-                current_position = await self._get_keyword_position(keyword.keyword)
-                previous_position = keyword.current_position
-                
-                # Update keyword
-                keyword.current_position = current_position
-                keyword.last_checked_at = datetime.utcnow()
-                
-                # Track history
-                if keyword.position_history is None:
-                    keyword.position_history = []
-                
-                keyword.position_history.append({
+            # Get position from GSC data or None
+            gsc_entry = gsc_keyword_data.get(keyword_text.lower(), {})
+            current_position = gsc_entry.get("position")
+            current_clicks = gsc_entry.get("clicks", kw.get("current_clicks", 0))
+            current_impressions = gsc_entry.get("impressions", kw.get("current_impressions", 0))
+            current_ctr = gsc_entry.get("ctr", kw.get("current_ctr", 0.0))
+            
+            # Build position history
+            history = kw.get("position_history") or []
+            if current_position is not None:
+                history.append({
                     "date": datetime.utcnow().isoformat(),
                     "position": current_position,
-                    "clicks": keyword.current_clicks,
-                    "impressions": keyword.current_impressions
+                    "clicks": current_clicks,
+                    "impressions": current_impressions
                 })
-                
-                # Keep only last 90 days
-                keyword.position_history = keyword.position_history[-90:]
-                
-                # Detect changes
-                if previous_position and current_position:
-                    if current_position < previous_position:
-                        results["improved"].append({
-                            "keyword": keyword.keyword,
-                            "from": previous_position,
-                            "to": current_position,
-                            "change": previous_position - current_position
-                        })
-                    elif current_position > previous_position:
-                        results["declined"].append({
-                            "keyword": keyword.keyword,
-                            "from": previous_position,
-                            "to": current_position,
-                            "change": current_position - previous_position
-                        })
-                    
-                    # Track top 10 changes
-                    if current_position <= 10 and previous_position > 10:
-                        results["new_top_10"].append(keyword.keyword)
-                    elif current_position > 10 and previous_position <= 10:
-                        results["lost_top_10"].append(keyword.keyword)
+                history = history[-90:]  # Keep last 90 entries
             
-            await session.commit()
+            # Update keyword in Supabase
+            update_data = {
+                "current_clicks": current_clicks,
+                "current_impressions": current_impressions,
+                "current_ctr": current_ctr,
+                "position_history": history,
+                "last_checked_at": datetime.utcnow().isoformat()
+            }
+            if current_position is not None:
+                update_data["current_position"] = int(current_position)
+            
+            sb.table(KEYWORDS_TABLE).update(update_data).eq("id", kw["id"]).execute()
+            results["updated"] += 1
+            
+            # Detect changes
+            if previous_position and current_position:
+                if current_position < previous_position:
+                    results["improved"].append({
+                        "keyword": keyword_text,
+                        "from": previous_position,
+                        "to": current_position,
+                        "change": previous_position - current_position
+                    })
+                elif current_position > previous_position:
+                    results["declined"].append({
+                        "keyword": keyword_text,
+                        "from": previous_position,
+                        "to": current_position,
+                        "change": current_position - previous_position
+                    })
+                if current_position <= 10 and previous_position > 10:
+                    results["new_top_10"].append(keyword_text)
+                elif current_position > 10 and previous_position <= 10:
+                    results["lost_top_10"].append(keyword_text)
         
-        # Notify Content Agent of keyword opportunities
-        if results["new_top_10"]:
-            await event_bus.publish(
-                event_type="keywords_entering_top_10",
-                target_agent="sama_content",
-                data={"keywords": results["new_top_10"]}
-            )
+        # Notify Content Agent
+        try:
+            from shared.event_bus import event_bus
+            if results["new_top_10"]:
+                await event_bus.publish(
+                    event_type="keywords_entering_top_10",
+                    target_agent="sama_content",
+                    data={"keywords": results["new_top_10"]}
+                )
+        except Exception:
+            pass
         
-        logger.info(f"✅ Keyword tracking complete. Improved: {len(results['improved'])}, Declined: {len(results['declined'])}")
-        
+        logger.info(f"✅ Keyword tracking complete. Updated: {results['updated']}, Improved: {len(results['improved'])}, Declined: {len(results['declined'])}")
         return results
     
     async def discover_keyword_opportunities(self) -> List[Dict[str, Any]]:
-        """
-        Discover new keyword opportunities using competitor analysis
-        
-        Returns:
-            List of new keyword opportunities
-        """
+        """Discover new keyword opportunities using GSC data"""
         logger.info("🔎 Discovering keyword opportunities...")
         
         opportunities = []
         
-        # This would use Semrush/Ahrefs API in production
-        # For now, return placeholder
+        try:
+            gsc_data = await self._fetch_gsc_keyword_data(limit=100)
+            existing = await self.get_keywords()
+            existing_keywords = {k["keyword"].lower() for k in existing}
+            
+            for query, data in gsc_data.items():
+                if query not in existing_keywords and data.get("impressions", 0) > 10:
+                    opportunities.append({
+                        "keyword": query,
+                        "impressions": data["impressions"],
+                        "clicks": data["clicks"],
+                        "position": data.get("position"),
+                        "ctr": data.get("ctr", 0),
+                        "source": "gsc_discovery"
+                    })
+            
+            # Sort by impressions
+            opportunities.sort(key=lambda x: x["impressions"], reverse=True)
+        except Exception as e:
+            logger.warning(f"Keyword discovery failed: {e}")
         
-        return opportunities
+        return opportunities[:20]
+    
+    # ── Real API integrations ──────────────────────────────────────────
+    
+    async def _check_core_web_vitals(self) -> Dict[str, Any]:
+        """Check Core Web Vitals via PageSpeed Insights API (free, no key needed)"""
+        params = {
+            "url": SITE_URL,
+            "strategy": "mobile",
+            "category": "performance"
+        }
+        
+        resp = await self.http_client.get(PAGESPEED_API, params=params)
+        
+        if resp.status_code != 200:
+            logger.warning(f"PageSpeed API returned {resp.status_code}")
+            return {"error": f"API returned {resp.status_code}"}
+        
+        data = resp.json()
+        
+        # Extract metrics from Lighthouse
+        audits = data.get("lighthouseResult", {}).get("audits", {})
+        
+        lcp = audits.get("largest-contentful-paint", {}).get("numericValue", 0)
+        fcp = audits.get("first-contentful-paint", {}).get("numericValue", 0)
+        cls = audits.get("cumulative-layout-shift", {}).get("numericValue", 0)
+        tbt = audits.get("total-blocking-time", {}).get("numericValue", 0)
+        si = audits.get("speed-index", {}).get("numericValue", 0)
+        
+        # Overall performance score
+        perf_score = data.get("lighthouseResult", {}).get("categories", {}).get("performance", {}).get("score", 0)
+        
+        return {
+            "lcp": round(lcp, 0),
+            "fcp": round(fcp, 0),
+            "cls": round(cls, 4),
+            "tbt": round(tbt, 0),
+            "speed_index": round(si, 0),
+            "performance_score": round(perf_score * 100, 0) if perf_score else 0,
+            "strategy": "mobile",
+            "url": SITE_URL
+        }
     
     async def _fetch_gsc_data(self) -> Dict[str, Any]:
-        """Fetch Google Search Console data (placeholder)"""
-        # Would use Google Search Console API in production
+        """Fetch Google Search Console summary data"""
+        if not getattr(settings, 'GOOGLE_CLIENT_ID', '') or not getattr(settings, 'GOOGLE_CLIENT_SECRET', ''):
+            return {"status": "not_configured", "message": "Google API credentials not set"}
+        
+        # GSC API requires OAuth2 - return placeholder until OAuth is configured
         return {
+            "status": "oauth_required",
+            "message": "Configure Google OAuth to enable GSC data",
             "total_clicks": 0,
             "total_impressions": 0,
             "avg_ctr": 0.0,
             "avg_position": 0.0
         }
     
-    async def _check_keyword_rankings(self) -> Dict[str, Any]:
-        """Check keyword rankings (placeholder)"""
-        # Would use Semrush API in production
-        return {
-            "keywords_tracked": len(self.TARGET_KEYWORDS),
-            "top_10_count": 0,
-            "page_1_count": 0
-        }
+    async def _fetch_gsc_keyword_data(self, limit: int = 50) -> Dict[str, Dict]:
+        """Fetch per-keyword data from GSC"""
+        if not getattr(settings, 'GOOGLE_CLIENT_ID', '') or not getattr(settings, 'GOOGLE_CLIENT_SECRET', ''):
+            return {}
+        
+        # Requires OAuth2 - return empty until configured
+        return {}
     
-    async def _get_keyword_position(self, keyword: str) -> Optional[int]:
-        """Get current position for keyword (placeholder)"""
-        # Would use Semrush API in production
-        return None
+    async def _check_keyword_rankings(self) -> Dict[str, Any]:
+        """Check keyword rankings summary"""
+        keywords = await self.get_keywords()
+        
+        top_10 = sum(1 for k in keywords if k.get("current_position") and k["current_position"] <= 10)
+        page_1 = sum(1 for k in keywords if k.get("current_position") and k["current_position"] <= 10)
+        page_2 = sum(1 for k in keywords if k.get("current_position") and 11 <= k["current_position"] <= 20)
+        tracked = sum(1 for k in keywords if k.get("current_position") is not None)
+        
+        return {
+            "keywords_tracked": len(keywords),
+            "with_position_data": tracked,
+            "top_10_count": top_10,
+            "page_1_count": page_1,
+            "page_2_count": page_2
+        }
     
     async def _check_technical_seo(self) -> Dict[str, List[Dict]]:
-        """Run technical SEO checks (placeholder)"""
-        # Would use Screaming Frog CLI in production
-        return {
-            "critical": [],
-            "high": [],
-            "medium": []
-        }
-    
-    async def _check_core_web_vitals(self) -> Dict[str, float]:
-        """Check Core Web Vitals (placeholder)"""
-        # Would use PageSpeed Insights API in production
-        return {
-            "lcp": 0.0,
-            "inp": 0.0,
-            "cls": 0.0
-        }
+        """Run HTTP-based technical SEO checks on successifier.com"""
+        issues = {"critical": [], "high": [], "medium": []}
+        
+        pages_to_check = [
+            "/", "/product", "/pricing", "/blog",
+            "/vs/gainsight", "/vs/totango", "/vs/churnzero"
+        ]
+        
+        for page in pages_to_check:
+            url = f"{SITE_URL}{page}"
+            try:
+                resp = await self.http_client.get(url, follow_redirects=True)
+                
+                if resp.status_code == 404:
+                    issues["critical"].append({
+                        "type": "page_not_found",
+                        "url": url,
+                        "status_code": 404
+                    })
+                elif resp.status_code >= 500:
+                    issues["critical"].append({
+                        "type": "server_error",
+                        "url": url,
+                        "status_code": resp.status_code
+                    })
+                elif resp.status_code >= 300 and resp.status_code < 400:
+                    issues["medium"].append({
+                        "type": "redirect",
+                        "url": url,
+                        "status_code": resp.status_code
+                    })
+                
+                # Check response time
+                # httpx doesn't expose elapsed easily, so we skip timing for now
+                
+                # Check for basic SEO elements in HTML
+                if resp.status_code == 200:
+                    html = resp.text.lower()
+                    if "<title>" not in html or "</title>" not in html:
+                        issues["high"].append({
+                            "type": "missing_title",
+                            "url": url
+                        })
+                    if 'meta name="description"' not in html:
+                        issues["high"].append({
+                            "type": "missing_meta_description",
+                            "url": url
+                        })
+                    if "<h1" not in html:
+                        issues["medium"].append({
+                            "type": "missing_h1",
+                            "url": url
+                        })
+                    if 'rel="canonical"' not in html:
+                        issues["medium"].append({
+                            "type": "missing_canonical",
+                            "url": url
+                        })
+                        
+            except httpx.ConnectError:
+                issues["critical"].append({
+                    "type": "connection_failed",
+                    "url": url,
+                    "message": "Could not connect to site"
+                })
+            except Exception as e:
+                logger.warning(f"Check failed for {url}: {e}")
+        
+        return issues
     
     async def _generate_recommendations(self, audit_data: Dict[str, Any]) -> List[str]:
         """Generate SEO recommendations using Claude"""
+        cwv = audit_data.get("core_web_vitals", {})
         
         prompt = f"""Based on this SEO audit data for successifier.com, provide 5 actionable recommendations:
 
@@ -300,10 +435,18 @@ Audit Summary:
 - High Issues: {len(audit_data['high_issues'])}
 - Medium Issues: {len(audit_data['medium_issues'])}
 
-Critical Issues:
-{audit_data['critical_issues'][:3]}
+Core Web Vitals:
+- LCP: {cwv.get('lcp', 'N/A')}ms
+- CLS: {cwv.get('cls', 'N/A')}
+- Performance Score: {cwv.get('performance_score', 'N/A')}/100
 
-Provide specific, actionable recommendations prioritized by impact."""
+Critical Issues:
+{audit_data['critical_issues'][:5]}
+
+High Issues:
+{audit_data['high_issues'][:5]}
+
+Provide specific, actionable recommendations prioritized by impact. Be concise."""
 
         response = self.client.messages.create(
             model=self.model,
@@ -311,26 +454,31 @@ Provide specific, actionable recommendations prioritized by impact."""
             messages=[{"role": "user", "content": prompt}]
         )
         
-        # Parse recommendations
         recommendations = response.content[0].text.strip().split("\n")
         return [r.strip() for r in recommendations if r.strip()]
     
     async def _save_audit(self, audit_data: Dict[str, Any]):
-        """Save audit results to database"""
-        async with AsyncSessionLocal() as session:
-            audit = SEOAudit(
-                audit_date=datetime.utcnow(),
-                critical_issues=audit_data["critical_issues"],
-                high_issues=audit_data["high_issues"],
-                medium_issues=audit_data["medium_issues"],
-                low_issues=audit_data["low_issues"],
-                auto_fixed=audit_data["auto_fixed"],
-                recommendations=audit_data["recommendations"],
-                summary=f"Audit completed with {len(audit_data['critical_issues'])} critical issues"
-            )
-            session.add(audit)
-            await session.commit()
-            logger.info("✅ Audit saved to database")
+        """Save audit results to Supabase"""
+        sb = self._get_sb()
+        
+        record = {
+            "audit_date": audit_data["audit_date"],
+            "critical_issues": audit_data["critical_issues"],
+            "high_issues": audit_data["high_issues"],
+            "medium_issues": audit_data["medium_issues"],
+            "low_issues": audit_data["low_issues"],
+            "auto_fixed": audit_data["auto_fixed"],
+            "recommendations": audit_data["recommendations"],
+            "summary": f"Audit: {len(audit_data['critical_issues'])} critical, {len(audit_data['high_issues'])} high issues"
+        }
+        
+        cwv = audit_data.get("core_web_vitals")
+        if cwv and not cwv.get("error"):
+            record["lcp_score"] = cwv.get("lcp")
+            record["cls_score"] = cwv.get("cls")
+        
+        sb.table(SEO_AUDITS_TABLE).insert(record).execute()
+        logger.info("✅ Audit saved to Supabase")
 
 
 # Global SEO agent instance

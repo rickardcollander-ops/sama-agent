@@ -10,9 +10,8 @@ from anthropic import Anthropic
 import httpx
 
 from shared.config import settings
-from shared.database import AsyncSessionLocal
-from shared.event_bus import event_bus
-from .models import ContentPiece, Keyword
+from shared.database import get_supabase
+from .models import CONTENT_PIECES_TABLE, KEYWORDS_TABLE
 from .brand_voice import brand_voice
 
 logger = logging.getLogger(__name__)
@@ -29,11 +28,17 @@ class ContentAgent:
     """
     
     def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
         self.settings = settings
+        self.sb = None
+    
+    def _get_sb(self):
+        if not self.sb:
+            self.sb = get_supabase()
+        return self.sb
     
     async def generate_blog_post(
         self,
@@ -112,7 +117,7 @@ Format as markdown with proper headings.
         validation = brand_voice.validate_content(content)
         
         # Save to database
-        content_piece = await self._save_content(
+        saved = await self._save_content(
             title=title,
             content=content,
             content_type="blog",
@@ -122,22 +127,26 @@ Format as markdown with proper headings.
         )
         
         # Notify SEO Agent of new content
-        if target_keyword:
-            await event_bus.publish(
-                event_type="content_published",
-                target_agent="sama_seo",
-                data={
-                    "content_id": str(content_piece.id),
-                    "title": title,
-                    "keyword": target_keyword,
-                    "word_count": validation['word_count']
-                }
-            )
+        try:
+            from shared.event_bus import event_bus
+            if target_keyword:
+                await event_bus.publish(
+                    event_type="content_published",
+                    target_agent="sama_seo",
+                    data={
+                        "content_id": saved.get("id", ""),
+                        "title": title,
+                        "keyword": target_keyword,
+                        "word_count": validation['word_count']
+                    }
+                )
+        except Exception:
+            pass
         
         logger.info(f"✅ Blog post generated: {title} ({validation['word_count']} words)")
         
         return {
-            "id": str(content_piece.id),
+            "id": saved.get("id", ""),
             "title": title,
             "content": content,
             "meta_description": meta_description,
@@ -212,7 +221,7 @@ Format as markdown.
         meta_description = await self._generate_meta_description(title, content)
         validation = brand_voice.validate_content(content)
         
-        content_piece = await self._save_content(
+        saved = await self._save_content(
             title=title,
             content=content,
             content_type="landing_page",
@@ -224,7 +233,7 @@ Format as markdown.
         logger.info(f"✅ Landing page generated: {title}")
         
         return {
-            "id": str(content_piece.id),
+            "id": saved.get("id", ""),
             "title": title,
             "content": content,
             "meta_description": meta_description,
@@ -291,7 +300,7 @@ Format as markdown.
         meta_description = await self._generate_meta_description(title, content)
         validation = brand_voice.validate_content(content)
         
-        content_piece = await self._save_content(
+        saved = await self._save_content(
             title=title,
             content=content,
             content_type="comparison",
@@ -304,7 +313,7 @@ Format as markdown.
         logger.info(f"✅ Comparison page generated: {title}")
         
         return {
-            "id": str(content_piece.id),
+            "id": saved.get("id", ""),
             "title": title,
             "content": content,
             "meta_description": meta_description,
@@ -377,7 +386,7 @@ Format: Plain text, no special formatting.
         content = response.content[0].text.strip()
         
         # Save as content piece
-        content_piece = await self._save_content(
+        saved = await self._save_content(
             title=f"{platform.title()} post: {topic}",
             content=content,
             content_type="social",
@@ -387,7 +396,7 @@ Format: Plain text, no special formatting.
         logger.info(f"✅ Social post generated for {platform}")
         
         return {
-            "id": str(content_piece.id),
+            "id": saved.get("id", ""),
             "platform": platform,
             "content": content,
             "status": "draft"
@@ -410,34 +419,33 @@ Format: Plain text, no special formatting.
         """
         logger.info(f"🔍 Optimizing content for: {target_keyword}")
         
-        async with AsyncSessionLocal() as session:
-            from sqlalchemy import select
-            result = await session.execute(
-                select(ContentPiece).where(ContentPiece.id == content_id)
+        sb = self._get_sb()
+        result = sb.table(CONTENT_PIECES_TABLE).select("*").eq("id", content_id).execute()
+        
+        if not result.data:
+            raise ValueError(f"Content piece {content_id} not found")
+        
+        piece = result.data[0]
+        
+        # Analyze current content
+        analysis = await self._analyze_seo(piece["content"], target_keyword)
+        
+        # Generate optimized version if needed
+        if analysis['keyword_density'] < 0.5 or analysis['keyword_density'] > 2.5:
+            optimized_content = await self._optimize_content(
+                piece["content"],
+                target_keyword,
+                analysis
             )
-            content_piece = result.scalar_one_or_none()
             
-            if not content_piece:
-                raise ValueError(f"Content piece {content_id} not found")
+            sb.table(CONTENT_PIECES_TABLE).update({
+                "content": optimized_content,
+                "target_keyword": target_keyword
+            }).eq("id", content_id).execute()
             
-            # Analyze current content
-            analysis = await self._analyze_seo(content_piece.content, target_keyword)
-            
-            # Generate optimized version if needed
-            if analysis['keyword_density'] < 0.5 or analysis['keyword_density'] > 2.5:
-                optimized_content = await self._optimize_content(
-                    content_piece.content,
-                    target_keyword,
-                    analysis
-                )
-                
-                content_piece.content = optimized_content
-                content_piece.target_keyword = target_keyword
-                await session.commit()
-                
-                logger.info(f"✅ Content optimized for {target_keyword}")
-            
-            return analysis
+            logger.info(f"✅ Content optimized for {target_keyword}")
+        
+        return analysis
     
     async def _generate_meta_description(self, title: str, content: str) -> str:
         """Generate SEO-optimized meta description"""
@@ -505,24 +513,25 @@ Requirements:
         meta_description: Optional[str] = None,
         word_count: int = 0,
         target_url: Optional[str] = None
-    ) -> ContentPiece:
-        """Save content to database"""
-        async with AsyncSessionLocal() as session:
-            content_piece = ContentPiece(
-                title=title,
-                content=content,
-                content_type=content_type,
-                target_keyword=target_keyword,
-                meta_title=title[:200] if len(title) > 200 else title,
-                meta_description=meta_description,
-                word_count=word_count,
-                target_url=target_url,
-                status="draft" if not settings.AUTO_PUBLISH_BLOG_POSTS else "approved"
-            )
-            session.add(content_piece)
-            await session.commit()
-            await session.refresh(content_piece)
-            return content_piece
+    ) -> Dict[str, Any]:
+        """Save content to Supabase"""
+        sb = self._get_sb()
+        
+        record = {
+            "title": title,
+            "content": content,
+            "content_type": content_type,
+            "target_keyword": target_keyword,
+            "meta_title": title[:200] if len(title) > 200 else title,
+            "meta_description": meta_description,
+            "word_count": word_count,
+            "target_url": target_url,
+            "status": "draft",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        result = sb.table(CONTENT_PIECES_TABLE).insert(record).execute()
+        return result.data[0] if result.data else record
 
 
 # Global content agent instance

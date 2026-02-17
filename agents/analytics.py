@@ -10,8 +10,7 @@ from anthropic import Anthropic
 import httpx
 
 from shared.config import settings
-from shared.database import AsyncSessionLocal
-from shared.event_bus import event_bus
+from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
 

@@ -8,7 +8,6 @@ from typing import Dict, Any, List
 from anthropic import Anthropic
 
 from shared.config import settings
-from shared.event_bus import event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +101,17 @@ Format as JSON."""
             event_type: Type of coordination event
             data: Event data
         """
-        if settings.LINKEDIN_AGENT_EVENT_BUS_ENABLED:
-            await event_bus.publish(
-                event_type=event_type,
-                target_agent="linkedin_agent",
-                data=data
-            )
-            logger.info(f"📤 Sent {event_type} to LinkedIn Agent")
+        try:
+            from shared.event_bus import event_bus
+            if settings.LINKEDIN_AGENT_EVENT_BUS_ENABLED:
+                await event_bus.publish(
+                    event_type=event_type,
+                    target_agent="linkedin_agent",
+                    data=data
+                )
+                logger.info(f"📤 Sent {event_type} to LinkedIn Agent")
+        except Exception as e:
+            logger.warning(f"Event bus not available: {e}")
     
     def _build_context(self, context: Dict[str, Any]) -> str:
         """Build context string for Claude"""
