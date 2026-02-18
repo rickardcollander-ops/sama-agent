@@ -161,13 +161,44 @@ async def run_full_analysis():
 async def execute_action(action: Dict[str, Any] = Body(...)):
     """Execute an SEO action - routes to appropriate agent"""
     from agents.content import content_agent
-    
+    from shared.database import get_supabase
+
     if not action:
         raise HTTPException(status_code=400, detail="No action provided")
-    
-    action_type = action.get("type", "")
+
+    # DB stores as action_type; dashboard may send either field name
+    action_type = action.get("action_type") or action.get("type", "")
     keyword = action.get("keyword", "")
-    
+    db_row_id = action.get("id")  # UUID primary key in agent_actions table
+
+    def mark_done(result: dict):
+        """Update status to completed in DB"""
+        if db_row_id:
+            try:
+                sb = get_supabase()
+                from datetime import datetime
+                sb.table("agent_actions").update({
+                    "status": "completed",
+                    "executed_at": datetime.utcnow().isoformat(),
+                    "execution_result": result
+                }).eq("id", db_row_id).execute()
+            except Exception as e:
+                pass  # Don't fail the response if DB update fails
+
+    def mark_failed(error: str):
+        """Update status to failed in DB"""
+        if db_row_id:
+            try:
+                sb = get_supabase()
+                from datetime import datetime
+                sb.table("agent_actions").update({
+                    "status": "failed",
+                    "executed_at": datetime.utcnow().isoformat(),
+                    "error_message": error
+                }).eq("id", db_row_id).execute()
+            except Exception:
+                pass
+
     try:
         if action_type == "content":
             # Generate blog post via Content Agent
@@ -177,7 +208,7 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
                 target_keyword=keyword,
                 word_count=2000
             )
-            return {
+            outcome = {
                 "success": True,
                 "action_type": "content_generated",
                 "keyword": keyword,
@@ -188,77 +219,104 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
                     "meta_description": result.get("meta_description", "")
                 }
             }
+            mark_done(outcome)
+            return outcome
+
         elif action_type == "on_page":
-            # Generate meta optimization suggestions
+            # Generate concrete meta optimisation suggestions via Claude
+            description = action.get("description", "")
             if seo_agent.client:
                 response = seo_agent.client.messages.create(
                     model=seo_agent.model,
                     max_tokens=1024,
-                    messages=[{"role": "user", "content": f"""Generate optimized SEO meta tags for the keyword '{keyword}' for successifier.com (a customer success platform):
+                    messages=[{"role": "user", "content": f"""You are an SEO specialist for successifier.com — an AI customer success platform.
 
-1. Title tag (max 60 chars)
-2. Meta description (max 155 chars)  
+Action context: {description}
+Target keyword: '{keyword}'
+
+Provide:
+1. Optimised title tag (max 60 chars)
+2. Meta description (max 155 chars)
 3. H1 heading
-4. 3 internal link suggestions
-5. 3 related keywords to include in content
+4. 3 internal links to add (use real successifier.com pages like /product, /pricing, /blog, /vs/gainsight)
+5. 3 LSI keywords to weave into the content
 
-Be specific and actionable."""}]
+Be specific — no generic advice."""}]
                 )
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "meta_optimization",
                     "keyword": keyword,
                     "suggestions": response.content[0].text
                 }
             else:
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "meta_optimization",
                     "keyword": keyword,
-                    "suggestions": f"Title: {keyword.title()} | Successifier - Customer Success Platform\nDescription: Learn about {keyword} with Successifier's AI-powered customer success platform.\nH1: {keyword.title()}: Complete Guide"
+                    "suggestions": f"Title: {keyword.title()} | Successifier\nDescription: {keyword.title()} with Successifier's AI-powered CS platform.\nH1: {keyword.title()}: Complete Guide"
                 }
+            mark_done(outcome)
+            return outcome
+
         elif action_type == "technical":
-            # Check if this is a 404 for a comparison page
             target_page = action.get("target_page", "")
             title = action.get("title", "")
-            
-            # Check both target_page and title for vs/ URLs
             url_to_check = target_page or title
-            
+
             if "vs/" in url_to_check and ("404" in title.lower() or "not found" in title.lower()):
-                # Extract competitor name from URL
                 import re
                 match = re.search(r'/vs/(\w+)', url_to_check)
                 if match:
                     competitor = match.group(1)
-                    
-                    # Generate comparison page via Content Agent
                     result = await content_agent.generate_comparison_page(competitor=competitor)
-                    
-                    # Push to GitHub
                     from shared.github_helper import create_comparison_page
                     github_result = await create_comparison_page(
                         competitor=competitor,
                         content=result.get("content", "")
                     )
-                    
-                    return {
+                    outcome = {
                         "success": True,
                         "action_type": "comparison_page_created",
                         "competitor": competitor,
                         "github": github_result,
                         "url": f"https://successifier.com/vs/{competitor}"
                     }
-            
-            # Other technical issues just get flagged
-            return {
-                "success": True,
-                "action_type": "technical_flagged",
-                "message": "Technical issue flagged for development team. Add to sprint backlog."
-            }
+                    mark_done(outcome)
+                    return outcome
+
+            # Other technical issues: generate a concrete fix plan via Claude
+            if seo_agent.client:
+                response = seo_agent.client.messages.create(
+                    model=seo_agent.model,
+                    max_tokens=512,
+                    messages=[{"role": "user", "content": f"""Technical SEO issue on successifier.com:
+Issue: {title}
+Details: {action.get('description', '')}
+
+Give a concise, developer-ready fix (3-5 steps). Be specific."""}]
+                )
+                outcome = {
+                    "success": True,
+                    "action_type": "technical_fix_plan",
+                    "fix_plan": response.content[0].text
+                }
+            else:
+                outcome = {
+                    "success": True,
+                    "action_type": "technical_flagged",
+                    "message": f"Fix required: {title}. Add to sprint backlog."
+                }
+            mark_done(outcome)
+            return outcome
+
         else:
-            return {"success": False, "message": f"Unknown action type: {action_type}"}
+            err = {"success": False, "message": f"Unknown action type: '{action_type}'"}
+            mark_failed(f"Unknown action type: {action_type}")
+            return err
+
     except Exception as e:
+        mark_failed(str(e))
         return {"success": False, "error": str(e)}
 
 
