@@ -3,8 +3,11 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 
 from agents.content import content_agent
+from agents.brand_voice import brand_voice
+from api.routes.content_chat import router as chat_router
 
 router = APIRouter()
+router.include_router(chat_router)
 
 
 class BlogPostRequest(BaseModel):
