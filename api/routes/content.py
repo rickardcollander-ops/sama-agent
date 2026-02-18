@@ -386,21 +386,38 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
     
     try:
         if action_type == "blog_post":
-            pillar = action.get("pillar")
+            # Generate blog post
             result = await content_agent.generate_blog_post(
-                topic=keyword or action.get("title", ""),
+                topic=action.get("title", keyword),
                 target_keyword=keyword,
-                word_count=2000,
-                pillar=pillar
+                word_count=2000
             )
+            
+            # Create in GitHub repo if GITHUB_TOKEN is configured
+            from shared.github_helper import create_blog_post
+            import re
+            
+            slug = re.sub(r'[^a-z0-9]+', '-', result.get("title", keyword).lower()).strip('-')
+            
+            github_result = await create_blog_post(
+                title=result.get("title", ""),
+                content=result.get("content", ""),
+                slug=slug,
+                excerpt=result.get("meta_description", "")[:160],
+                keywords=[keyword] if keyword else [],
+                meta_description=result.get("meta_description", ""),
+                author="SAMA Content Agent"
+            )
+            
             return {
                 "success": True,
                 "action_type": "blog_generated",
                 "result": {
                     "title": result.get("title", ""),
                     "word_count": result.get("word_count", 0),
+                    "status": result.get("status", "draft"),
                     "meta_description": result.get("meta_description", ""),
-                    "status": result.get("status", "draft")
+                    "github": github_result
                 }
             }
         
@@ -408,9 +425,19 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
             competitor = action.get("competitor", "")
             if competitor:
                 result = await content_agent.generate_comparison_page(competitor=competitor)
+                
+                # Create comparison page in GitHub
+                from shared.github_helper import create_comparison_page
+                
+                github_result = await create_comparison_page(
+                    competitor=competitor,
+                    content=result.get("content", "")
+                )
+                
                 return {
                     "success": True,
                     "action_type": "comparison_generated",
+                    "github": github_result,
                     "result": {
                         "title": result.get("title", ""),
                         "target_url": result.get("target_url", ""),
