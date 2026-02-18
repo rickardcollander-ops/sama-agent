@@ -131,6 +131,41 @@ async def get_top_performers():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/keywords/add")
+async def add_keyword(data: dict):
+    """Add a single keyword to tracking"""
+    from shared.database import get_supabase
+    from datetime import datetime
+
+    keyword = (data.get("keyword") or "").strip().lower()
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword is required")
+
+    try:
+        sb = get_supabase()
+
+        # Check for duplicate
+        existing = sb.table("seo_keywords").select("id").eq("keyword", keyword).execute()
+        if existing.data:
+            return {"success": False, "message": f'"{keyword}" is already being tracked'}
+
+        sb.table("seo_keywords").insert({
+            "keyword": keyword,
+            "intent": data.get("intent", "manual"),
+            "priority": data.get("priority", "medium"),
+            "target_page": data.get("target_page", "/"),
+            "current_position": None,
+            "current_clicks": 0,
+            "current_impressions": 0,
+            "current_ctr": 0.0,
+            "position_history": []
+        }).execute()
+
+        return {"success": True, "message": f'Now tracking "{keyword}"'}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/discover-opportunities")
 async def discover_opportunities():
     """Discover new keyword opportunities"""
