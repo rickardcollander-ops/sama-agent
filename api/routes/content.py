@@ -210,7 +210,14 @@ async def run_content_analysis():
     except Exception:
         content_pieces = []
     
-    # 2. Fetch SEO keywords to find content gaps
+    # 2. Update keyword data from live GSC before analyzing gaps
+    try:
+        from agents.seo import seo_agent as _seo
+        await _seo.track_keyword_rankings()
+    except Exception:
+        pass
+    
+    # 2b. Fetch SEO keywords (now with fresh GSC data)
     seo_keywords = []
     try:
         sb = get_supabase()

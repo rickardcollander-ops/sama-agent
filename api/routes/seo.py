@@ -151,6 +151,64 @@ async def run_full_analysis():
     vitals = None
     keyword_gaps = []
     technical_issues = []
+    gsc_summary = None
+    ranking_changes = None
+    
+    # 0. Fetch LIVE data from Google Search Console first
+    try:
+        gsc_summary = await seo_agent._fetch_gsc_data()
+    except Exception as e:
+        gsc_summary = {"status": "error", "message": str(e)}
+    
+    # 0b. Update keyword rankings from live GSC data
+    try:
+        ranking_changes = await seo_agent.track_keyword_rankings()
+    except Exception as e:
+        ranking_changes = {"error": str(e)}
+    
+    # 0c. Discover new keyword opportunities from GSC
+    new_opportunities = []
+    try:
+        new_opportunities = await seo_agent.discover_keyword_opportunities()
+        for opp in new_opportunities[:5]:
+            actions.append({
+                "id": f"discover-{opp['keyword'][:20]}",
+                "type": "content",
+                "priority": "medium",
+                "title": f"New keyword opportunity: '{opp['keyword']}'",
+                "description": f"Found in GSC: {opp['impressions']} impressions, position {opp.get('position', 'N/A')}, {opp['clicks']} clicks. Not yet tracked.",
+                "action": f"Add '{opp['keyword']}' to tracked keywords and create targeted content",
+                "keyword": opp["keyword"],
+                "status": "pending"
+            })
+    except Exception:
+        pass
+    
+    # 0d. Flag ranking changes from live data
+    if ranking_changes and not ranking_changes.get("error"):
+        for declined in ranking_changes.get("declined", []):
+            if declined.get("change", 0) >= 3:
+                actions.append({
+                    "id": f"decline-{declined['keyword'][:20]}",
+                    "type": "on_page",
+                    "priority": "high",
+                    "title": f"Ranking dropped: '{declined['keyword']}' #{declined['from']} → #{declined['to']}",
+                    "description": f"Lost {declined['change']} positions. Investigate and optimize.",
+                    "action": f"Review and strengthen content for '{declined['keyword']}' — add internal links, update content, improve meta tags",
+                    "keyword": declined["keyword"],
+                    "status": "pending"
+                })
+        for lost in ranking_changes.get("lost_top_10", []):
+            actions.append({
+                "id": f"lost-top10-{lost[:20]}",
+                "type": "on_page",
+                "priority": "critical",
+                "title": f"Lost top 10: '{lost}'",
+                "description": "This keyword dropped out of page 1. Immediate action needed.",
+                "action": f"Urgent: optimize page for '{lost}', build internal links, consider content refresh",
+                "keyword": lost,
+                "status": "pending"
+            })
     
     # 1. Core Web Vitals
     try:
@@ -274,6 +332,9 @@ async def run_full_analysis():
             "high": sum(1 for a in actions if a["priority"] == "high"),
             "medium": sum(1 for a in actions if a["priority"] == "medium"),
         },
+        "gsc_live_data": gsc_summary,
+        "ranking_changes": ranking_changes,
+        "new_opportunities": new_opportunities[:5],
         "core_web_vitals": vitals,
         "technical_issues": technical_issues,
         "keyword_gaps": keyword_gaps,
