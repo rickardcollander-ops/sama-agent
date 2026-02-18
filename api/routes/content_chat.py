@@ -219,13 +219,8 @@ EXPLANATION: [brief explanation of what you'll do]"""
         
         elif action == "REPUBLISH_CONTENT":
             # Re-publish existing content to GitHub
-            if not content_title and not competitor:
-                response_text = "Please specify which content to republish (e.g., 'Republish all comparison pages' or 'Republish Gainsight comparison')"
-                await save_message("content", "agent", response_text, user_id)
-                return {"response": response_text}
-            
-            # If "all" is mentioned, republish all comparison pages
-            if "all" in message.lower() or not content_title:
+            # Check if user wants to republish all content
+            if "all" in message.lower() or "alla" in message.lower():
                 comparison_pages = [cp for cp in saved_content if cp.get("type") == "comparison" or "vs" in cp.get("title", "").lower()]
                 
                 if not comparison_pages:
