@@ -247,6 +247,85 @@ class SEOAgent:
         logger.info(f"✅ Keyword tracking complete. Updated: {results['updated']}, Improved: {len(results['improved'])}, Declined: {len(results['declined'])}")
         return results
     
+    TARGET_KEYWORDS = [
+        # Brand
+        {"keyword": "successifier", "intent": "brand", "priority": "high", "target_page": "/"},
+        # Core product
+        {"keyword": "customer success platform", "intent": "commercial", "priority": "high", "target_page": "/product"},
+        {"keyword": "ai customer success", "intent": "commercial", "priority": "high", "target_page": "/product"},
+        {"keyword": "customer success software", "intent": "commercial", "priority": "high", "target_page": "/product"},
+        {"keyword": "customer success management tool", "intent": "commercial", "priority": "high", "target_page": "/product"},
+        {"keyword": "customer health score software", "intent": "commercial", "priority": "high", "target_page": "/product"},
+        # Competitor comparison
+        {"keyword": "gainsight alternative", "intent": "commercial", "priority": "high", "target_page": "/vs/gainsight"},
+        {"keyword": "gainsight vs successifier", "intent": "commercial", "priority": "high", "target_page": "/vs/gainsight"},
+        {"keyword": "totango alternative", "intent": "commercial", "priority": "medium", "target_page": "/vs/totango"},
+        {"keyword": "churnzero alternative", "intent": "commercial", "priority": "medium", "target_page": "/vs/churnzero"},
+        # Informational / blog
+        {"keyword": "how to reduce customer churn", "intent": "informational", "priority": "medium", "target_page": "/blog"},
+        {"keyword": "customer success metrics", "intent": "informational", "priority": "medium", "target_page": "/blog"},
+        {"keyword": "net revenue retention", "intent": "informational", "priority": "medium", "target_page": "/blog"},
+        {"keyword": "customer onboarding best practices", "intent": "informational", "priority": "medium", "target_page": "/blog"},
+        {"keyword": "churn prediction", "intent": "informational", "priority": "medium", "target_page": "/blog"},
+        # Pricing / commercial
+        {"keyword": "customer success platform pricing", "intent": "transactional", "priority": "high", "target_page": "/pricing"},
+        {"keyword": "best customer success software", "intent": "commercial", "priority": "high", "target_page": "/product"},
+    ]
+
+    async def initialize_keywords(self) -> Dict[str, Any]:
+        """Seed seo_keywords table with TARGET_KEYWORDS, then enrich from GSC if available"""
+        sb = self._get_sb()
+        inserted = 0
+        skipped = 0
+
+        # Fetch existing keywords to avoid duplicates
+        existing_result = sb.table(KEYWORDS_TABLE).select("keyword").execute()
+        existing = {row["keyword"].lower() for row in (existing_result.data or [])}
+
+        for kw in self.TARGET_KEYWORDS:
+            if kw["keyword"].lower() in existing:
+                skipped += 1
+                continue
+            sb.table(KEYWORDS_TABLE).insert({
+                "keyword": kw["keyword"],
+                "intent": kw["intent"],
+                "priority": kw["priority"],
+                "target_page": kw["target_page"],
+                "current_position": None,
+                "current_clicks": 0,
+                "current_impressions": 0,
+                "current_ctr": 0.0,
+                "position_history": []
+            }).execute()
+            inserted += 1
+
+        # Also pull top GSC queries not yet tracked
+        try:
+            gsc_data = await self._fetch_gsc_keyword_data(limit=50)
+            for query, data in gsc_data.items():
+                if query in existing or data.get("impressions", 0) < 5:
+                    continue
+                try:
+                    sb.table(KEYWORDS_TABLE).insert({
+                        "keyword": query,
+                        "intent": "gsc_discovered",
+                        "priority": "medium",
+                        "target_page": "/",
+                        "current_position": int(data.get("position", 0)) or None,
+                        "current_clicks": data.get("clicks", 0),
+                        "current_impressions": data.get("impressions", 0),
+                        "current_ctr": data.get("ctr", 0.0),
+                        "position_history": []
+                    }).execute()
+                    inserted += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"GSC seed failed during initialize: {e}")
+
+        logger.info(f"✅ initialize_keywords: {inserted} inserted, {skipped} skipped")
+        return {"inserted": inserted, "skipped": skipped, "total_target": len(self.TARGET_KEYWORDS)}
+
     async def discover_keyword_opportunities(self) -> List[Dict[str, Any]]:
         """Discover new keyword opportunities using GSC data"""
         logger.info("🔎 Discovering keyword opportunities...")
