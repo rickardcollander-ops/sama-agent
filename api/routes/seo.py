@@ -218,6 +218,34 @@ Be specific and actionable."""}]
                     "suggestions": f"Title: {keyword.title()} | Successifier - Customer Success Platform\nDescription: Learn about {keyword} with Successifier's AI-powered customer success platform.\nH1: {keyword.title()}: Complete Guide"
                 }
         elif action_type == "technical":
+            # Check if this is a 404 for a comparison page
+            title = action.get("title", "")
+            if "vs/" in title and "404" in title.lower():
+                # Extract competitor name from URL
+                import re
+                match = re.search(r'/vs/(\w+)', title)
+                if match:
+                    competitor = match.group(1)
+                    
+                    # Generate comparison page via Content Agent
+                    result = await content_agent.generate_comparison_page(competitor=competitor)
+                    
+                    # Push to GitHub
+                    from shared.github_helper import create_comparison_page
+                    github_result = await create_comparison_page(
+                        competitor=competitor,
+                        content=result.get("content", "")
+                    )
+                    
+                    return {
+                        "success": True,
+                        "action_type": "comparison_page_created",
+                        "competitor": competitor,
+                        "github": github_result,
+                        "url": f"https://successifier.com/vs/{competitor}"
+                    }
+            
+            # Other technical issues just get flagged
             return {
                 "success": True,
                 "action_type": "technical_flagged",
