@@ -476,6 +476,46 @@ async def get_seo_actions(status: str = None, limit: int = 100):
     return {"success": True, "actions": actions}
 
 
+@router.delete("/actions/{action_id}")
+async def delete_action(action_id: str):
+    """Delete a single action by its UUID"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        sb.table("agent_actions").delete().eq("id", action_id).execute()
+        return {"success": True, "message": f"Action {action_id} deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/strategy/tasks/{task_id}")
+async def delete_strategy_task(task_id: str):
+    """Delete a single task from the current strategy"""
+    from shared.database import get_supabase
+    from datetime import datetime
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_strategies").select("id,tasks").order("created_at", desc=True).limit(1).execute()
+        row = (result.data or [None])[0]
+        if not row:
+            raise HTTPException(status_code=404, detail="No strategy found")
+
+        tasks = row["tasks"] or []
+        new_tasks = [t for t in tasks if t["id"] != task_id]
+        if len(new_tasks) == len(tasks):
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        sb.table("seo_strategies").update({
+            "tasks": new_tasks,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", row["id"]).execute()
+        return {"success": True, "tasks": new_tasks}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/analyze")
 async def run_full_analysis():
     """Run full SEO analysis using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
