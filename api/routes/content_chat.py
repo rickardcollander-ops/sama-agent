@@ -78,8 +78,9 @@ Interpret their request and respond with ONE of these actions:
 3. ANALYZE_GAPS - if they want to analyze content gaps
 4. LIST_CONTENT - if they want to see what content exists
 5. PUBLISH_CONTENT - if they want to publish a draft
-6. DELETE_CONTENT - if they want to delete content
-7. GENERAL_QUESTION - if they're asking a general question
+6. REPUBLISH_CONTENT - if they want to re-publish/push existing content to GitHub
+7. DELETE_CONTENT - if they want to delete content
+8. GENERAL_QUESTION - if they're asking a general question
 
 Also extract key parameters:
 - topic: the main topic/keyword
@@ -215,6 +216,79 @@ EXPLANATION: [brief explanation of what you'll do]"""
             response_text = f"✅ Published: **{content.get('title')}**\n\nStatus changed from draft to published."
             await save_message("content", "agent", response_text, user_id)
             return {"response": response_text}
+        
+        elif action == "REPUBLISH_CONTENT":
+            # Re-publish existing content to GitHub
+            if not content_title and not competitor:
+                response_text = "Please specify which content to republish (e.g., 'Republish all comparison pages' or 'Republish Gainsight comparison')"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            # If "all" is mentioned, republish all comparison pages
+            if "all" in message.lower() or not content_title:
+                comparison_pages = [cp for cp in saved_content if cp.get("type") == "comparison" or "vs" in cp.get("title", "").lower()]
+                
+                if not comparison_pages:
+                    response_text = "❌ No comparison pages found to republish."
+                    await save_message("content", "agent", response_text, user_id)
+                    return {"response": response_text}
+                
+                results = []
+                for cp in comparison_pages:
+                    # Extract competitor from title
+                    title = cp.get("title", "")
+                    import re
+                    match = re.search(r'vs\s+(\w+)', title, re.IGNORECASE)
+                    if match:
+                        comp = match.group(1).lower()
+                        
+                        # Regenerate and push to GitHub
+                        result = await content_agent.generate_comparison_page(competitor=comp)
+                        from shared.github_helper import create_comparison_page
+                        github_result = await create_comparison_page(comp, result.get("content", ""))
+                        
+                        if github_result.get("success"):
+                            results.append(f"✅ {title}")
+                        else:
+                            results.append(f"❌ {title}: {github_result.get('error', 'Unknown error')}")
+                
+                response_text = f"📤 **Republished {len(results)} pages:**\n\n" + "\n".join(results) + "\n\nVercel is deploying now (~2 min)"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            # Single page republish
+            matching = [cp for cp in saved_content if (content_title and content_title.lower() in cp.get("title", "").lower()) or (competitor and competitor.lower() in cp.get("title", "").lower())]
+            
+            if not matching:
+                response_text = f"❌ Could not find content to republish"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            content = matching[0]
+            title = content.get("title", "")
+            
+            # Extract competitor from title
+            import re
+            match = re.search(r'vs\s+(\w+)', title, re.IGNORECASE)
+            if match:
+                comp = match.group(1).lower()
+                
+                # Regenerate and push to GitHub
+                result = await content_agent.generate_comparison_page(competitor=comp)
+                from shared.github_helper import create_comparison_page
+                github_result = await create_comparison_page(comp, result.get("content", ""))
+                
+                if github_result.get("success"):
+                    response_text = f"✅ Republished: **{title}**\n\n🔗 Will be live at: successifier.com/vs/{comp}\n\nVercel is deploying now (~2 min)"
+                else:
+                    response_text = f"❌ Failed to push to GitHub: {github_result.get('error', 'Unknown error')}"
+                
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            else:
+                response_text = f"❌ Could not extract competitor name from title: {title}"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
         
         elif action == "DELETE_CONTENT":
             if not content_title:
