@@ -354,6 +354,30 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         logger.info(f"✅ OBSERVE: {len(keywords)} keywords ({ranked_count} ranked), "
                     f"CWV={'ok' if not cwv.get('error') else 'error'}")
 
+        # ── Save audit record so Audit History tab gets updated ──────────────
+        try:
+            from datetime import datetime as _dt
+            _tech_critical = tech.get("critical", []) if not tech.get("error") else []
+            _tech_high = tech.get("high", []) if not tech.get("error") else []
+            _tech_medium = tech.get("medium", []) if not tech.get("error") else []
+            audit_record = {
+                "audit_date": _dt.utcnow().isoformat(),
+                "critical_issues": _tech_critical,
+                "high_issues": _tech_high,
+                "medium_issues": _tech_medium,
+                "low_issues": [],
+                "auto_fixed": [],
+                "recommendations": [],
+                "summary": f"OODA analysis: {len(_tech_critical)} critical, {len(_tech_high)} high issues"
+            }
+            if cwv and not cwv.get("error"):
+                audit_record["lcp_score"] = cwv.get("lcp")
+                audit_record["cls_score"] = cwv.get("cls")
+            sb.table("seo_audits").insert(audit_record).execute()
+            logger.info("✅ Audit record saved to seo_audits")
+        except Exception as e:
+            logger.warning(f"Failed to save audit record: {e}")
+
         # ── ORIENT ──────────────────────────────────────────────────────────────
         logger.info("🔄 ORIENT phase…")
 
