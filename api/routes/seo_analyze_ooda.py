@@ -30,7 +30,7 @@ def _url_hash(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:8]
 
 
-async def _ensure_strategy(keywords: list, sb) -> dict:
+async def _ensure_strategy(keywords: list, sb, known_pages: dict = None) -> dict:
     """Load existing strategy or generate a fresh one if fingerprint changed."""
     from api.routes.seo import _build_fingerprint, _strategy_to_tasks
     from anthropic import Anthropic
@@ -70,6 +70,29 @@ Latest Audit:
 
     unranked_summary = ", ".join([f"'{k['keyword']}'" for k in unranked[:12]])
 
+    # Build live pages context so Claude knows what already exists
+    live_pages_info = ""
+    if known_pages:
+        live_list = known_pages.get("live_list", [])
+        if live_list:
+            live_pages_info = f"\n\nEXISTING PAGES ON SITE ({len(live_list)} pages):\n"
+            live_pages_info += "\n".join([f"  - {p}" for p in live_list])
+            live_pages_info += "\n\nIMPORTANT: Do NOT suggest creating pages that already exist above. "
+            live_pages_info += "Focus on NEW content that doesn't exist yet."
+
+    # Build existing content context
+    content_info = ""
+    try:
+        content_result = sb.table("content").select("title, url_path, status, content_type").execute()
+        content_rows = content_result.data or []
+        if content_rows:
+            content_info = f"\n\nEXISTING CONTENT IN DATABASE ({len(content_rows)} pieces):\n"
+            for c in content_rows[:15]:
+                content_info += f"  - [{c.get('content_type', '?')}] {c.get('title', '?')} → {c.get('url_path', 'no url')} ({c.get('status', '?')})\n"
+            content_info += "\nDo NOT suggest creating content that already exists above."
+    except Exception:
+        pass
+
     prompt = f"""You are an expert SEO strategist for successifier.com (AI customer success platform).
 
 CURRENT DATA:
@@ -79,9 +102,10 @@ Ranked keywords:
 {kw_lines}
 
 Unranked (no GSC data yet, these need content): {unranked_summary}
-{audit_summary}
+{audit_summary}{live_pages_info}{content_info}
 
 Generate a concrete 90-day SEO strategy. Each action must be a single checkable task.
+Only suggest creating NEW pages/content that don't already exist on the site.
 Return ONLY valid JSON (no markdown, no explanation):
 {{
   "headline": "one-sentence strategic focus",
@@ -91,7 +115,7 @@ Return ONLY valid JSON (no markdown, no explanation):
   "month1": [{{"focus": "Theme", "actions": ["Specific task 1", "Specific task 2", "Specific task 3"]}}],
   "month2": [{{"focus": "Theme", "actions": ["Specific task 1", "Specific task 2", "Specific task 3"]}}],
   "month3": [{{"focus": "Theme", "actions": ["Specific task 1", "Specific task 2", "Specific task 3"]}}],
-  "content_gaps": ["keyword or topic — each should become a blog post or landing page"],
+  "content_gaps": ["keyword or topic — each should become a NEW blog post or landing page that doesn't exist yet"],
   "technical_priorities": ["Concrete technical fix"],
   "kpi_targets": {{"top10_keywords": 5, "monthly_clicks": 200, "avg_position": 15}}
 }}"""
@@ -270,6 +294,20 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         # ── OBSERVE ─────────────────────────────────────────────────────────────
         logger.info("👁️  OBSERVE phase starting…")
 
+        # Fetch known pages first (sitemap + DB) — used by technical checks and strategy
+        known_pages = {}
+        try:
+            known_pages = await seo_agent.get_known_pages()
+            observations["known_pages"] = {
+                "live_count": len(known_pages.get("live", set())),
+                "live_pages": known_pages.get("live_list", []),
+                "missing_pages": known_pages.get("missing", []),
+            }
+            logger.info(f"✅ Known pages: {len(known_pages.get('live', set()))} live, "
+                        f"{len(known_pages.get('missing', []))} missing")
+        except Exception as e:
+            logger.warning(f"Known pages fetch failed: {e}")
+
         try:
             observations["gsc_summary"] = await seo_agent._fetch_gsc_data()
         except Exception as e:
@@ -380,7 +418,7 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         # ── DECIDE ──────────────────────────────────────────────────────────────
         logger.info("🧠 DECIDE phase — loading/generating strategy…")
 
-        strategy_result = await _ensure_strategy(keywords, sb)
+        strategy_result = await _ensure_strategy(keywords, sb, known_pages=known_pages)
         strategy        = strategy_result["strategy"]
         strategy_cached = strategy_result["cached"]
 
@@ -390,6 +428,33 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
             tech_issues=critical_tech,
             cwv=cwv
         )
+
+        # Filter out actions that suggest creating pages/content that already exists
+        live_pages = known_pages.get("live", set()) if known_pages else set()
+        if live_pages:
+            filtered = []
+            for action in actions:
+                title_lower = action.get("title", "").lower()
+                keyword_lower = action.get("keyword", "").lower()
+                # Skip content actions for pages that already exist
+                if action.get("type") == "content":
+                    # Check if any live page path matches the keyword/title
+                    page_exists = False
+                    for page in live_pages:
+                        page_lower = page.lower()
+                        # Match /vs/gainsight with "gainsight alternative" etc.
+                        if keyword_lower and keyword_lower in page_lower:
+                            page_exists = True
+                            break
+                        if page_lower != "/" and page_lower.strip("/") in title_lower:
+                            page_exists = True
+                            break
+                    if page_exists:
+                        logger.info(f"⏭️  Skipping action (page exists): {action.get('title', '')}")
+                        continue
+                filtered.append(action)
+            logger.info(f"✅ Filtered actions: {len(actions)} → {len(filtered)} (removed {len(actions) - len(filtered)} for existing pages)")
+            actions = filtered
 
         await ooda.decide(actions)
 

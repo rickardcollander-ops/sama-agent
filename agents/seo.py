@@ -5,7 +5,8 @@ Uses Supabase for persistence and real Google APIs where configured.
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+import re
+from typing import Dict, Any, List, Optional, Set
 from datetime import datetime, timedelta
 from anthropic import Anthropic
 import httpx
@@ -497,26 +498,109 @@ class SEOAgent:
             "page_2_count": page_2
         }
     
+    async def fetch_sitemap_pages(self) -> Set[str]:
+        """Crawl sitemap.xml to discover all live pages on the site"""
+        pages = set()
+        try:
+            resp = await self.http_client.get(f"{SITE_URL}/sitemap.xml", follow_redirects=True)
+            if resp.status_code == 200:
+                # Parse URLs from sitemap XML
+                urls = re.findall(r'<loc>(.*?)</loc>', resp.text)
+                for url in urls:
+                    # Normalize to path only
+                    path = url.replace("https://www.successifier.com", "").replace("https://successifier.com", "")
+                    if not path:
+                        path = "/"
+                    pages.add(path.rstrip("/") or "/")
+                logger.info(f"✅ Sitemap: found {len(pages)} pages")
+            else:
+                logger.warning(f"Sitemap returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Sitemap fetch failed: {e}")
+        return pages
+
+    async def get_known_pages(self) -> Dict[str, Any]:
+        """
+        Build a complete picture of all known pages:
+        - From sitemap.xml (live pages)
+        - From seo_keywords target_page (expected pages)
+        - From content table url_path (generated content)
+        Returns dict with 'live', 'expected', 'content_urls' sets and 'missing' list
+        """
+        sb = self._get_sb()
+
+        # 1. Live pages from sitemap
+        live_pages = await self.fetch_sitemap_pages()
+
+        # 2. Expected pages from keyword targets
+        expected_pages = set()
+        try:
+            kw_result = sb.table(KEYWORDS_TABLE).select("target_page").execute()
+            for row in (kw_result.data or []):
+                if row.get("target_page"):
+                    expected_pages.add(row["target_page"].rstrip("/") or "/")
+        except Exception:
+            pass
+
+        # 3. Content URLs from content table
+        content_urls = set()
+        try:
+            content_result = sb.table("content").select("url_path, title, status").execute()
+            for row in (content_result.data or []):
+                if row.get("url_path"):
+                    content_urls.add(row["url_path"].rstrip("/") or "/")
+        except Exception:
+            pass
+
+        # 4. Find missing pages (expected but not live)
+        all_expected = expected_pages | content_urls
+        missing = [p for p in all_expected if p not in live_pages and p != "/blog"]
+
+        return {
+            "live": live_pages,
+            "expected": expected_pages,
+            "content_urls": content_urls,
+            "missing": missing,
+            "live_list": sorted(live_pages),
+        }
+
     async def _check_technical_seo(self) -> Dict[str, List[Dict]]:
-        """Run HTTP-based technical SEO checks on successifier.com"""
+        """Run HTTP-based technical SEO checks on all known pages"""
         issues = {"critical": [], "high": [], "medium": []}
-        
-        pages_to_check = [
-            "/", "/product", "/pricing", "/blog",
-            "/vs/gainsight", "/vs/totango", "/vs/churnzero"
-        ]
-        
-        for page in pages_to_check:
+
+        # Build dynamic page list from sitemap + DB
+        known = await self.get_known_pages()
+        live_pages = known["live"]
+
+        # Check all live pages + expected pages
+        pages_to_check = set()
+        pages_to_check.update(live_pages)
+        pages_to_check.update(known["expected"])
+        # Always check core pages
+        pages_to_check.update(["/", "/product", "/pricing"])
+
+        checked = 0
+        for page in sorted(pages_to_check):
             url = f"{SITE_URL}{page}"
             try:
                 resp = await self.http_client.get(url, follow_redirects=True)
-                
+                checked += 1
+
                 if resp.status_code == 404:
-                    issues["critical"].append({
-                        "type": "page_not_found",
-                        "url": url,
-                        "status_code": 404
-                    })
+                    # Only flag as critical if it's an expected page (keyword target or content)
+                    if page in known["expected"] or page in known["content_urls"]:
+                        issues["critical"].append({
+                            "type": "page_not_found",
+                            "url": url,
+                            "status_code": 404,
+                            "message": f"Expected page {page} returns 404"
+                        })
+                    else:
+                        issues["medium"].append({
+                            "type": "page_not_found",
+                            "url": url,
+                            "status_code": 404
+                        })
                 elif resp.status_code >= 500:
                     issues["critical"].append({
                         "type": "server_error",
@@ -529,10 +613,7 @@ class SEOAgent:
                         "url": url,
                         "status_code": resp.status_code
                     })
-                
-                # Check response time
-                # httpx doesn't expose elapsed easily, so we skip timing for now
-                
+
                 # Check for basic SEO elements in HTML
                 if resp.status_code == 200:
                     html = resp.text.lower()
@@ -556,7 +637,7 @@ class SEOAgent:
                             "type": "missing_canonical",
                             "url": url
                         })
-                        
+
             except httpx.ConnectError:
                 issues["critical"].append({
                     "type": "connection_failed",
@@ -565,7 +646,9 @@ class SEOAgent:
                 })
             except Exception as e:
                 logger.warning(f"Check failed for {url}: {e}")
-        
+
+        logger.info(f"✅ Technical SEO: checked {checked} pages, "
+                    f"{len(issues['critical'])} critical, {len(issues['high'])} high, {len(issues['medium'])} medium")
         return issues
     
     async def _generate_recommendations(self, audit_data: Dict[str, Any]) -> List[str]:
