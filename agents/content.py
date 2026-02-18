@@ -514,8 +514,11 @@ Requirements:
         word_count: int = 0,
         target_url: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Save content to Supabase"""
+        """Save content to Supabase (upsert by title)"""
         sb = self._get_sb()
+        
+        # Check if content with this title already exists
+        existing = sb.table(CONTENT_PIECES_TABLE).select("id").eq("title", title).execute()
         
         record = {
             "title": title,
@@ -526,11 +529,20 @@ Requirements:
             "meta_description": meta_description,
             "word_count": word_count,
             "target_url": target_url,
-            "status": "draft",
-            "created_at": datetime.utcnow().isoformat()
         }
         
-        result = sb.table(CONTENT_PIECES_TABLE).insert(record).execute()
+        if existing.data:
+            # Update existing record
+            record["updated_at"] = datetime.utcnow().isoformat()
+            result = sb.table(CONTENT_PIECES_TABLE).update(record).eq("id", existing.data[0]["id"]).execute()
+            logger.info(f"📝 Updated existing content: {title}")
+        else:
+            # Insert new record
+            record["status"] = "draft"
+            record["created_at"] = datetime.utcnow().isoformat()
+            result = sb.table(CONTENT_PIECES_TABLE).insert(record).execute()
+            logger.info(f"✨ Created new content: {title}")
+        
         return result.data[0] if result.data else record
 
 

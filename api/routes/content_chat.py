@@ -177,18 +177,30 @@ EXPLANATION: [brief explanation of what you'll do]"""
             return {"response": response_text}
         
         elif action == "LIST_CONTENT":
-            # List all saved content
-            response_lines = [f"📚 **Content Library** ({len(saved_content)} pieces):\n"]
+            # List all saved content with clear status and URLs
+            published = [cp for cp in saved_content if cp.get("status") == "published"]
+            drafts = [cp for cp in saved_content if cp.get("status") != "published"]
             
-            for cp in saved_content:
-                status_emoji = "✅" if cp.get("status") == "published" else "📝"
-                title = cp.get("title", "Untitled")
-                content_type = cp.get("type", "unknown")
-                word_count = cp.get("word_count", 0)
-                status = cp.get("status", "draft")
-                
-                response_lines.append(f"{status_emoji} **{title}**")
-                response_lines.append(f"   Type: {content_type} | Status: {status} | {word_count} words\n")
+            response_lines = [f"📚 **Content Library** ({len(saved_content)} pieces)\n"]
+            
+            if published:
+                response_lines.append(f"\n🟢 **Published ({len(published)}):**")
+                for cp in published:
+                    title = cp.get("title", "Untitled")
+                    word_count = cp.get("word_count", 0)
+                    url = cp.get("target_url", "")
+                    live_url = f"successifier.com{url}" if url else ""
+                    url_text = f" → {live_url}" if live_url else ""
+                    response_lines.append(f"  ✅ {title} ({word_count} words){url_text}")
+            
+            if drafts:
+                response_lines.append(f"\n🟡 **Drafts ({len(drafts)}):**")
+                for cp in drafts:
+                    title = cp.get("title", "Untitled")
+                    word_count = cp.get("word_count", 0)
+                    response_lines.append(f"  📝 {title} ({word_count} words)")
+            
+            response_lines.append("\n💡 Say 'Publish [title]' or 'Republish [title]' to push to GitHub")
             
             response_text = "\n".join(response_lines)
             await save_message("content", "agent", response_text, user_id)
@@ -219,71 +231,43 @@ EXPLANATION: [brief explanation of what you'll do]"""
         
         elif action == "REPUBLISH_CONTENT":
             # Re-publish existing content to GitHub
-            # Check if user wants to republish all content
-            if "all" in message.lower() or "alla" in message.lower():
-                comparison_pages = [cp for cp in saved_content if cp.get("type") == "comparison" or "vs" in cp.get("title", "").lower()]
-                
-                if not comparison_pages:
-                    response_text = "❌ No comparison pages found to republish."
-                    await save_message("content", "agent", response_text, user_id)
-                    return {"response": response_text}
-                
-                results = []
-                for cp in comparison_pages:
-                    # Extract competitor from title
-                    title = cp.get("title", "")
-                    import re
-                    match = re.search(r'vs\s+(\w+)', title, re.IGNORECASE)
-                    if match:
-                        comp = match.group(1).lower()
-                        
-                        # Regenerate and push to GitHub
-                        result = await content_agent.generate_comparison_page(competitor=comp)
-                        from shared.github_helper import create_comparison_page
-                        github_result = await create_comparison_page(comp, result.get("content", ""))
-                        
-                        if github_result.get("success"):
-                            results.append(f"✅ {title}")
-                        else:
-                            results.append(f"❌ {title}: {github_result.get('error', 'Unknown error')}")
-                
-                response_text = f"📤 **Republished {len(results)} pages:**\n\n" + "\n".join(results) + "\n\nVercel is deploying now (~2 min)"
-                await save_message("content", "agent", response_text, user_id)
-                return {"response": response_text}
-            
-            # Single page republish
-            matching = [cp for cp in saved_content if (content_title and content_title.lower() in cp.get("title", "").lower()) or (competitor and competitor.lower() in cp.get("title", "").lower())]
-            
-            if not matching:
-                response_text = f"❌ Could not find content to republish"
-                await save_message("content", "agent", response_text, user_id)
-                return {"response": response_text}
-            
-            content = matching[0]
-            title = content.get("title", "")
-            
-            # Extract competitor from title
             import re
-            match = re.search(r'vs\s+(\w+)', title, re.IGNORECASE)
-            if match:
+            from shared.github_helper import create_comparison_page
+            
+            # Determine which pages to republish
+            if "all" in message.lower() or "alla" in message.lower():
+                pages_to_publish = [cp for cp in saved_content if "vs" in cp.get("title", "").lower()]
+            else:
+                pages_to_publish = [cp for cp in saved_content if (content_title and content_title.lower() in cp.get("title", "").lower()) or (competitor and competitor.lower() in cp.get("title", "").lower())]
+            
+            if not pages_to_publish:
+                response_text = "❌ Could not find content to republish. Say 'List content' to see what's available."
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            results = []
+            for cp in pages_to_publish:
+                title = cp.get("title", "")
+                match = re.search(r'vs\s+(\w+)', title, re.IGNORECASE)
+                if not match:
+                    continue
+                
                 comp = match.group(1).lower()
                 
                 # Regenerate and push to GitHub
                 result = await content_agent.generate_comparison_page(competitor=comp)
-                from shared.github_helper import create_comparison_page
                 github_result = await create_comparison_page(comp, result.get("content", ""))
                 
                 if github_result.get("success"):
-                    response_text = f"✅ Republished: **{title}**\n\n🔗 Will be live at: successifier.com/vs/{comp}\n\nVercel is deploying now (~2 min)"
+                    # Update status to published in Supabase
+                    sb.table("content_pieces").update({"status": "published"}).eq("title", title).execute()
+                    results.append(f"✅ {title} → successifier.com/vs/{comp}")
                 else:
-                    response_text = f"❌ Failed to push to GitHub: {github_result.get('error', 'Unknown error')}"
-                
-                await save_message("content", "agent", response_text, user_id)
-                return {"response": response_text}
-            else:
-                response_text = f"❌ Could not extract competitor name from title: {title}"
-                await save_message("content", "agent", response_text, user_id)
-                return {"response": response_text}
+                    results.append(f"❌ {title}: {github_result.get('error', 'Unknown error')}")
+            
+            response_text = f"📤 **Republished {len(results)} pages:**\n\n" + "\n".join(results) + "\n\nVercel is deploying now (~2 min)"
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
         
         elif action == "DELETE_CONTENT":
             if not content_title:

@@ -41,7 +41,7 @@ class SEOAgent:
     
     def __init__(self):
         self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-5-20250929"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.sb = None
     
@@ -405,16 +405,16 @@ class SEOAgent:
         """Check keyword rankings summary"""
         keywords = await self.get_keywords()
         
+        top_3 = sum(1 for k in keywords if k.get("current_position") and k["current_position"] <= 3)
         top_10 = sum(1 for k in keywords if k.get("current_position") and k["current_position"] <= 10)
-        page_1 = sum(1 for k in keywords if k.get("current_position") and k["current_position"] <= 10)
         page_2 = sum(1 for k in keywords if k.get("current_position") and 11 <= k["current_position"] <= 20)
         tracked = sum(1 for k in keywords if k.get("current_position") is not None)
         
         return {
             "keywords_tracked": len(keywords),
             "with_position_data": tracked,
+            "top_3_count": top_3,
             "top_10_count": top_10,
-            "page_1_count": page_1,
             "page_2_count": page_2
         }
     

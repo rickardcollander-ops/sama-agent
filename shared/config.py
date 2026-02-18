@@ -32,13 +32,10 @@ class Settings(BaseSettings):
     GOOGLE_ADS_REFRESH_TOKEN: str = ""
     GOOGLE_ADS_CUSTOMER_ID: str = ""
     
-    # Google Custom Search API (for SERP analysis)
-    GOOGLE_CUSTOM_SEARCH_API_KEY: str = ""
-    GOOGLE_SEARCH_ENGINE_ID: str = ""  # cx parameter from cse.google.com
-
     # SEO APIs
     SEMRUSH_API_KEY: str = ""
     AHREFS_API_KEY: str = ""
+    VALUESERP_API_KEY: str = ""  # valueserp.com - for SERP analysis
     
     # Social Media
     TWITTER_API_KEY: str = ""
