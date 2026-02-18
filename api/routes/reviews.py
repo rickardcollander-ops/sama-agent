@@ -105,7 +105,14 @@ async def analyze_reviews_manual(request: ReviewAnalysisRequest):
 
 @router.post("/analyze")
 async def run_review_analysis():
-    """Analyze all reviews from Supabase and generate actionable recommendations"""
+    """Analyze reviews using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+    from api.routes.reviews_analyze_ooda import run_reviews_analysis_with_ooda
+    return await run_reviews_analysis_with_ooda()
+
+
+@router.post("/analyze-legacy")
+async def run_review_analysis_legacy():
+    """Legacy reviews analysis (deprecated - use /analyze)"""
     from shared.database import get_supabase
     
     actions = []

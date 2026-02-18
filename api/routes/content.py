@@ -195,7 +195,14 @@ async def get_brand_voice():
 
 @router.post("/analyze")
 async def run_content_analysis():
-    """Analyze content library and generate actionable recommendations"""
+    """Analyze content using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+    from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
+    return await run_content_analysis_with_ooda()
+
+
+@router.post("/analyze-legacy")
+async def run_content_analysis_legacy():
+    """Legacy content analysis (deprecated - use /analyze)"""
     from shared.database import get_supabase
     from agents.brand_voice import brand_voice
     

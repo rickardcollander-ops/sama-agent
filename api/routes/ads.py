@@ -166,7 +166,14 @@ async def get_optimization_rules():
 
 @router.post("/analyze")
 async def run_full_analysis():
-    """Run full Ads analysis and return actionable items"""
+    """Run full Ads analysis using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+    from api.routes.ads_analyze_ooda import run_ads_analysis_with_ooda
+    return await run_ads_analysis_with_ooda()
+
+
+@router.post("/analyze-legacy")
+async def run_full_analysis_legacy():
+    """Legacy Ads analysis (deprecated - use /analyze)"""
     actions = []
     campaign_data = []
     keyword_data = []

@@ -176,14 +176,21 @@ async def get_engagement_rules():
 
 @router.post("/analyze")
 async def run_social_analysis():
-    """Analyze social presence and generate actionable recommendations"""
+    """Analyze social using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+    from api.routes.social_analyze_ooda import run_social_analysis_with_ooda
+    return await run_social_analysis_with_ooda()
+
+
+@router.post("/analyze-legacy")
+async def run_social_analysis_legacy():
+    """Legacy social analysis (deprecated - use /analyze)"""
     from agents.social import is_twitter_configured
-    
+
     actions = []
     mentions = []
     competitor_tweets = []
     twitter_configured = is_twitter_configured()
-    
+
     # 1. Fetch real mentions if Twitter is configured
     if twitter_configured:
         try:
