@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     SENTRY_DSN: str = ""
     DATADOG_API_KEY: str = ""
     
+    # GitHub
+    GITHUB_TOKEN: str = ""
+    
     # Application
     SUCCESSIFIER_DOMAIN: str = "successifier.com"
     SUCCESSIFIER_CMS_API_URL: str = "https://successifier.com/api"
