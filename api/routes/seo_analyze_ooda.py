@@ -141,8 +141,10 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         
         # Actions from new keyword opportunities
         for opp in new_opps[:5]:
+            import hashlib
+            kw_hash = hashlib.md5(opp['keyword'].encode()).hexdigest()[:8]
             actions.append({
-                "id": f"discover-{opp['keyword'][:20]}",
+                "id": f"discover-{kw_hash}",
                 "type": "content",
                 "priority": "medium",
                 "title": f"New keyword opportunity: '{opp['keyword']}'",
@@ -211,13 +213,16 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         # Actions from technical issues
         if not tech.get("error"):
             for issue in tech.get("critical", []):
+                import hashlib
+                url_hash = hashlib.md5(issue.get('url', '').encode()).hexdigest()[:8]
                 actions.append({
-                    "id": f"tech-{issue.get('type', 'unknown')}-{issue.get('url', '')[:20]}",
+                    "id": f"tech-{issue.get('type', 'unknown')}-{url_hash}",
                     "type": "technical",
                     "priority": "critical",
                     "title": f"{issue.get('type', '').replace('_', ' ').title()}: {issue.get('url', '')}",
                     "description": issue.get("message", f"Status: {issue.get('status_code', 'N/A')}"),
                     "action": "Fix immediately - affects crawling and indexing",
+                    "target_page": issue.get('url', ''),
                     "expected_outcome": {"type": "technical_fix", "target_status": 200},
                     "status": "pending"
                 })

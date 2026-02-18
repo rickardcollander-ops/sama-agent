@@ -166,6 +166,36 @@ async def add_keyword(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/actions/cleanup")
+async def cleanup_duplicate_actions():
+    """Remove duplicate pending actions keeping only the most recent per action_id"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        # Get all pending SEO actions
+        result = sb.table("agent_actions").select("id,action_id,created_at").eq("agent_name", "seo").eq("status", "pending").order("created_at", desc=True).execute()
+        rows = result.data or []
+
+        # Group by action_id, keep newest, collect rest for deletion
+        seen = {}
+        to_delete = []
+        for row in rows:
+            aid = row["action_id"]
+            if aid in seen:
+                to_delete.append(row["id"])
+            else:
+                seen[aid] = row["id"]
+
+        deleted = 0
+        for uuid in to_delete:
+            sb.table("agent_actions").delete().eq("id", uuid).execute()
+            deleted += 1
+
+        return {"success": True, "deleted": deleted, "remaining": len(seen)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/keywords/{keyword:path}")
 async def delete_keyword(keyword: str):
     """Remove a keyword from tracking"""
