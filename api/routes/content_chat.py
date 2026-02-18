@@ -6,10 +6,18 @@ Allows natural language interaction with the Content agent
 from fastapi import APIRouter, Body, HTTPException
 from typing import Dict, Any
 from agents.content import content_agent
+from shared.chat_db import save_message, get_chat_history
 import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/chat/history")
+async def get_chat_history_endpoint(user_id: str = "default_user"):
+    """Get chat history for Content agent"""
+    history = await get_chat_history("content", user_id)
+    return {"history": history}
 
 
 @router.post("/chat")
@@ -23,9 +31,13 @@ async def chat_with_content_agent(request: Dict[str, Any] = Body(...)):
     - "Analyze content gaps for Q1"
     """
     message = request.get("message", "")
+    user_id = request.get("user_id", "default_user")
     
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
+    
+    # Save user message
+    await save_message("content", "user", message, user_id)
     
     try:
         # Use Claude to interpret the request and route to appropriate action
@@ -107,13 +119,12 @@ EXPLANATION: [brief explanation of what you'll do]"""
             )
             
             if github_result.get("success"):
-                return {
-                    "response": f"✅ Created blog post: '{result.get('title')}'\n\n📊 {result.get('word_count', 0)} words\n🔗 Will be live at: successifier.com/blog/{slug}\n\nVercel is deploying now (~2 min)"
-                }
+                response_text = f"✅ Created blog post: '{result.get('title')}'\n\n📊 {result.get('word_count', 0)} words\n🔗 Will be live at: successifier.com/blog/{slug}\n\nVercel is deploying now (~2 min)"
             else:
-                return {
-                    "response": f"✅ Generated blog post: '{result.get('title')}' ({result.get('word_count', 0)} words)\n\n⚠️ GitHub push failed: {github_result.get('error', 'Unknown error')}\n\nContent saved to Supabase as draft."
-                }
+                response_text = f"✅ Generated blog post: '{result.get('title')}' ({result.get('word_count', 0)} words)\n\n⚠️ GitHub push failed: {github_result.get('error', 'Unknown error')}\n\nContent saved to Supabase as draft."
+            
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
         
         elif action == "CREATE_COMPARISON":
             if not competitor:
@@ -131,18 +142,17 @@ EXPLANATION: [brief explanation of what you'll do]"""
             )
             
             if github_result.get("success"):
-                return {
-                    "response": f"✅ Created comparison page: Successifier vs {competitor.title()}\n\n🔗 Will be live at: successifier.com/vs/{competitor.lower()}\n\nVercel is deploying now (~2 min)"
-                }
+                response_text = f"✅ Created comparison page: Successifier vs {competitor.title()}\n\n🔗 Will be live at: successifier.com/vs/{competitor.lower()}\n\nVercel is deploying now (~2 min)"
             else:
-                return {
-                    "response": f"✅ Generated comparison page for {competitor.title()}\n\n⚠️ GitHub push failed: {github_result.get('error', 'Unknown error')}\n\nContent saved to Supabase as draft."
-                }
+                response_text = f"✅ Generated comparison page for {competitor.title()}\n\n⚠️ GitHub push failed: {github_result.get('error', 'Unknown error')}\n\nContent saved to Supabase as draft."
+            
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
         
         elif action == "ANALYZE_GAPS":
-            return {
-                "response": "📊 To analyze content gaps, click 'Run Content Analysis' button above. This will:\n\n1. Check existing content in Supabase\n2. Analyze SEO keywords from GSC\n3. Identify missing competitor comparisons\n4. Suggest new content opportunities\n\nThe analysis will generate actionable items you can execute."
-            }
+            response_text = "📊 To analyze content gaps, click 'Run Content Analysis' button above. This will:\n\n1. Check existing content in Supabase\n2. Analyze SEO keywords from GSC\n3. Identify missing competitor comparisons\n4. Suggest new content opportunities\n\nThe analysis will generate actionable items you can execute."
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
         
         else:
             # General question - let Claude answer
@@ -159,9 +169,9 @@ Be helpful, concise, and actionable. If relevant, mention what content actions y
                 }]
             )
             
-            return {
-                "response": answer.content[0].text
-            }
+            response_text = answer.content[0].text
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
     
     except Exception as e:
         logger.error(f"Chat error: {e}")
