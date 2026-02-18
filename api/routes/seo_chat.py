@@ -58,6 +58,17 @@ async def chat_with_seo_agent(request: Dict[str, Any] = Body(...)):
     try:
         sb = get_supabase()
 
+        # ── Load chat history for context ────────────────────────────────
+        history = await get_chat_history("seo", user_id)
+        # Build conversation context (last 10 messages for Claude)
+        conversation_context = ""
+        if history and len(history) > 1:  # More than just current message
+            recent = history[-11:-1]  # Last 10 messages before current
+            conversation_context = "\n\nRecent conversation:\n"
+            for msg in recent:
+                role = "User" if msg["role"] == "user" else "Agent"
+                conversation_context += f"{role}: {msg['message'][:150]}\n"
+
         # ── Build context ────────────────────────────────────────────────
         # Recent keywords
         try:
@@ -92,7 +103,8 @@ async def chat_with_seo_agent(request: Dict[str, Any] = Body(...)):
             messages=[{
                 "role": "user",
                 "content": f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform).
-A user sent: "{message}"
+{conversation_context}
+Current message: "{message}"
 {kw_summary}{action_summary}
 
 Classify their intent as ONE of:
@@ -347,8 +359,8 @@ EXPLANATION: [one sentence]"""
                 messages=[{
                     "role": "user",
                     "content": f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform targeting SMB SaaS companies).
-
-User question: "{message}"
+{conversation_context}
+Current question: "{message}"
 
 Context:
 - Competitors: Gainsight, Totango, ChurnZero
@@ -369,8 +381,8 @@ Give specific, actionable SEO strategy advice. Reference real successifier.com p
                 messages=[{
                     "role": "user",
                     "content": f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform).
-
-User message: "{message}"
+{conversation_context}
+Current message: "{message}"
 
 Answer helpfully and concisely. If they want to take action, tell them exactly what to say (e.g. 'Say "run audit" to trigger a technical audit').
 
