@@ -3,8 +3,10 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from agents.seo import seo_agent
+from api.routes.seo_chat import router as chat_router
 
 router = APIRouter()
+router.include_router(chat_router)
 
 
 @router.get("/status")
