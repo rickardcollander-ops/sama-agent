@@ -208,12 +208,128 @@ async def delete_keyword(keyword: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _build_fingerprint(keywords: list) -> str:
+    """Build a hash of current keyword data to detect significant changes"""
+    import hashlib, json
+    ranked = sorted(
+        [{"k": kw["keyword"], "p": kw.get("current_position"), "c": kw.get("current_clicks", 0)}
+         for kw in keywords if kw.get("current_position")],
+        key=lambda x: x["k"]
+    )
+    raw = json.dumps({"count": len(keywords), "ranked": ranked}, sort_keys=True)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _strategy_to_tasks(strategy: dict) -> list:
+    """Flatten all strategy actions into a task checklist"""
+    import uuid as _uuid
+    from datetime import datetime
+    tasks = []
+
+    for win in strategy.get("quick_wins", []):
+        tasks.append({
+            "id": str(_uuid.uuid4()),
+            "title": win.get("title", ""),
+            "detail": win.get("action", ""),
+            "category": "quick_win",
+            "impact": win.get("impact", "medium"),
+            "effort": win.get("effort", "medium"),
+            "timeframe": win.get("timeframe", ""),
+            "done": False,
+            "done_at": None
+        })
+
+    for month_key, month_label in [("month1", "Month 1"), ("month2", "Month 2"), ("month3", "Month 3")]:
+        for block in strategy.get(month_key, []):
+            for action in block.get("actions", []):
+                tasks.append({
+                    "id": str(_uuid.uuid4()),
+                    "title": action,
+                    "detail": block.get("focus", ""),
+                    "category": month_key,
+                    "impact": "medium",
+                    "effort": "medium",
+                    "timeframe": month_label,
+                    "done": False,
+                    "done_at": None
+                })
+
+    for pri in strategy.get("technical_priorities", []):
+        tasks.append({
+            "id": str(_uuid.uuid4()),
+            "title": pri,
+            "detail": "",
+            "category": "technical",
+            "impact": "high",
+            "effort": "medium",
+            "timeframe": "Ongoing",
+            "done": False,
+            "done_at": None
+        })
+
+    return tasks
+
+
+@router.get("/strategy")
+async def load_seo_strategy():
+    """Load the most recent saved strategy"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_strategies").select("*").order("created_at", desc=True).limit(1).execute()
+        row = (result.data or [None])[0]
+        if not row:
+            return {"success": True, "strategy": None}
+        return {
+            "success": True,
+            "strategy": row["strategy_json"],
+            "tasks": row["tasks"],
+            "headline": row["headline"],
+            "created_at": row["created_at"],
+            "id": row["id"],
+            "data_fingerprint": row["data_fingerprint"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/strategy/tasks/{task_id}")
+async def update_task(task_id: str, data: dict):
+    """Toggle a task done/undone"""
+    from shared.database import get_supabase
+    from datetime import datetime
+    import json
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_strategies").select("id,tasks").order("created_at", desc=True).limit(1).execute()
+        row = (result.data or [None])[0]
+        if not row:
+            raise HTTPException(status_code=404, detail="No strategy found")
+
+        tasks = row["tasks"] or []
+        done = data.get("done", False)
+        for task in tasks:
+            if task["id"] == task_id:
+                task["done"] = done
+                task["done_at"] = datetime.utcnow().isoformat() if done else None
+                break
+
+        sb.table("seo_strategies").update({"tasks": tasks, "updated_at": datetime.utcnow().isoformat()}).eq("id", row["id"]).execute()
+        return {"success": True, "tasks": tasks}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/strategy")
-async def get_seo_strategy():
-    """Generate a strategic SEO plan using Claude based on current data"""
+async def get_seo_strategy(force: bool = False):
+    """Generate a strategic SEO plan using Claude. Skips generation if data hasn't changed significantly."""
     from shared.database import get_supabase
     from anthropic import Anthropic
     from shared.config import settings
+    import json, re
+    from datetime import datetime
 
     try:
         sb = get_supabase()
@@ -221,6 +337,25 @@ async def get_seo_strategy():
         # Gather keyword data
         kw_result = sb.table("seo_keywords").select("*").execute()
         keywords = kw_result.data or []
+
+        current_fingerprint = _build_fingerprint(keywords)
+
+        # Check if existing strategy has same fingerprint
+        if not force:
+            existing = sb.table("seo_strategies").select("*").order("created_at", desc=True).limit(1).execute()
+            existing_row = (existing.data or [None])[0]
+            if existing_row and existing_row.get("data_fingerprint") == current_fingerprint:
+                return {
+                    "success": True,
+                    "cached": True,
+                    "strategy": existing_row["strategy_json"],
+                    "tasks": existing_row["tasks"],
+                    "headline": existing_row["headline"],
+                    "created_at": existing_row["created_at"],
+                    "id": existing_row["id"],
+                    "data_fingerprint": current_fingerprint,
+                    "message": "Data hasn't changed significantly — showing existing strategy."
+                }
 
         ranked    = [k for k in keywords if k.get("current_position") and k["current_position"] > 0]
         unranked  = [k for k in keywords if not k.get("current_position")]
@@ -238,8 +373,7 @@ async def get_seo_strategy():
 Latest Audit ({latest_audit.get('audit_date', '')[:10]}):
 - Critical issues: {len(latest_audit.get('critical_issues') or [])}
 - High issues: {len(latest_audit.get('high_issues') or [])}
-- LCP: {latest_audit.get('lcp_score', 'N/A')}ms
-- CLS: {latest_audit.get('cls_score', 'N/A')}
+- LCP: {latest_audit.get('lcp_score', 'N/A')}ms, CLS: {latest_audit.get('cls_score', 'N/A')}
 """
 
         kw_summary = "\n".join([
@@ -268,15 +402,15 @@ Give your response in this exact JSON structure:
   "quick_wins": [
     {{"title": "...", "action": "...", "impact": "high|medium", "effort": "low|medium|high", "timeframe": "1-2 weeks"}}
   ],
-  "month1": [{{"focus": "...", "actions": ["..."]}}],
-  "month2": [{{"focus": "...", "actions": ["..."]}}],
-  "month3": [{{"focus": "...", "actions": ["..."]}}],
+  "month1": [{{"focus": "...", "actions": ["...","...","..."]}}],
+  "month2": [{{"focus": "...", "actions": ["...","...","..."]}}],
+  "month3": [{{"focus": "...", "actions": ["...","...","..."]}}],
   "content_gaps": ["keyword or topic to target"],
-  "technical_priorities": ["..."],
+  "technical_priorities": ["...","..."],
   "kpi_targets": {{"top10_keywords": 0, "monthly_clicks": 0, "avg_position": 0}}
 }}
 
-Be specific to successifier.com and the customer success SaaS space. Focus on realistic wins."""
+Be specific to successifier.com and the customer success SaaS space. Focus on realistic wins. Make each action in month1/month2/month3 a concrete single task someone can do and check off."""
 
         client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         response = client.messages.create(
@@ -285,16 +419,37 @@ Be specific to successifier.com and the customer success SaaS space. Focus on re
             messages=[{"role": "user", "content": prompt}]
         )
 
-        import json, re
         text = response.content[0].text.strip()
-        # Extract JSON from response
         match = re.search(r'\{[\s\S]*\}', text)
         if match:
             strategy = json.loads(match.group())
         else:
             strategy = {"headline": text, "quick_wins": [], "month1": [], "month2": [], "month3": [], "content_gaps": [], "technical_priorities": [], "kpi_targets": {}}
 
-        return {"success": True, "strategy": strategy, "data_summary": {"total_keywords": len(keywords), "ranked": len(ranked), "top10": len(top10)}}
+        tasks = _strategy_to_tasks(strategy)
+
+        # Save to DB
+        row = sb.table("seo_strategies").insert({
+            "headline": strategy.get("headline", ""),
+            "strategy_json": strategy,
+            "tasks": tasks,
+            "data_fingerprint": current_fingerprint,
+            "ranked_keywords_count": len(ranked),
+            "total_keywords_count": len(keywords),
+        }).execute()
+
+        saved_id = (row.data or [{}])[0].get("id")
+
+        return {
+            "success": True,
+            "cached": False,
+            "strategy": strategy,
+            "tasks": tasks,
+            "headline": strategy.get("headline", ""),
+            "created_at": datetime.utcnow().isoformat(),
+            "id": saved_id,
+            "data_fingerprint": current_fingerprint
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
