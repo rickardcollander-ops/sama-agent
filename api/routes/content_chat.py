@@ -46,6 +46,21 @@ async def chat_with_content_agent(request: Dict[str, Any] = Body(...)):
                 "response": "Content agent is not configured. Please set ANTHROPIC_API_KEY in Railway."
             }
         
+        # Fetch current content from Supabase for context
+        from shared.database import get_supabase
+        sb = get_supabase()
+        
+        try:
+            content_result = sb.table("content_pieces").select("*").order("created_at", desc=True).limit(20).execute()
+            saved_content = content_result.data or []
+        except Exception:
+            saved_content = []
+        
+        # Build context about saved content
+        content_summary = f"\n\nCurrent content in database ({len(saved_content)} pieces):\n"
+        for cp in saved_content[:10]:
+            content_summary += f"- {cp.get('title', 'Untitled')} ({cp.get('status', 'draft')}, {cp.get('type', 'unknown')}, {cp.get('word_count', 0)} words)\n"
+        
         # Ask Claude to interpret the user's request
         interpretation = content_agent.client.messages.create(
             model=content_agent.model,
@@ -55,21 +70,27 @@ async def chat_with_content_agent(request: Dict[str, Any] = Body(...)):
                 "content": f"""You are the Content Agent for Successifier. A user has sent you this message:
 
 "{message}"
+{content_summary}
 
 Interpret their request and respond with ONE of these actions:
 1. CREATE_BLOG_POST - if they want to create a blog post
 2. CREATE_COMPARISON - if they want to create a competitor comparison page
 3. ANALYZE_GAPS - if they want to analyze content gaps
-4. GENERAL_QUESTION - if they're asking a general question
+4. LIST_CONTENT - if they want to see what content exists
+5. PUBLISH_CONTENT - if they want to publish a draft
+6. DELETE_CONTENT - if they want to delete content
+7. GENERAL_QUESTION - if they're asking a general question
 
 Also extract key parameters:
 - topic: the main topic/keyword
 - competitor: competitor name (if applicable)
+- content_title: exact title of content to modify (if applicable)
 
 Respond in this exact format:
 ACTION: [action type]
 TOPIC: [topic]
 COMPETITOR: [competitor name or N/A]
+CONTENT_TITLE: [exact title or N/A]
 EXPLANATION: [brief explanation of what you'll do]"""
             }]
         )
@@ -81,6 +102,7 @@ EXPLANATION: [brief explanation of what you'll do]"""
         action = None
         topic = None
         competitor = None
+        content_title = None
         explanation = ""
         
         for line in lines:
@@ -92,6 +114,10 @@ EXPLANATION: [brief explanation of what you'll do]"""
                 competitor = line.split(":", 1)[1].strip()
                 if competitor.lower() == "n/a":
                     competitor = None
+            elif line.startswith("CONTENT_TITLE:"):
+                content_title = line.split(":", 1)[1].strip()
+                if content_title.lower() == "n/a":
+                    content_title = None
             elif line.startswith("EXPLANATION:"):
                 explanation = line.split(":", 1)[1].strip()
         
@@ -146,6 +172,70 @@ EXPLANATION: [brief explanation of what you'll do]"""
             else:
                 response_text = f"✅ Generated comparison page for {competitor.title()}\n\n⚠️ GitHub push failed: {github_result.get('error', 'Unknown error')}\n\nContent saved to Supabase as draft."
             
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
+        
+        elif action == "LIST_CONTENT":
+            # List all saved content
+            response_lines = [f"📚 **Content Library** ({len(saved_content)} pieces):\n"]
+            
+            for cp in saved_content:
+                status_emoji = "✅" if cp.get("status") == "published" else "📝"
+                title = cp.get("title", "Untitled")
+                content_type = cp.get("type", "unknown")
+                word_count = cp.get("word_count", 0)
+                status = cp.get("status", "draft")
+                
+                response_lines.append(f"{status_emoji} **{title}**")
+                response_lines.append(f"   Type: {content_type} | Status: {status} | {word_count} words\n")
+            
+            response_text = "\n".join(response_lines)
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
+        
+        elif action == "PUBLISH_CONTENT":
+            if not content_title:
+                response_text = "Please specify which content to publish (e.g., 'Publish Successifier vs Gainsight')"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            # Find content by title
+            matching = [cp for cp in saved_content if content_title.lower() in cp.get("title", "").lower()]
+            
+            if not matching:
+                response_text = f"❌ Could not find content with title containing '{content_title}'"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            content = matching[0]
+            
+            # Update status to published
+            sb.table("content_pieces").update({"status": "published"}).eq("id", content["id"]).execute()
+            
+            response_text = f"✅ Published: **{content.get('title')}**\n\nStatus changed from draft to published."
+            await save_message("content", "agent", response_text, user_id)
+            return {"response": response_text}
+        
+        elif action == "DELETE_CONTENT":
+            if not content_title:
+                response_text = "Please specify which content to delete (e.g., 'Delete Successifier vs Gainsight')"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            # Find content by title
+            matching = [cp for cp in saved_content if content_title.lower() in cp.get("title", "").lower()]
+            
+            if not matching:
+                response_text = f"❌ Could not find content with title containing '{content_title}'"
+                await save_message("content", "agent", response_text, user_id)
+                return {"response": response_text}
+            
+            content = matching[0]
+            
+            # Delete from database
+            sb.table("content_pieces").delete().eq("id", content["id"]).execute()
+            
+            response_text = f"🗑️ Deleted: **{content.get('title')}**\n\nContent removed from database."
             await save_message("content", "agent", response_text, user_id)
             return {"response": response_text}
         
