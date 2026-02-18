@@ -219,11 +219,16 @@ Be specific and actionable."""}]
                 }
         elif action_type == "technical":
             # Check if this is a 404 for a comparison page
+            target_page = action.get("target_page", "")
             title = action.get("title", "")
-            if "vs/" in title and "404" in title.lower():
+            
+            # Check both target_page and title for vs/ URLs
+            url_to_check = target_page or title
+            
+            if "vs/" in url_to_check and ("404" in title.lower() or "not found" in title.lower()):
                 # Extract competitor name from URL
                 import re
-                match = re.search(r'/vs/(\w+)', title)
+                match = re.search(r'/vs/(\w+)', url_to_check)
                 if match:
                     competitor = match.group(1)
                     
