@@ -164,6 +164,9 @@ async def create_comparison_page(
     """
     file_path = f"app/vs/{competitor}/page.tsx"
     
+    # Escape content for JSX (replace backticks and handle quotes)
+    content_escaped = content.replace('`', '\\`').replace('${', '\\${')
+    
     # Create Next.js page component
     page_content = f"""export default function {competitor.title()}ComparisonPage() {{
   return (
@@ -173,7 +176,7 @@ async def create_comparison_page(
           Successifier vs {competitor.title()}
         </h1>
         <div className="prose prose-slate max-w-none">
-          {content}
+          <div dangerouslySetInnerHTML={{{{ __html: `{content_escaped}` }}}} />
         </div>
       </div>
     </div>
