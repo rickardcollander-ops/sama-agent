@@ -249,12 +249,17 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         # Record DECIDE phase
         await ooda.decide(actions)
         
+        # Save actions to database
+        from shared.actions_db import save_actions
+        action_ids = await save_actions("seo", actions)
+        
         # Return analysis results (ACT phase happens via /execute endpoint)
         return {
             "success": True,
             "cycle_id": cycle_id,
             "cycle_number": ooda.cycle_number,
             "ooda_status": "decided",
+            "actions_saved": len(action_ids),
             "summary": {
                 "total_actions": len(actions),
                 "critical": sum(1 for a in actions if a["priority"] == "critical"),

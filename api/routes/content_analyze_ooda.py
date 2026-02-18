@@ -170,4 +170,12 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
         
         return actions
     
-    return await run_agent_ooda_cycle("content", observe, orient, decide)
+    result = await run_agent_ooda_cycle("content", observe, orient, decide)
+    
+    # Save actions to database
+    from shared.actions_db import save_actions
+    if result.get("success") and result.get("actions"):
+        action_ids = await save_actions("content", result["actions"])
+        result["actions_saved"] = len(action_ids)
+    
+    return result

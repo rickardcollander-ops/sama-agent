@@ -167,4 +167,12 @@ async def run_reviews_analysis_with_ooda() -> Dict[str, Any]:
         
         return actions
     
-    return await run_agent_ooda_cycle("reviews", observe, orient, decide)
+    result = await run_agent_ooda_cycle("reviews", observe, orient, decide)
+    
+    # Save actions to database
+    from shared.actions_db import save_actions
+    if result.get("success") and result.get("actions"):
+        action_ids = await save_actions("reviews", result["actions"])
+        result["actions_saved"] = len(action_ids)
+    
+    return result
