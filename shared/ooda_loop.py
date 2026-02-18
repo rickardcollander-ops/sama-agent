@@ -45,38 +45,48 @@ class OODALoop:
     
     async def start_cycle(self) -> str:
         """Start a new OODA cycle"""
-        # Get next cycle number
-        result = self.sb.table("agent_cycles").select("cycle_number").eq("agent_name", self.agent_name).order("cycle_number", desc=True).limit(1).execute()
-        
-        if result.data:
-            self.cycle_number = result.data[0]["cycle_number"] + 1
-        else:
+        try:
+            # Get next cycle number
+            result = self.sb.table("agent_cycles").select("cycle_number").eq("agent_name", self.agent_name).order("cycle_number", desc=True).limit(1).execute()
+            
+            if result.data:
+                self.cycle_number = result.data[0]["cycle_number"] + 1
+            else:
+                self.cycle_number = 1
+            
+            # Create new cycle record
+            cycle = self.sb.table("agent_cycles").insert({
+                "agent_name": self.agent_name,
+                "cycle_number": self.cycle_number,
+                "status": "observing",
+                "observe_started_at": datetime.utcnow().isoformat()
+            }).execute()
+            
+            self.cycle_id = cycle.data[0]["id"]
+            logger.info(f"🔄 {self.agent_name} Agent: Started OODA cycle #{self.cycle_number} (ID: {self.cycle_id})")
+            
+            return self.cycle_id
+        except Exception as e:
+            # OODA tables don't exist yet - continue without tracking
+            logger.warning(f"⚠️ OODA tracking unavailable (tables not created): {e}")
+            self.cycle_id = f"temp-{self.agent_name}-{datetime.utcnow().timestamp()}"
             self.cycle_number = 1
-        
-        # Create new cycle record
-        cycle = self.sb.table("agent_cycles").insert({
-            "agent_name": self.agent_name,
-            "cycle_number": self.cycle_number,
-            "status": "observing",
-            "observe_started_at": datetime.utcnow().isoformat()
-        }).execute()
-        
-        self.cycle_id = cycle.data[0]["id"]
-        logger.info(f"🔄 {self.agent_name} Agent: Started OODA cycle #{self.cycle_number} (ID: {self.cycle_id})")
-        
-        return self.cycle_id
+            return self.cycle_id
     
     async def observe(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """Record OBSERVE phase - data fetched from external sources"""
         if not self.cycle_id:
             raise ValueError("Must call start_cycle() first")
         
-        self.sb.table("agent_cycles").update({
-            "observations": observations,
-            "observe_completed_at": datetime.utcnow().isoformat(),
-            "status": "orienting",
-            "orient_started_at": datetime.utcnow().isoformat()
-        }).eq("id", self.cycle_id).execute()
+        try:
+            self.sb.table("agent_cycles").update({
+                "observations": observations,
+                "observe_completed_at": datetime.utcnow().isoformat(),
+                "status": "orienting",
+                "orient_started_at": datetime.utcnow().isoformat()
+            }).eq("id", self.cycle_id).execute()
+        except Exception:
+            pass  # Continue without tracking
         
         logger.info(f"👁️ {self.agent_name}: OBSERVE complete - {len(observations)} data sources")
         return observations
@@ -86,12 +96,15 @@ class OODALoop:
         if not self.cycle_id:
             raise ValueError("Must call start_cycle() first")
         
-        self.sb.table("agent_cycles").update({
-            "analysis": analysis,
-            "orient_completed_at": datetime.utcnow().isoformat(),
-            "status": "deciding",
-            "decide_started_at": datetime.utcnow().isoformat()
-        }).eq("id", self.cycle_id).execute()
+        try:
+            self.sb.table("agent_cycles").update({
+                "analysis": analysis,
+                "orient_completed_at": datetime.utcnow().isoformat(),
+                "status": "deciding",
+                "decide_started_at": datetime.utcnow().isoformat()
+            }).eq("id", self.cycle_id).execute()
+        except Exception:
+            pass
         
         logger.info(f"🧠 {self.agent_name}: ORIENT complete - {analysis.get('insights_count', 0)} insights")
         return analysis
@@ -101,12 +114,15 @@ class OODALoop:
         if not self.cycle_id:
             raise ValueError("Must call start_cycle() first")
         
-        self.sb.table("agent_cycles").update({
-            "decisions": {"actions": decisions, "count": len(decisions)},
-            "decide_completed_at": datetime.utcnow().isoformat(),
-            "status": "acting",
-            "act_started_at": datetime.utcnow().isoformat()
-        }).eq("id", self.cycle_id).execute()
+        try:
+            self.sb.table("agent_cycles").update({
+                "decisions": {"actions": decisions, "count": len(decisions)},
+                "decide_completed_at": datetime.utcnow().isoformat(),
+                "status": "acting",
+                "act_started_at": datetime.utcnow().isoformat()
+            }).eq("id", self.cycle_id).execute()
+        except Exception:
+            pass
         
         logger.info(f"🎯 {self.agent_name}: DECIDE complete - {len(decisions)} actions planned")
         return decisions
@@ -117,25 +133,28 @@ class OODALoop:
             logger.warning(f"No active cycle for {self.agent_name}, cannot record action")
             return
         
-        # Get current actions_taken
-        cycle = self.sb.table("agent_cycles").select("actions_taken").eq("id", self.cycle_id).execute()
-        actions_taken = cycle.data[0].get("actions_taken", {}) if cycle.data else {}
-        
-        if not actions_taken:
-            actions_taken = {"actions": []}
-        
-        # Add this action
-        actions_taken["actions"].append({
-            "action_id": action_id,
-            "action_data": action_data,
-            "result": result,
-            "executed_at": datetime.utcnow().isoformat()
-        })
-        
-        # Update cycle
-        self.sb.table("agent_cycles").update({
-            "actions_taken": actions_taken
-        }).eq("id", self.cycle_id).execute()
+        try:
+            # Get current actions_taken
+            cycle = self.sb.table("agent_cycles").select("actions_taken").eq("id", self.cycle_id).execute()
+            actions_taken = cycle.data[0].get("actions_taken", {}) if cycle.data else {}
+            
+            if not actions_taken:
+                actions_taken = {"actions": []}
+            
+            # Add this action
+            actions_taken["actions"].append({
+                "action_id": action_id,
+                "action_data": action_data,
+                "result": result,
+                "executed_at": datetime.utcnow().isoformat()
+            })
+            
+            # Update cycle
+            self.sb.table("agent_cycles").update({
+                "actions_taken": actions_taken
+            }).eq("id", self.cycle_id).execute()
+        except Exception:
+            pass
         
         logger.info(f"⚡ {self.agent_name}: ACT - Recorded action {action_id}")
     
