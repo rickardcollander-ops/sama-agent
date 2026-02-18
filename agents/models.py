@@ -10,7 +10,7 @@ import uuid
 
 
 # Table name constants
-KEYWORDS_TABLE = "keywords"
+KEYWORDS_TABLE = "seo_keywords"
 SEO_AUDITS_TABLE = "seo_audits"
 CONTENT_PIECES_TABLE = "content_pieces"
 BACKLINK_PROFILES_TABLE = "backlink_profiles"
