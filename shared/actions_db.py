@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[str]:
     """
-    Save actions to database
+    Save actions to database with deduplication
     
     Args:
         agent_name: Name of the agent (seo, ads, content, social, reviews)
@@ -25,10 +25,20 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
     
     for action in actions:
         try:
+            action_id = action.get("id", "")
+            
+            # Check if action already exists (pending status)
+            existing = sb.table("agent_actions").select("id").eq("agent_name", agent_name).eq("action_id", action_id).eq("status", "pending").execute()
+            
+            if existing.data:
+                logger.info(f"⏭️ Skipping duplicate action: {action.get('title', '')[:50]}")
+                created_ids.append(existing.data[0]["id"])
+                continue
+            
             # Prepare action for database
             db_action = {
                 "agent_name": agent_name,
-                "action_id": action.get("id", ""),
+                "action_id": action_id,
                 "action_type": action.get("type", ""),
                 "priority": action.get("priority", "medium"),
                 "title": action.get("title", ""),
