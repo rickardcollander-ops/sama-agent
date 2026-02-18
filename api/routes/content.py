@@ -193,6 +193,14 @@ async def get_brand_voice():
     }
 
 
+@router.get("/actions")
+async def get_content_actions(status: str = None, limit: int = 100):
+    """Get Content actions from database"""
+    from shared.actions_db import get_actions
+    actions = await get_actions(agent_name="content", status=status, limit=limit)
+    return {"success": True, "actions": actions}
+
+
 @router.post("/analyze")
 async def run_content_analysis():
     """Analyze content using OODA loop (Observe → Orient → Decide → Act → Reflect)"""

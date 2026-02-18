@@ -142,6 +142,14 @@ async def discover_opportunities():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/actions")
+async def get_seo_actions(status: str = None, limit: int = 100):
+    """Get SEO actions from database"""
+    from shared.actions_db import get_actions
+    actions = await get_actions(agent_name="seo", status=status, limit=limit)
+    return {"success": True, "actions": actions}
+
+
 @router.post("/analyze")
 async def run_full_analysis():
     """Run full SEO analysis using OODA loop (Observe → Orient → Decide → Act → Reflect)"""

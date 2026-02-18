@@ -103,6 +103,14 @@ async def analyze_reviews_manual(request: ReviewAnalysisRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/actions")
+async def get_reviews_actions(status: str = None, limit: int = 100):
+    """Get Reviews actions from database"""
+    from shared.actions_db import get_actions
+    actions = await get_actions(agent_name="reviews", status=status, limit=limit)
+    return {"success": True, "actions": actions}
+
+
 @router.post("/analyze")
 async def run_review_analysis():
     """Analyze reviews using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
