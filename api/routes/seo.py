@@ -166,6 +166,110 @@ async def add_keyword(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/keywords/{keyword:path}")
+async def delete_keyword(keyword: str):
+    """Remove a keyword from tracking"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_keywords").delete().eq("keyword", keyword).execute()
+        return {"success": True, "message": f'Removed "{keyword}"'}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/strategy")
+async def get_seo_strategy():
+    """Generate a strategic SEO plan using Claude based on current data"""
+    from shared.database import get_supabase
+    from anthropic import Anthropic
+    from shared.config import settings
+
+    try:
+        sb = get_supabase()
+
+        # Gather keyword data
+        kw_result = sb.table("seo_keywords").select("*").execute()
+        keywords = kw_result.data or []
+
+        ranked    = [k for k in keywords if k.get("current_position") and k["current_position"] > 0]
+        unranked  = [k for k in keywords if not k.get("current_position")]
+        top3      = [k for k in ranked if k["current_position"] <= 3]
+        top10     = [k for k in ranked if k["current_position"] <= 10]
+        page2     = [k for k in ranked if 11 <= k["current_position"] <= 20]
+
+        # Latest audit
+        audit_result = sb.table("seo_audits").select("*").order("audit_date", desc=True).limit(1).execute()
+        latest_audit = (audit_result.data or [None])[0]
+
+        audit_summary = ""
+        if latest_audit:
+            audit_summary = f"""
+Latest Audit ({latest_audit.get('audit_date', '')[:10]}):
+- Critical issues: {len(latest_audit.get('critical_issues') or [])}
+- High issues: {len(latest_audit.get('high_issues') or [])}
+- LCP: {latest_audit.get('lcp_score', 'N/A')}ms
+- CLS: {latest_audit.get('cls_score', 'N/A')}
+"""
+
+        kw_summary = "\n".join([
+            f"- '{k['keyword']}' pos={k['current_position']} clicks={k.get('current_clicks',0)} impressions={k.get('current_impressions',0)} intent={k.get('intent','')} priority={k.get('priority','')}"
+            for k in sorted(ranked, key=lambda x: x["current_position"])
+        ]) or "No ranked keywords yet"
+
+        unranked_summary = ", ".join([f"'{k['keyword']}'" for k in unranked[:10]])
+
+        prompt = f"""You are an expert SEO strategist. Analyze this data for successifier.com (AI customer success platform) and give a concrete 90-day SEO strategy.
+
+KEYWORD DATA:
+Tracked: {len(keywords)} keywords total
+Ranked (have position data): {len(ranked)}
+Top 3: {len(top3)} | Top 10: {len(top10)} | Page 2 (positions 11-20): {len(page2)}
+
+Ranked keywords:
+{kw_summary}
+
+Unranked keywords (no GSC data yet): {unranked_summary}
+{audit_summary}
+
+Give your response in this exact JSON structure:
+{{
+  "headline": "one-line strategic summary",
+  "quick_wins": [
+    {{"title": "...", "action": "...", "impact": "high|medium", "effort": "low|medium|high", "timeframe": "1-2 weeks"}}
+  ],
+  "month1": [{{"focus": "...", "actions": ["..."]}}],
+  "month2": [{{"focus": "...", "actions": ["..."]}}],
+  "month3": [{{"focus": "...", "actions": ["..."]}}],
+  "content_gaps": ["keyword or topic to target"],
+  "technical_priorities": ["..."],
+  "kpi_targets": {{"top10_keywords": 0, "monthly_clicks": 0, "avg_position": 0}}
+}}
+
+Be specific to successifier.com and the customer success SaaS space. Focus on realistic wins."""
+
+        client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        import json, re
+        text = response.content[0].text.strip()
+        # Extract JSON from response
+        match = re.search(r'\{[\s\S]*\}', text)
+        if match:
+            strategy = json.loads(match.group())
+        else:
+            strategy = {"headline": text, "quick_wins": [], "month1": [], "month2": [], "month3": [], "content_gaps": [], "technical_priorities": [], "kpi_targets": {}}
+
+        return {"success": True, "strategy": strategy, "data_summary": {"total_keywords": len(keywords), "ranked": len(ranked), "top10": len(top10)}}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/discover-opportunities")
 async def discover_opportunities():
     """Discover new keyword opportunities"""
