@@ -322,9 +322,20 @@ async def execute_social_action(action: Dict[str, Any] = Body(...)):
     """Execute a social media action"""
     if not action:
         raise HTTPException(status_code=400, detail="No action provided")
-    
+
     action_type = action.get("type", "")
-    
+    action_db_id = action.get("db_id")  # UUID from agent_actions table
+
+    async def _mark_completed(result_data: dict):
+        """Helper to mark action as completed in DB"""
+        if action_db_id:
+            try:
+                from shared.actions_db import update_action_status
+                await update_action_status(action_db_id, "completed", execution_result=result_data)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Could not update action status: {e}")
+
     try:
         if action_type == "generate_post":
             topic = action.get("topic", "customer success tips")
@@ -335,12 +346,10 @@ async def execute_social_action(action: Dict[str, Any] = Body(...)):
                 style=style,
                 thread=is_thread
             )
-            return {
-                "success": True,
-                "action_type": "post_generated",
-                "result": result
-            }
-        
+            response = {"success": True, "action_type": "post_generated", "result": result}
+            await _mark_completed(result)
+            return response
+
         elif action_type == "generate_thread":
             topic = action.get("topic", "customer success best practices")
             result = await social_agent.generate_post(
@@ -348,68 +357,74 @@ async def execute_social_action(action: Dict[str, Any] = Body(...)):
                 style=action.get("style", "educational"),
                 thread=True
             )
-            return {
-                "success": True,
-                "action_type": "thread_generated",
-                "result": result
-            }
-        
-        elif action_type == "reply":
+            response = {"success": True, "action_type": "thread_generated", "result": result}
+            await _mark_completed(result)
+            return response
+
+        elif action_type in ("reply", "competitor_engage", "engage_interesting"):
             original_tweet = action.get("original_tweet", "")
             if original_tweet:
+                context_map = {
+                    "reply": f"User: @{action.get('username', 'unknown')}",
+                    "competitor_engage": "This user is frustrated with a competitor. Be empathetic, provide value, mention Successifier only if directly relevant.",
+                    "engage_interesting": "This user is discussing customer success challenges. Provide genuine value and insight. Only mention Successifier if it's directly relevant to their specific problem."
+                }
                 reply = await social_agent.generate_reply(
                     original_tweet=original_tweet,
-                    context=f"User: @{action.get('username', 'unknown')}"
+                    context=context_map.get(action_type, "")
                 )
-                return {
-                    "success": True,
-                    "action_type": "reply_generated",
-                    "result": {
-                        "reply": reply,
-                        "original_tweet": original_tweet[:200],
-                        "status": "draft"
-                    }
+                result_data = {
+                    "reply": reply,
+                    "original_tweet": original_tweet[:200],
+                    "tweet_url": action.get("tweet_url", ""),
+                    "username": action.get("username", ""),
+                    "status": "draft"
                 }
+                await _mark_completed(result_data)
+                return {"success": True, "action_type": "reply_generated", "result": result_data}
             return {"success": False, "message": "No original tweet provided"}
-        
-        elif action_type == "competitor_engage":
-            original_tweet = action.get("original_tweet", "")
-            if original_tweet:
-                reply = await social_agent.generate_reply(
-                    original_tweet=original_tweet,
-                    context="This user is frustrated with a competitor. Be empathetic, provide value, mention Successifier only if directly relevant."
-                )
-                return {
-                    "success": True,
-                    "action_type": "competitor_reply_generated",
-                    "result": {
-                        "reply": reply,
-                        "original_tweet": original_tweet[:200],
-                        "status": "draft"
-                    }
-                }
-            return {"success": False, "message": "No original tweet provided"}
-        
+
         elif action_type == "publish":
             content = action.get("content", "")
             tweet_id = action.get("reply_to")
             if content:
                 result = await social_agent.publish_tweet(text=content, reply_to=tweet_id)
-                return {
-                    "success": True,
-                    "action_type": "tweet_published",
-                    "result": result
-                }
+                await _mark_completed(result)
+                return {"success": True, "action_type": "tweet_published", "result": result}
             return {"success": False, "message": "No content to publish"}
-        
+
         elif action_type == "config":
             return {
                 "success": False,
                 "message": "Twitter API configuration must be done in Railway environment variables. Set TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET."
             }
-        
+
         else:
             return {"success": False, "message": f"Unknown action type: {action_type}"}
-    
+
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@router.get("/drafts")
+async def get_social_drafts(limit: int = 20):
+    """Get generated social content drafts from content_pieces"""
+    from shared.database import get_supabase
+    try:
+        sb = get_supabase()
+        result = sb.table("content_pieces").select("*").eq("created_by", "sama_social").order(
+            "created_at", desc=True
+        ).limit(limit).execute()
+        return {"success": True, "drafts": result.data or []}
+    except Exception as e:
+        return {"success": False, "drafts": [], "error": str(e)}
+
+
+@router.get("/interesting-tweets")
+async def get_interesting_tweets():
+    """Search for interesting tweets about CS pain points"""
+    try:
+        tweets = await social_agent.search_interesting_tweets(max_results=20)
+        return {"success": True, "tweets": tweets, "count": len(tweets)}
+    except Exception as e:
+        return {"success": False, "tweets": [], "error": str(e)}

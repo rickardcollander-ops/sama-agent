@@ -10,77 +10,93 @@ from datetime import datetime, timedelta
 
 async def run_social_analysis_with_ooda() -> Dict[str, Any]:
     """Run Social analysis using OODA loop"""
-    
+
     async def observe():
         """OBSERVE: Fetch social media data"""
         observations = {}
-        
+
         observations["twitter_configured"] = is_twitter_configured()
-        
-        # Fetch mentions if Twitter is configured
+
         if observations["twitter_configured"]:
             try:
                 observations["mentions"] = await social_agent.get_mentions(max_results=20)
             except Exception:
                 observations["mentions"] = []
-            
+
             try:
                 observations["competitor_tweets"] = await social_agent.search_competitor_mentions(max_results=10)
             except Exception:
                 observations["competitor_tweets"] = []
+
+            # NEW: search interesting tweets for engagement opportunities
+            try:
+                observations["interesting_tweets"] = await social_agent.search_interesting_tweets(max_results=15)
+            except Exception:
+                observations["interesting_tweets"] = []
         else:
             observations["mentions"] = []
             observations["competitor_tweets"] = []
-        
+            observations["interesting_tweets"] = []
+
         observations["content_calendar"] = social_agent.CONTENT_CALENDAR
         observations["engagement_rules"] = social_agent.ENGAGEMENT_RULES
-        
+
         return observations
-    
+
     async def orient(observations):
         """ORIENT: Analyze social engagement opportunities"""
         analysis = create_analysis_structure()
-        
+
         mentions = observations.get("mentions", [])
         competitor_tweets = observations.get("competitor_tweets", [])
+        interesting_tweets = observations.get("interesting_tweets", [])
         twitter_configured = observations.get("twitter_configured", False)
-        
+
         # Analyze mention engagement opportunities
         high_value_mentions = [m for m in mentions if m.get("user", {}).get("followers_count", 0) > 500]
         if high_value_mentions:
             add_pattern(analysis, "high_value_mentions", {"count": len(high_value_mentions)})
-        
+
         # Analyze competitor opportunities
         if competitor_tweets:
             add_pattern(analysis, "competitor_opportunities", {"count": len(competitor_tweets)})
-        
+
+        # Analyze interesting tweet engagement opportunities
+        high_engagement_tweets = [t for t in interesting_tweets if t.get("engagement_score", 0) > 10]
+        if high_engagement_tweets:
+            add_pattern(analysis, "interesting_tweet_opportunities", {
+                "count": len(interesting_tweets),
+                "high_engagement": len(high_engagement_tweets)
+            })
+
         # Check if Twitter is configured
         if not twitter_configured:
             add_anomaly(analysis, "twitter_not_configured", "critical", {"message": "Cannot post or monitor mentions"})
-        
+
         # Analyze content calendar coverage
         today = datetime.now()
         upcoming_days = [(today + timedelta(days=i)).strftime("%A").lower() for i in range(7)]
         calendar_coverage = sum(1 for day in upcoming_days if day in observations.get("content_calendar", {}))
         if calendar_coverage < 7:
             add_pattern(analysis, "content_calendar_gaps", {"days_covered": calendar_coverage, "days_total": 7})
-        
+
         return analysis
-    
+
     async def decide(analysis, observations):
         """DECIDE: Generate social media actions"""
         actions = []
         mentions = observations.get("mentions", [])
         competitor_tweets = observations.get("competitor_tweets", [])
+        interesting_tweets = observations.get("interesting_tweets", [])
         content_calendar = observations.get("content_calendar", {})
         twitter_configured = observations.get("twitter_configured", False)
-        
+
         # Generate content calendar actions
         today = datetime.now()
         for day_offset in range(7):
             post_date = today + timedelta(days=day_offset)
             day_name = post_date.strftime("%A").lower()
-            
+
             if day_name in content_calendar:
                 day_config = content_calendar[day_name]
                 actions.append(create_action(
@@ -96,7 +112,7 @@ async def run_social_analysis_with_ooda() -> Dict[str, Any]:
                     is_thread=day_config["format"] == "Educational thread",
                     scheduled_date=post_date.strftime("%Y-%m-%d")
                 ))
-        
+
         # Generate mention reply actions
         for mention in mentions:
             user = mention.get("user", {})
@@ -104,7 +120,7 @@ async def run_social_analysis_with_ooda() -> Dict[str, Any]:
             username = user.get("username", "unknown")
             text = mention.get("text", "")
             priority = "high" if followers > 500 else "medium" if followers > 100 else "low"
-            
+
             actions.append(create_action(
                 f"social-reply-{mention.get('id', '')}",
                 "reply",
@@ -117,13 +133,13 @@ async def run_social_analysis_with_ooda() -> Dict[str, Any]:
                 tweet_id=mention.get("id", ""),
                 username=username
             ))
-        
+
         # Competitor opportunity actions
         for tweet in competitor_tweets:
             user = tweet.get("user", {})
             username = user.get("username", "unknown")
             text = tweet.get("text", "")
-            
+
             actions.append(create_action(
                 f"social-competitor-{tweet.get('id', '')}",
                 "competitor_engage",
@@ -136,7 +152,33 @@ async def run_social_analysis_with_ooda() -> Dict[str, Any]:
                 tweet_id=tweet.get("id", ""),
                 username=username
             ))
-        
+
+        # Interesting tweet engagement actions (new)
+        for tweet in interesting_tweets[:10]:  # cap at 10
+            user = tweet.get("user", {})
+            username = user.get("username", "unknown")
+            followers = user.get("followers_count", 0)
+            text = tweet.get("text", "")
+            engagement = tweet.get("engagement_score", 0)
+            tweet_url = tweet.get("tweet_url", "")
+
+            # Only reply to tweets with some traction
+            priority = "high" if engagement > 50 or followers > 1000 else "medium"
+
+            actions.append(create_action(
+                f"social-engage-{tweet.get('id', '')}",
+                "engage_interesting",
+                priority,
+                f"Engage with @{username} on CS pain point",
+                f"{text[:150]}... ({engagement} engagements)",
+                "Reply to this customer success discussion with a valuable insight",
+                {"type": "thought_leadership", "expected_engagement": engagement},
+                original_tweet=text,
+                tweet_id=tweet.get("id", ""),
+                username=username,
+                tweet_url=tweet_url
+            ))
+
         # Thread creation action
         actions.append(create_action(
             "social-thread-weekly",
@@ -149,7 +191,7 @@ async def run_social_analysis_with_ooda() -> Dict[str, Any]:
             topic="customer success best practices for reducing churn",
             style="educational"
         ))
-        
+
         # Twitter configuration action if needed
         if not twitter_configured:
             actions.append(create_action(
@@ -161,19 +203,23 @@ async def run_social_analysis_with_ooda() -> Dict[str, Any]:
                 "Add Twitter API credentials to enable real posting and mention monitoring",
                 {"type": "infrastructure", "enables": "all_social_features"}
             ))
-        
+
         # Sort by priority
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         actions.sort(key=lambda a: priority_order.get(a.get("priority", "low"), 3))
-        
+
         return actions
-    
+
     result = await run_agent_ooda_cycle("social", observe, orient, decide)
-    
+
     # Save actions to database
     from shared.actions_db import save_actions
     if result.get("success") and result.get("actions"):
         action_ids = await save_actions("social", result["actions"])
         result["actions_saved"] = len(action_ids)
-    
+
+    # Include interesting tweets in result for dashboard display
+    if result.get("observations"):
+        result["interesting_tweets"] = result["observations"].get("interesting_tweets", [])
+
     return result

@@ -148,7 +148,7 @@ class SocialAgent:
     
     def __init__(self):
         self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-5-20250929"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
     
@@ -309,6 +309,66 @@ class SocialAgent:
         
         return results
     
+    async def search_interesting_tweets(self, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Search for interesting tweets about customer success, churn, and related pain points"""
+        if not settings.TWITTER_BEARER_TOKEN:
+            return []
+
+        # Topics that are relevant and where Successifier can add value
+        queries = [
+            '("customer success" OR "churn rate" OR "customer retention") (struggling OR challenge OR "how do you" OR "any tips" OR help) -is:retweet lang:en',
+            '("customer success manager" OR "CSM") (burnout OR overwhelmed OR "too many accounts" OR manual) -is:retweet lang:en',
+            '(churn OR "customer churn") ("Q1" OR "Q2" OR "Q3" OR "Q4" OR quarter) -is:retweet lang:en min_faves:5',
+        ]
+
+        all_tweets = []
+        seen_ids = set()
+
+        for query in queries:
+            data = await self._twitter_get("/tweets/search/recent", params={
+                "query": query,
+                "max_results": min(10, max_results),
+                "tweet.fields": "created_at,public_metrics,author_id",
+                "expansions": "author_id",
+                "user.fields": "username,public_metrics,description"
+            })
+
+            if "data" not in data:
+                continue
+
+            users = {}
+            for u in data.get("includes", {}).get("users", []):
+                users[u["id"]] = u
+
+            for tweet in data["data"]:
+                if tweet["id"] in seen_ids:
+                    continue
+                seen_ids.add(tweet["id"])
+
+                author = users.get(tweet.get("author_id"), {})
+                metrics = tweet.get("public_metrics", {})
+                engagement = metrics.get("like_count", 0) + metrics.get("retweet_count", 0) + metrics.get("reply_count", 0)
+
+                all_tweets.append({
+                    "id": tweet["id"],
+                    "text": tweet["text"],
+                    "created_at": tweet.get("created_at"),
+                    "user": {
+                        "username": author.get("username", "unknown"),
+                        "followers_count": author.get("public_metrics", {}).get("followers_count", 0),
+                        "description": author.get("description", "")
+                    },
+                    "metrics": metrics,
+                    "engagement_score": engagement,
+                    "tweet_url": f"https://twitter.com/{author.get('username', 'unknown')}/status/{tweet['id']}"
+                })
+
+        # Sort by engagement
+        all_tweets.sort(key=lambda t: t["engagement_score"], reverse=True)
+
+        logger.info(f"✅ Found {len(all_tweets)} interesting tweets")
+        return all_tweets[:max_results]
+
     async def search_competitor_mentions(self, max_results: int = 20) -> List[Dict[str, Any]]:
         """Search for competitor complaint tweets"""
         if not settings.TWITTER_BEARER_TOKEN:
@@ -420,10 +480,10 @@ Format as plain text.
             tweets = [content]
         
         tweets = [t[:280] for t in tweets]
-        
+
         logger.info(f"✅ Generated {len(tweets)} tweet(s)")
-        
-        return {
+
+        result = {
             "topic": topic,
             "style": style,
             "is_thread": thread,
@@ -431,6 +491,26 @@ Format as plain text.
             "status": "draft",
             "api_configured": is_twitter_configured()
         }
+
+        # Save to content_pieces table
+        try:
+            sb = get_supabase()
+            content_text = "\n\n".join(tweets)
+            title = topic[:200]
+            sb.table("content_pieces").insert({
+                "title": title,
+                "content_type": "thread" if thread else "tweet",
+                "content": content_text,
+                "target_keyword": style,
+                "status": "draft",
+                "word_count": len(content_text.split()),
+                "created_by": "sama_social"
+            }).execute()
+            logger.info(f"✅ Saved content to content_pieces: {title[:50]}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not save to content_pieces: {e}")
+
+        return result
     
     async def generate_and_publish(
         self,
@@ -525,15 +605,32 @@ Format as plain text.
                     thread=day_config["format"] == "Educational thread"
                 )
                 
-                scheduled_posts.append({
+                scheduled_entry = {
                     "date": post_date.strftime("%Y-%m-%d"),
                     "day": day_name,
                     "theme": day_config["theme"],
                     "format": day_config["format"],
                     "post": post,
                     "scheduled_time": "09:00"
-                })
-        
+                }
+
+                # Save to content_pieces
+                try:
+                    sb = get_supabase()
+                    content_text = "\n\n".join(post.get("tweets", []))
+                    sb.table("content_pieces").insert({
+                        "title": f"[{post_date.strftime('%Y-%m-%d')}] {day_config['theme']}",
+                        "content_type": "thread" if post.get("is_thread") else "tweet",
+                        "content": content_text,
+                        "status": "draft",
+                        "word_count": len(content_text.split()),
+                        "created_by": "sama_social"
+                    }).execute()
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not save calendar post: {e}")
+
+                scheduled_posts.append(scheduled_entry)
+
         logger.info(f"✅ Generated {len(scheduled_posts)} scheduled posts")
         return scheduled_posts
     
