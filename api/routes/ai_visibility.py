@@ -131,6 +131,42 @@ async def clear_data():
         return {"error": str(e)}
 
 
+# ── Debug: single sync test ────────────────────────────────────────────────────
+
+@router.get("/test")
+async def test_single():
+    """Run ONE prompt against ONE engine synchronously and return result — for debugging"""
+    try:
+        from anthropic import Anthropic
+        from shared.config import settings
+        c = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        msg = c.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=200,
+            system="You are ChatGPT. Answer helpfully.",
+            messages=[{"role": "user", "content": "What are the best customer success tools?"}],
+        )
+        response_text = msg.content[0].text
+        mentioned = "successifier" in response_text.lower()
+        # Try DB insert
+        sb = get_supabase()
+        sb.table("ai_visibility_checks").insert({
+            "prompt": "TEST: What are the best customer success tools?",
+            "category": "tool_recommendation",
+            "ai_engine": "ChatGPT (GPT-4o)",
+            "run_id": "test",
+            "mentioned": mentioned,
+            "rank": None,
+            "competitors_mentioned": [],
+            "sentiment": None,
+            "ai_response_excerpt": response_text[:200],
+            "full_response": response_text,
+        }).execute()
+        return {"ok": True, "mentioned": mentioned, "response_preview": response_text[:300], "db_insert": "success"}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "error_type": type(e).__name__}
+
+
 # ── GEO Recommendations ────────────────────────────────────────────────────────
 
 @router.post("/recommendations")
