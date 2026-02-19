@@ -1,14 +1,16 @@
 """
-GitHub Helper for creating files in repositories
+GitHub Helper for creating files in repositories and managing PRs/Issues
 Allows agents to create blog posts, pages, etc. directly in GitHub repos
 """
 
 import base64
 import httpx
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from shared.config import settings
-
 import re as _re
+import logging
+
+logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 
@@ -310,7 +312,7 @@ export default function {competitor.title().replace(' ', '')}ComparisonPage() {{
 """
     
     commit_message = f"Add comparison page: Successifier vs {competitor.title()}"
-    
+
     return await create_or_update_file(
         repo_owner=repo_owner,
         repo_name=repo_name,
@@ -318,3 +320,194 @@ export default function {competitor.title().replace(' ', '')}ComparisonPage() {{
         content=page_content,
         commit_message=commit_message
     )
+
+
+async def get_default_branch(
+    repo_owner: str,
+    repo_name: str,
+    token: str
+) -> str:
+    """Get the default branch name of a repo"""
+    url = f"{GITHUB_API}/repos/{repo_owner}/{repo_name}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code == 200:
+            return resp.json().get("default_branch", "master")
+    return "master"
+
+
+async def create_branch_from_default(
+    repo_owner: str,
+    repo_name: str,
+    branch_name: str,
+    token: str
+) -> Dict[str, Any]:
+    """Create a new branch from the repo's default branch"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        # Get default branch SHA
+        default_branch = await get_default_branch(repo_owner, repo_name, token)
+        ref_url = f"{GITHUB_API}/repos/{repo_owner}/{repo_name}/git/refs/heads/{default_branch}"
+        resp = await client.get(ref_url, headers=headers)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"Could not get default branch ref: {resp.status_code}"}
+
+        sha = resp.json()["object"]["sha"]
+
+        # Create new branch
+        create_url = f"{GITHUB_API}/repos/{repo_owner}/{repo_name}/git/refs"
+        resp = await client.post(create_url, headers=headers, json={
+            "ref": f"refs/heads/{branch_name}",
+            "sha": sha
+        })
+
+        if resp.status_code in (200, 201):
+            return {"success": True, "branch": branch_name, "sha": sha}
+        elif resp.status_code == 422:
+            # Branch already exists — that's fine
+            return {"success": True, "branch": branch_name, "sha": sha, "existed": True}
+        else:
+            return {"success": False, "error": f"Could not create branch: {resp.status_code} {resp.text[:200]}"}
+
+
+async def create_pull_request(
+    repo_owner: str,
+    repo_name: str,
+    title: str,
+    body: str,
+    head_branch: str,
+    token: str,
+    base_branch: Optional[str] = None,
+    labels: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Create a pull request"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    if not base_branch:
+        base_branch = await get_default_branch(repo_owner, repo_name, token)
+
+    url = f"{GITHUB_API}/repos/{repo_owner}/{repo_name}/pulls"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json={
+            "title": title,
+            "body": body,
+            "head": head_branch,
+            "base": base_branch,
+            "draft": False
+        })
+
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            pr_url = data.get("html_url", "")
+            pr_number = data.get("number", 0)
+            logger.info(f"✅ Created PR #{pr_number}: {pr_url}")
+            return {"success": True, "pr_url": pr_url, "pr_number": pr_number, "pr_id": data.get("id")}
+        else:
+            return {"success": False, "error": f"PR creation failed: {resp.status_code}", "detail": resp.text[:300]}
+
+
+async def create_blog_post_pr(
+    title: str,
+    content: str,
+    slug: str,
+    excerpt: str,
+    keywords: list,
+    meta_description: str,
+    author: str = "SAMA Agent",
+    repo_owner: str = "rickardcollander-ops",
+    repo_name: str = "successifier-homepage"
+) -> Dict[str, Any]:
+    """
+    Create a blog post as a GitHub Pull Request (feature branch → PR → review → merge).
+    Returns PR URL and branch name.
+    """
+    from datetime import datetime
+    import re
+
+    token = getattr(settings, 'GITHUB_TOKEN', '')
+    if not token:
+        return {"success": False, "error": "GITHUB_TOKEN not configured"}
+
+    # Sanitise slug
+    slug = re.sub(r'[^a-z0-9-]', '-', slug.lower()).strip('-')
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    branch_name = f"content/blog-{slug}-{datetime.utcnow().strftime('%Y%m%d%H%M')}"
+
+    # 1. Create branch
+    branch_result = await create_branch_from_default(repo_owner, repo_name, branch_name, token)
+    if not branch_result.get("success"):
+        return branch_result
+
+    # 2. Build markdown content with frontmatter
+    frontmatter = f"""---
+title: "{title}"
+date: "{date_str}"
+excerpt: "{excerpt}"
+author: "{author}"
+keywords: {keywords}
+metaDescription: "{meta_description}"
+readingTime: {max(1, len(content.split()) // 200)}
+---
+
+"""
+    full_content = frontmatter + content
+    file_path = f"content/blog/{slug}.md"
+
+    # 3. Create file on branch
+    file_result = await create_or_update_file(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        file_path=file_path,
+        content=full_content,
+        commit_message=f"content: add blog post — {title}",
+        branch=branch_name,
+        github_token=token
+    )
+
+    if not file_result.get("success"):
+        return file_result
+
+    # 4. Create PR
+    pr_body = f"""## 📝 New Blog Post — AI Generated
+
+**Title:** {title}
+**Target URL:** `/blog/{slug}`
+**Keywords:** {', '.join(keywords) if keywords else 'N/A'}
+
+### Excerpt
+{excerpt}
+
+### Meta Description
+{meta_description}
+
+---
+*Generated by SAMA SEO Agent. Review content before merging.*
+"""
+
+    pr_result = await create_pull_request(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        title=f"📝 Blog post: {title}",
+        body=pr_body,
+        head_branch=branch_name,
+        token=token
+    )
+
+    return {
+        **pr_result,
+        "file_path": file_path,
+        "branch": branch_name,
+        "slug": slug
+    }

@@ -567,13 +567,29 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
 
     try:
         if action_type == "content":
-            # Generate blog post via Content Agent
+            # Generate blog post via Content Agent, then create GitHub PR
             title = action.get("title", keyword)
             result = await content_agent.generate_blog_post(
                 topic=title,
                 target_keyword=keyword,
                 word_count=2000
             )
+
+            # Try to push as PR if GitHub token is set
+            from shared.github_helper import create_blog_post_pr
+            import re as _re
+
+            slug = _re.sub(r'[^a-z0-9]+', '-', (result.get("slug") or keyword or title).lower()).strip('-')[:60]
+            pr_result = await create_blog_post_pr(
+                title=result.get("title", title),
+                content=result.get("content", ""),
+                slug=slug,
+                excerpt=result.get("meta_description", "")[:200],
+                keywords=[keyword] if keyword else [],
+                meta_description=result.get("meta_description", ""),
+                author="SAMA SEO Agent"
+            )
+
             outcome = {
                 "success": True,
                 "action_type": "content_generated",
@@ -582,45 +598,79 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
                     "title": result.get("title", ""),
                     "word_count": result.get("word_count", 0),
                     "status": result.get("status", "draft"),
-                    "meta_description": result.get("meta_description", "")
-                }
+                    "meta_description": result.get("meta_description", ""),
+                    "slug": slug,
+                },
+                "github": pr_result
             }
             mark_done(outcome)
             return outcome
 
         elif action_type == "on_page":
-            # Generate concrete meta optimisation suggestions via Claude
+            # Generate structured on-page SEO suggestions
             description = action.get("description", "")
+            target_page = action.get("target_page", "")
             if seo_agent.client:
                 response = seo_agent.client.messages.create(
                     model=seo_agent.model,
                     max_tokens=1024,
                     messages=[{"role": "user", "content": f"""You are an SEO specialist for successifier.com — an AI customer success platform.
 
-Action context: {description}
+Page: {target_page or 'unknown'}
+Context: {description}
 Target keyword: '{keyword}'
 
-Provide:
-1. Optimised title tag (max 60 chars)
-2. Meta description (max 155 chars)
-3. H1 heading
-4. 3 internal links to add (use real successifier.com pages like /product, /pricing, /blog, /vs/gainsight)
-5. 3 LSI keywords to weave into the content
+Reply with ONLY this exact JSON (no prose outside it):
+{{
+  "title_tag": "...",
+  "meta_description": "...",
+  "h1": "...",
+  "internal_links": [
+    {{"anchor": "...", "url": "..."}}
+  ],
+  "lsi_keywords": ["...", "...", "..."],
+  "quick_wins": ["one concrete sentence per win"]
+}}
 
-Be specific — no generic advice."""}]
+Rules:
+- title_tag: max 60 chars, include '{keyword}'
+- meta_description: max 155 chars, compelling CTA
+- Use real successifier.com paths: /, /pricing, /blog, /vs/gainsight, /vs/totango, /vs/churnzero, /product
+- 3 internal links, 3 LSI keywords, 3 quick wins
+- Be specific to successifier.com, not generic"""}]
                 )
+                import json as _json, re as _re
+                raw = response.content[0].text.strip()
+                match = _re.search(r'\{[\s\S]*\}', raw)
+                if match:
+                    try:
+                        suggestions = _json.loads(match.group())
+                    except Exception:
+                        suggestions = {"raw": raw}
+                else:
+                    suggestions = {"raw": raw}
+
                 outcome = {
                     "success": True,
-                    "action_type": "meta_optimization",
+                    "action_type": "on_page_suggestions",
                     "keyword": keyword,
-                    "suggestions": response.content[0].text
+                    "target_page": target_page,
+                    "suggestions": suggestions
                 }
             else:
                 outcome = {
                     "success": True,
-                    "action_type": "meta_optimization",
+                    "action_type": "on_page_suggestions",
                     "keyword": keyword,
-                    "suggestions": f"Title: {keyword.title()} | Successifier\nDescription: {keyword.title()} with Successifier's AI-powered CS platform.\nH1: {keyword.title()}: Complete Guide"
+                    "target_page": target_page,
+                    "suggestions": {
+                        "title_tag": f"{keyword.title()} | Successifier",
+                        "meta_description": f"{keyword.title()} with Successifier's AI-powered CS platform. Reduce churn by 40%.",
+                        "h1": f"{keyword.title()}: Complete Guide",
+                        "internal_links": [],
+                        "lsi_keywords": [],
+                        "quick_wins": []
+                    }
                 }
             mark_done(outcome)
             return outcome
@@ -651,27 +701,51 @@ Be specific — no generic advice."""}]
                     mark_done(outcome)
                     return outcome
 
-            # Other technical issues: generate a concrete fix plan via Claude
+            # Other technical issues: generate a structured fix plan
             if seo_agent.client:
                 response = seo_agent.client.messages.create(
                     model=seo_agent.model,
-                    max_tokens=512,
+                    max_tokens=700,
                     messages=[{"role": "user", "content": f"""Technical SEO issue on successifier.com:
 Issue: {title}
 Details: {action.get('description', '')}
+Page: {target_page}
 
-Give a concise, developer-ready fix (3-5 steps). Be specific."""}]
+Reply with ONLY this exact JSON:
+{{
+  "severity": "critical|high|medium|low",
+  "estimated_effort": "30min|2h|1day|1week",
+  "steps": ["concrete dev step 1", "concrete dev step 2", "..."],
+  "files_to_change": ["path/to/file or component name"],
+  "expected_impact": "one sentence on SEO impact after fix"
+}}
+
+Be developer-ready. No generic advice."""}]
                 )
+                import json as _json, re as _re
+                raw = response.content[0].text.strip()
+                match = _re.search(r'\{[\s\S]*\}', raw)
+                if match:
+                    try:
+                        fix_plan = _json.loads(match.group())
+                    except Exception:
+                        fix_plan = {"raw": raw}
+                else:
+                    fix_plan = {"raw": raw}
+
                 outcome = {
                     "success": True,
                     "action_type": "technical_fix_plan",
-                    "fix_plan": response.content[0].text
+                    "title": title,
+                    "target_page": target_page,
+                    "fix_plan": fix_plan
                 }
             else:
                 outcome = {
                     "success": True,
-                    "action_type": "technical_flagged",
-                    "message": f"Fix required: {title}. Add to sprint backlog."
+                    "action_type": "technical_fix_plan",
+                    "title": title,
+                    "fix_plan": {"steps": [f"Fix required: {title}. Add to sprint backlog."], "severity": "medium", "estimated_effort": "2h"}
                 }
             mark_done(outcome)
             return outcome
