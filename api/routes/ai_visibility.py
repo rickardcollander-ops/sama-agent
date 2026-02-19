@@ -3,10 +3,10 @@ AI Visibility API Routes
 GEO (Generative Engine Optimization) monitoring endpoints
 """
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import Optional
 import logging
+import threading
 
 from agents.ai_visibility import ai_visibility_agent
 from shared.database import get_supabase
@@ -82,19 +82,22 @@ async def get_gaps():
 
 # ── Run check ──────────────────────────────────────────────────────────────────
 
-def _run_check_background():
+def _run_check_thread():
     try:
+        logger.info("AI Visibility monitoring thread started")
         result = ai_visibility_agent.run_monitoring()
         logger.info(f"AI Visibility monitoring done: {result}")
     except Exception as e:
-        logger.error(f"Background monitoring error: {e}")
+        logger.error(f"AI Visibility monitoring thread error: {e}", exc_info=True)
 
 
 @router.post("/check")
-async def run_check(background_tasks: BackgroundTasks):
-    """Kick off a monitoring run in the background (~3 min)"""
-    background_tasks.add_task(_run_check_background)
-    return {"status": "started", "message": "Monitoring run started in background. Results will appear in ~3 minutes."}
+async def run_check():
+    """Kick off a monitoring run in a background thread (~13 min for 5 engines × 16 prompts)"""
+    t = threading.Thread(target=_run_check_thread, daemon=True)
+    t.start()
+    logger.info(f"AI Visibility monitoring thread started: {t.name}")
+    return {"status": "started", "message": "Monitoring thread started. Results appear as checks complete."}
 
 
 # ── Update gap ─────────────────────────────────────────────────────────────────
