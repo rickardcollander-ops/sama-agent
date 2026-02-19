@@ -216,8 +216,9 @@ class AIVisibilityAgent:
                     }
                     try:
                         sb.table("ai_visibility_checks").insert(check_data).execute()
+                        logger.info(f"[{run_id}] ✓ {engine_name} | {category} | mentioned={analysis['mentioned']}")
                     except Exception as e:
-                        logger.warning(f"DB insert check failed: {e}")
+                        logger.error(f"[{run_id}] DB insert check FAILED: {e} | data keys: {list(check_data.keys())}")
 
                     results.append(check_data)
 
@@ -237,7 +238,7 @@ class AIVisibilityAgent:
                             sb.table("ai_visibility_gaps").insert(gap_data).execute()
                             gaps_created += 1
                         except Exception as e:
-                            logger.warning(f"DB insert gap failed: {e}")
+                            logger.error(f"[{run_id}] DB insert gap FAILED: {e}")
 
         mentioned = [r for r in results if r["mentioned"]]
         mention_rate = len(mentioned) / len(results) if results else 0
