@@ -113,6 +113,21 @@ async def update_gap(req: GapUpdateRequest):
         return {"error": str(e)}
 
 
+# ── Clear data ─────────────────────────────────────────────────────────────────
+
+@router.post("/clear")
+async def clear_data():
+    """Delete all checks and gaps — use when old/corrupt data needs to be removed"""
+    try:
+        sb = get_supabase()
+        sb.table("ai_visibility_checks").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+        sb.table("ai_visibility_gaps").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+        return {"success": True, "message": "All checks and gaps cleared."}
+    except Exception as e:
+        logger.error(f"clear_data error: {e}")
+        return {"error": str(e)}
+
+
 # ── GEO Recommendations ────────────────────────────────────────────────────────
 
 @router.post("/recommendations")

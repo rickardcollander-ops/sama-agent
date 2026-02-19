@@ -6,6 +6,7 @@ by giving each engine a distinct persona/system prompt.
 """
 
 import logging
+import uuid
 from typing import Dict, Any, List
 from datetime import datetime, timezone
 from anthropic import Anthropic
@@ -189,6 +190,7 @@ class AIVisibilityAgent:
         sb = get_supabase()
         results = []
         gaps_created = 0
+        run_id = str(uuid.uuid4())[:8]  # short ID to group this run's checks
 
         for category, prompts in MONITORING_PROMPTS.items():
             for prompt in prompts:
@@ -203,6 +205,7 @@ class AIVisibilityAgent:
                         "prompt": prompt,
                         "category": category,
                         "ai_engine": engine_name,
+                        "run_id": run_id,
                         "mentioned": analysis["mentioned"],
                         "rank": analysis["rank"],
                         "competitors_mentioned": analysis["competitors_mentioned"],
