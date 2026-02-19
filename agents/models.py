@@ -16,6 +16,11 @@ CONTENT_PIECES_TABLE = "content_pieces"
 BACKLINK_PROFILES_TABLE = "backlink_profiles"
 COMPETITOR_ANALYSES_TABLE = "competitor_analyses"
 
+# AI Visibility tables
+AI_VISIBILITY_CHECKS_TABLE = "ai_visibility_checks"
+AI_CITATIONS_TABLE = "ai_citations"
+AI_VISIBILITY_GAPS_TABLE = "ai_visibility_gaps"
+
 
 class Keyword(BaseModel):
     """Keyword tracking model"""
@@ -98,3 +103,33 @@ class CompetitorAnalysis(BaseModel):
     estimated_traffic: Optional[int] = None
     domain_rating: Optional[float] = None
     content_opportunities: List[Any] = []
+
+
+class AIVisibilityCheck(BaseModel):
+    """Single AI visibility monitoring check result"""
+    id: Optional[str] = None
+    checked_at: Optional[str] = None
+    prompt: str
+    prompt_category: Optional[str] = None
+    ai_response: Optional[str] = None
+    successifier_mentioned: bool = False
+    mention_rank: Optional[int] = None
+    mention_context: Optional[str] = None
+    mention_sentiment: Optional[str] = None  # positive / neutral / negative
+    competitors_mentioned: List[Any] = []  # [{name, rank, context}]
+    sources_cited: List[Any] = []
+    check_source: str = "claude_proxy"  # claude_proxy / perplexity
+
+
+class AIVisibilityGap(BaseModel):
+    """Opportunity where Successifier should be mentioned but isn't"""
+    id: Optional[str] = None
+    identified_at: Optional[str] = None
+    prompt: str
+    prompt_category: Optional[str] = None
+    competitor_winning: Optional[str] = None
+    gap_type: str = "not_mentioned"  # not_mentioned / low_rank / negative_context
+    recommended_action: Optional[str] = None
+    action_type: Optional[str] = None  # create_content / optimize_page / build_reviews / forum_engagement
+    priority: str = "medium"  # high / medium / low
+    status: str = "open"  # open / in_progress / resolved

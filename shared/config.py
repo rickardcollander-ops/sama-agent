@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     # GitHub
     GITHUB_TOKEN: str = ""
     
+    # AI Visibility / GEO
+    PERPLEXITY_API_KEY: str = ""  # For querying Perplexity API directly (optional - falls back to Claude proxy)
+
     # Application
     SUCCESSIFIER_DOMAIN: str = "successifier.com"
     SUCCESSIFIER_CMS_API_URL: str = "https://successifier.com/api"
