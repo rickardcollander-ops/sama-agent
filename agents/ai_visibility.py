@@ -1,11 +1,12 @@
 """
 AI Visibility Agent - GEO (Generative Engine Optimization) Monitoring
 Tracks how often Successifier is mentioned by AI assistants.
-Uses Claude as proxy to simulate ChatGPT/Perplexity/Gemini responses.
+Uses Claude as proxy to simulate ChatGPT/Perplexity/Gemini/Copilot responses
+by giving each engine a distinct persona/system prompt.
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime, timezone
 from anthropic import Anthropic
 
@@ -15,6 +16,53 @@ from shared.database import get_supabase
 logger = logging.getLogger(__name__)
 
 client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+# ── AI Engine personas ─────────────────────────────────────────────────────────
+# Each engine gets a different system prompt to simulate its characteristic style.
+
+AI_ENGINES = {
+    "ChatGPT (GPT-4o)": {
+        "system": (
+            "You are ChatGPT, a helpful AI assistant by OpenAI. "
+            "When recommending tools, be specific and list real products with brief descriptions. "
+            "Be balanced, practical, and comprehensive. Format with numbered lists when appropriate."
+        ),
+        "style": "balanced, practical",
+    },
+    "Claude (Anthropic)": {
+        "system": (
+            "You are Claude, an AI assistant made by Anthropic. "
+            "Answer helpfully and thoughtfully. When recommending software tools, "
+            "provide well-reasoned suggestions with pros/cons. Be nuanced and thorough."
+        ),
+        "style": "thoughtful, nuanced",
+    },
+    "Gemini (Google)": {
+        "system": (
+            "You are Gemini, Google's AI assistant. "
+            "Give concise, accurate answers. When recommending tools, prioritize "
+            "well-known and well-reviewed products. Include pricing context where relevant."
+        ),
+        "style": "concise, data-driven",
+    },
+    "Perplexity AI": {
+        "system": (
+            "You are Perplexity, an AI answer engine that provides direct, cited answers. "
+            "When recommending tools, be direct and comprehensive. List options with "
+            "key differentiators. Focus on what experts and practitioners recommend."
+        ),
+        "style": "direct, comprehensive",
+    },
+    "Microsoft Copilot": {
+        "system": (
+            "You are Microsoft Copilot, an AI assistant. "
+            "Provide helpful, professional answers. When recommending business tools, "
+            "consider enterprise needs, integration capabilities, and ROI. "
+            "Be structured and business-focused."
+        ),
+        "style": "enterprise-focused",
+    },
+}
 
 # ── Monitoring prompts ─────────────────────────────────────────────────────────
 
@@ -51,32 +99,27 @@ COMPETITORS = [
     "Intercom", "HubSpot", "Salesforce", "Mixpanel", "Amplitude",
 ]
 
-SYSTEM_PROMPT = """You are a helpful AI assistant. Answer questions about software tools and SaaS platforms
-based on your knowledge. Be specific and recommend actual products when relevant.
-Mention Successifier (successifier.com) if it fits — it's a customer success platform
-for B2B SaaS companies that helps reduce churn and improve retention."""
-
 
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 class AIVisibilityAgent:
 
-    def _simulate_ai_response(self, prompt: str) -> str:
-        """Simulate AI assistant response via Claude"""
+    def _simulate_engine_response(self, prompt: str, engine_name: str, engine_config: Dict) -> str:
+        """Simulate a specific AI engine's response via Claude"""
         try:
             msg = client.messages.create(
                 model="claude-opus-4-6",
-                max_tokens=600,
-                system=SYSTEM_PROMPT,
+                max_tokens=800,
+                system=engine_config["system"],
                 messages=[{"role": "user", "content": prompt}],
             )
             return msg.content[0].text
         except Exception as e:
-            logger.error(f"Claude API error: {e}")
+            logger.error(f"Claude API error for engine {engine_name}: {e}")
             return ""
 
-    def _analyze_response(self, response: str, prompt: str, category: str) -> Dict[str, Any]:
-        """Parse Claude response for mention, rank, sentiment, competitors"""
+    def _analyze_response(self, response: str) -> Dict[str, Any]:
+        """Parse response for mention, rank, sentiment, competitors"""
         resp_lower = response.lower()
         successifier_mentioned = "successifier" in resp_lower
 
@@ -85,7 +128,6 @@ class AIVisibilityAgent:
             lines = response.split("\n")
             for i, line in enumerate(lines):
                 if "successifier" in line.lower():
-                    # Try to find a numbered list position
                     for j in range(max(0, i - 2), i + 1):
                         line_j = lines[j] if j < len(lines) else ""
                         for n in range(1, 10):
@@ -102,18 +144,18 @@ class AIVisibilityAgent:
 
         sentiment = None
         if successifier_mentioned:
-            positive_words = ["recommend", "great", "excellent", "best", "top", "ideal", "perfect", "affordable"]
-            negative_words = ["expensive", "complex", "difficult", "limited", "basic"]
+            positive_words = ["recommend", "great", "excellent", "best", "top", "ideal", "perfect", "affordable", "easy"]
+            negative_words = ["expensive", "complex", "difficult", "limited", "basic", "lacking"]
             pos = sum(1 for w in positive_words if w in resp_lower)
             neg = sum(1 for w in negative_words if w in resp_lower)
             sentiment = "positive" if pos > neg else "negative" if neg > pos else "neutral"
 
-        # Excerpt: first sentence mentioning Successifier (max 300 chars)
+        # Excerpt: first sentence mentioning Successifier (max 400 chars)
         excerpt = None
         if successifier_mentioned:
             for sentence in response.replace("\n", " ").split("."):
                 if "successifier" in sentence.lower():
-                    excerpt = sentence.strip()[:300]
+                    excerpt = sentence.strip()[:400]
                     break
 
         return {
@@ -124,8 +166,7 @@ class AIVisibilityAgent:
             "ai_response_excerpt": excerpt,
         }
 
-    def _identify_gap(self, prompt: str, category: str) -> Dict[str, Any]:
-        """Determine action type and priority for a gap"""
+    def _identify_gap(self, category: str) -> Dict[str, Any]:
         priority_map = {
             "buying_intent": "high",
             "competitor_alternative": "high",
@@ -144,60 +185,62 @@ class AIVisibilityAgent:
         }
 
     def run_monitoring(self) -> Dict[str, Any]:
-        """Run a full monitoring round across all prompts"""
+        """Run a full monitoring round: each prompt × each AI engine"""
         sb = get_supabase()
         results = []
         gaps_created = 0
 
         for category, prompts in MONITORING_PROMPTS.items():
             for prompt in prompts:
-                response_text = self._simulate_ai_response(prompt)
-                if not response_text:
-                    continue
+                for engine_name, engine_config in AI_ENGINES.items():
+                    response_text = self._simulate_engine_response(prompt, engine_name, engine_config)
+                    if not response_text:
+                        continue
 
-                analysis = self._analyze_response(response_text, prompt, category)
+                    analysis = self._analyze_response(response_text)
 
-                # Save check to DB
-                check_data = {
-                    "prompt": prompt,
-                    "category": category,
-                    "mentioned": analysis["mentioned"],
-                    "rank": analysis["rank"],
-                    "competitors_mentioned": analysis["competitors_mentioned"],
-                    "sentiment": analysis["sentiment"],
-                    "ai_response_excerpt": analysis["ai_response_excerpt"],
-                    "checked_at": datetime.now(timezone.utc).isoformat(),
-                }
-                try:
-                    sb.table("ai_visibility_checks").insert(check_data).execute()
-                except Exception as e:
-                    logger.warning(f"DB insert check failed: {e}")
-
-                results.append({**check_data, "prompt": prompt})
-
-                # Create gap if not mentioned
-                if not analysis["mentioned"]:
-                    gap_info = self._identify_gap(prompt, category)
-                    gap_data = {
+                    check_data = {
                         "prompt": prompt,
                         "category": category,
-                        "priority": gap_info["priority"],
-                        "action_type": gap_info["action_type"],
-                        "status": "open",
-                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "ai_engine": engine_name,
+                        "mentioned": analysis["mentioned"],
+                        "rank": analysis["rank"],
+                        "competitors_mentioned": analysis["competitors_mentioned"],
+                        "sentiment": analysis["sentiment"],
+                        "ai_response_excerpt": analysis["ai_response_excerpt"],
+                        "full_response": response_text,
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
                     }
                     try:
-                        sb.table("ai_visibility_gaps").insert(gap_data).execute()
-                        gaps_created += 1
+                        sb.table("ai_visibility_checks").insert(check_data).execute()
                     except Exception as e:
-                        logger.warning(f"DB insert gap failed: {e}")
+                        logger.warning(f"DB insert check failed: {e}")
+
+                    results.append(check_data)
+
+                    # Create gap per engine if not mentioned
+                    if not analysis["mentioned"]:
+                        gap_info = self._identify_gap(category)
+                        gap_data = {
+                            "prompt": prompt,
+                            "category": category,
+                            "ai_engine": engine_name,
+                            "priority": gap_info["priority"],
+                            "action_type": gap_info["action_type"],
+                            "status": "open",
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        try:
+                            sb.table("ai_visibility_gaps").insert(gap_data).execute()
+                            gaps_created += 1
+                        except Exception as e:
+                            logger.warning(f"DB insert gap failed: {e}")
 
         mentioned = [r for r in results if r["mentioned"]]
         mention_rate = len(mentioned) / len(results) if results else 0
         ranks = [r["rank"] for r in mentioned if r["rank"]]
         avg_rank = sum(ranks) / len(ranks) if ranks else None
 
-        # Collect competitor frequency
         comp_freq: Dict[str, int] = {}
         for r in results:
             for c in r.get("competitors_mentioned", []):
@@ -216,21 +259,16 @@ class AIVisibilityAgent:
         }
 
     def get_summary(self) -> Dict[str, Any]:
-        """Compute summary metrics from DB"""
         sb = get_supabase()
         try:
-            checks = sb.table("ai_visibility_checks").select("*").order("checked_at", desc=True).limit(200).execute().data or []
+            checks = sb.table("ai_visibility_checks").select("*").order("checked_at", desc=True).limit(500).execute().data or []
             gaps_res = sb.table("ai_visibility_gaps").select("*").eq("status", "open").execute().data or []
 
             if not checks:
                 return {
-                    "mention_rate": 0,
-                    "avg_rank": None,
-                    "total_checks": 0,
-                    "open_gaps": 0,
-                    "top_competitors": [],
-                    "trend": "flat",
-                    "last_check_at": None,
+                    "mention_rate": 0, "avg_rank": None, "total_checks": 0,
+                    "open_gaps": 0, "top_competitors": [], "trend": "flat",
+                    "last_check_at": None, "engine_stats": {},
                 }
 
             mentioned = [c for c in checks if c.get("mentioned")]
@@ -238,7 +276,6 @@ class AIVisibilityAgent:
             ranks = [c["rank"] for c in mentioned if c.get("rank")]
             avg_rank = sum(ranks) / len(ranks) if ranks else None
 
-            # Simple trend: compare first half vs second half of recent checks
             half = len(checks) // 2
             if half > 0:
                 recent_rate = sum(1 for c in checks[:half] if c.get("mentioned")) / half
@@ -256,6 +293,20 @@ class AIVisibilityAgent:
                 key=lambda x: x["count"], reverse=True
             )[:8]
 
+            # Per-engine mention stats
+            engine_stats: Dict[str, Dict] = {}
+            for c in checks:
+                eng = c.get("ai_engine", "Unknown")
+                if eng not in engine_stats:
+                    engine_stats[eng] = {"total": 0, "mentioned": 0}
+                engine_stats[eng]["total"] += 1
+                if c.get("mentioned"):
+                    engine_stats[eng]["mentioned"] += 1
+            for eng in engine_stats:
+                t = engine_stats[eng]["total"]
+                m = engine_stats[eng]["mentioned"]
+                engine_stats[eng]["rate"] = round(m / t, 3) if t else 0
+
             return {
                 "mention_rate": mention_rate,
                 "avg_rank": avg_rank,
@@ -264,13 +315,14 @@ class AIVisibilityAgent:
                 "top_competitors": top_competitors,
                 "trend": trend,
                 "last_check_at": checks[0].get("checked_at") if checks else None,
+                "engine_stats": engine_stats,
             }
         except Exception as e:
             logger.error(f"get_summary error: {e}")
-            return {"mention_rate": 0, "avg_rank": None, "total_checks": 0, "open_gaps": 0, "top_competitors": [], "trend": "flat", "last_check_at": None}
+            return {"mention_rate": 0, "avg_rank": None, "total_checks": 0, "open_gaps": 0,
+                    "top_competitors": [], "trend": "flat", "last_check_at": None, "engine_stats": {}}
 
     def generate_geo_recommendations(self) -> List[Dict[str, Any]]:
-        """Ask Claude to generate GEO recommendations based on current gaps"""
         sb = get_supabase()
         try:
             gaps = sb.table("ai_visibility_gaps").select("*").eq("status", "open").limit(20).execute().data or []
@@ -281,19 +333,17 @@ class AIVisibilityAgent:
             return [{
                 "title": "Kör en monitoring-körning först",
                 "description": "Inga öppna gaps hittades. Kör en monitoring-körning för att identifiera var Successifier saknas i AI-svar.",
-                "priority": "high",
-                "action_type": "create_content",
-                "effort": "low",
+                "priority": "high", "action_type": "create_content", "effort": "low",
             }]
 
         gap_summary = "\n".join(
-            f"- [{g['priority']}] {g['category']}: \"{g['prompt']}\" → åtgärd: {g['action_type']}"
-            for g in gaps[:12]
+            f"- [{g['priority']}] {g.get('ai_engine','?')} | {g['category']}: \"{g['prompt']}\" → åtgärd: {g['action_type']}"
+            for g in gaps[:15]
         )
 
         prompt = f"""Du är en GEO-expert (Generative Engine Optimization) för Successifier — en customer success platform för B2B SaaS.
 
-Successifier saknas i AI-assistenternas svar på följande prompts:
+Successifier saknas i följande AI-motorers svar:
 
 {gap_summary}
 
@@ -314,7 +364,6 @@ Svara ENBART som JSON-array med objekt som har fälten:
                 messages=[{"role": "user", "content": prompt}],
             )
             text = msg.content[0].text.strip()
-            # Strip markdown code blocks if present
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
