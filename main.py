@@ -14,7 +14,7 @@ from typing import AsyncGenerator
 from api.routes import (
     seo, content, ads, social, reviews, analytics, orchestrator, automation,
     seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts, improvements,
-    ai_visibility
+    ai_visibility, social_reddit
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -108,6 +108,7 @@ app.include_router(content_advanced.router, prefix="/api/content", tags=["conten
 app.include_router(ads.router, prefix="/api/ads", tags=["ads"])
 app.include_router(ads_advanced.router, prefix="/api/ads", tags=["ads-advanced"])
 app.include_router(social.router, prefix="/api/social", tags=["social"])
+app.include_router(social_reddit.router, prefix="/api/social/reddit", tags=["social-reddit"])
 app.include_router(reviews.router, prefix="/api/reviews", tags=["reviews"])
 app.include_router(reviews_advanced.router, prefix="/api/reviews", tags=["reviews-advanced"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
@@ -129,6 +130,7 @@ async def root():
             "content": "active",
             "ads": "active",
             "social": "active",
+            "social_reddit": "active",
             "reviews": "active",
             "analytics": "active"
         }

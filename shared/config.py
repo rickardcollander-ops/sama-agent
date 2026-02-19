@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # LinkedIn
     LINKEDIN_ACCESS_TOKEN: str = ""
     LINKEDIN_ORG_ID: str = ""
+
+    # Reddit
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USERNAME: str = ""
+    REDDIT_PASSWORD: str = ""
+    REDDIT_USER_AGENT: str = "sama-agent/2.0 (by /u/successifier)"
     
     # Google Analytics 4
     GA4_PROPERTY_ID: str = ""
