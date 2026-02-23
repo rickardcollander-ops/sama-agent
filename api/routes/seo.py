@@ -196,6 +196,49 @@ async def cleanup_duplicate_actions():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/reset")
+async def reset_seo_data(include_keywords: bool = False):
+    """Reset SEO data so analysis can start from a clean slate."""
+    from shared.database import get_supabase
+
+    try:
+        sb = get_supabase()
+
+        # Delete all SEO agent actions (pending/completed/failed)
+        actions_result = (
+            sb.table("agent_actions")
+            .delete()
+            .eq("agent_name", "seo")
+            .execute()
+        )
+
+        # Delete all stored SEO audits
+        audits_result = sb.table("seo_audits").delete().neq("id", "").execute()
+
+        # Delete all saved SEO strategies and task states
+        strategies_result = sb.table("seo_strategies").delete().neq("id", "").execute()
+
+        reset_summary = {
+            "actions_deleted": len(actions_result.data or []),
+            "audits_deleted": len(audits_result.data or []),
+            "strategies_deleted": len(strategies_result.data or []),
+            "keywords_deleted": 0,
+            "include_keywords": include_keywords,
+        }
+
+        if include_keywords:
+            keywords_result = sb.table("seo_keywords").delete().neq("id", "").execute()
+            reset_summary["keywords_deleted"] = len(keywords_result.data or [])
+
+        return {
+            "success": True,
+            "message": "SEO data reset completed",
+            "reset": reset_summary,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/keywords/{keyword:path}")
 async def delete_keyword(keyword: str):
     """Remove a keyword from tracking"""

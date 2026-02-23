@@ -9,6 +9,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+async def clear_pending_actions(agent_name: str) -> int:
+    """Delete all pending actions for an agent and return deleted count."""
+    sb = get_supabase()
+
+    try:
+        result = (
+            sb.table("agent_actions")
+            .delete()
+            .eq("agent_name", agent_name)
+            .eq("status", "pending")
+            .execute()
+        )
+        deleted_count = len(result.data or [])
+        logger.info(f"🧹 Cleared {deleted_count} pending {agent_name} actions before saving new analysis")
+        return deleted_count
+    except Exception as e:
+        logger.error(f"❌ Failed to clear pending actions for {agent_name}: {e}")
+        return 0
+
+
 async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[str]:
     """
     Save actions to database with deduplication
@@ -22,18 +42,13 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
     """
     sb = get_supabase()
     created_ids = []
+
+    # Replace queue on each analysis run to avoid stale/duplicated pending actions.
+    await clear_pending_actions(agent_name)
     
     for action in actions:
         try:
             action_id = action.get("id", "")
-            
-            # Check if action already exists (pending status)
-            existing = sb.table("agent_actions").select("id").eq("agent_name", agent_name).eq("action_id", action_id).eq("status", "pending").execute()
-            
-            if existing.data:
-                logger.info(f"⏭️ Skipping duplicate action: {action.get('title', '')[:50]}")
-                created_ids.append(existing.data[0]["id"])
-                continue
             
             # Prepare action for database
             db_action = {
@@ -170,6 +185,28 @@ async def get_action_by_action_id(action_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"❌ Failed to get action: {e}")
         return None
+
+
+async def delete_action(action_uuid: str) -> bool:
+    """
+    Delete an action from the database by its UUID
+
+    Args:
+        action_uuid: UUID of the action (the 'id' column)
+
+    Returns:
+        True if successful
+    """
+    sb = get_supabase()
+
+    try:
+        sb.table("agent_actions").delete().eq("id", action_uuid).execute()
+        logger.info(f"🗑️ Deleted action {action_uuid}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Failed to delete action: {e}")
+        return False
 
 
 async def get_pending_actions(agent_name: Optional[str] = None) -> List[Dict[str, Any]]:
