@@ -25,7 +25,7 @@ PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 # Google Search Console API
 GSC_API = "https://searchconsole.googleapis.com/webmasters/v3"
 # GSC uses sc-domain: format for domain properties
-GSC_SITE_URL = "sc-domain:successifier.com"
+GSC_SITE_URL = settings.GSC_SITE_URL
 # HTTP URL for PageSpeed and technical checks
 SITE_URL = "https://successifier.com"
 
@@ -363,7 +363,7 @@ class SEOAgent:
         logger.info("🔎 Discovering keyword opportunities...")
         opportunities = []
         try:
-            gsc_data = await self._fetch_gsc_keyword_data(limit=200)
+            gsc_data = await self._fetch_gsc_keyword_data()
             existing = await self.get_keywords()
             existing_keywords = {k["keyword"].lower() for k in existing}
 
@@ -518,36 +518,83 @@ class SEOAgent:
         
         return {"status": "ok", "total_clicks": 0, "total_impressions": 0, "avg_ctr": 0.0, "avg_position": 0.0}
     
-    async def _fetch_gsc_keyword_data(self, limit: int = 50) -> Dict[str, Dict]:
-        """Fetch per-keyword data from Google Search Console"""
+    async def _fetch_gsc_paginated(
+        self,
+        dimensions: List[str],
+        days: int = 28,
+        max_rows: int = 0,
+    ) -> List[Dict]:
+        """Fetch all rows from GSC using pagination.
+
+        Args:
+            dimensions: GSC dimensions e.g. ["query"], ["page"]
+            days: Number of days to look back (default 28)
+            max_rows: Max rows to fetch. 0 = fetch all available rows.
+
+        Returns:
+            List of raw GSC row dicts with keys, clicks, impressions, ctr, position.
+        """
         if not is_gsc_configured():
-            return {}
-        
+            return []
+
         token = await get_access_token("gsc")
         if not token:
-            return {}
-        
+            return []
+
         end_date = datetime.utcnow().strftime("%Y-%m-%d")
-        start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
-        
+        start_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+
         encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
         url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
-        
-        resp = await self.http_client.post(url, json={
-            "startDate": start_date,
-            "endDate": end_date,
-            "dimensions": ["query"],
-            "rowLimit": limit
-        }, headers={"Authorization": f"Bearer {token}"})
-        
-        if resp.status_code != 200:
-            logger.warning(f"GSC keyword query failed: {resp.status_code}")
-            return {}
-        
-        data = resp.json()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        all_rows: List[Dict] = []
+        page_size = 1000  # GSC max per request
+        start_row = 0
+
+        while True:
+            batch_limit = page_size
+            if max_rows > 0:
+                remaining = max_rows - len(all_rows)
+                if remaining <= 0:
+                    break
+                batch_limit = min(page_size, remaining)
+
+            resp = await self.http_client.post(url, json={
+                "startDate": start_date,
+                "endDate": end_date,
+                "dimensions": dimensions,
+                "rowLimit": batch_limit,
+                "startRow": start_row,
+            }, headers=headers)
+
+            if resp.status_code != 200:
+                logger.warning(f"GSC paginated query failed: {resp.status_code}")
+                break
+
+            rows = resp.json().get("rows", [])
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+            start_row += len(rows)
+
+            # If we got fewer rows than requested, there are no more pages
+            if len(rows) < batch_limit:
+                break
+
+        return all_rows
+
+    async def _fetch_gsc_keyword_data(self, limit: int = 0) -> Dict[str, Dict]:
+        """Fetch per-keyword data from Google Search Console.
+
+        Args:
+            limit: Max keywords to fetch. 0 = fetch all (paginated).
+        """
+        rows = await self._fetch_gsc_paginated(["query"], max_rows=limit)
+
         result = {}
-        
-        for row in data.get("rows", []):
+        for row in rows:
             query = row["keys"][0].lower()
             result[query] = {
                 "clicks": row.get("clicks", 0),
@@ -555,7 +602,7 @@ class SEOAgent:
                 "ctr": round(row.get("ctr", 0) * 100, 2),
                 "position": round(row.get("position", 0), 1)
             }
-        
+
         logger.info(f"✅ Fetched GSC data for {len(result)} queries")
         return result
     

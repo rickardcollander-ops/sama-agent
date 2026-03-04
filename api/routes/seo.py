@@ -826,38 +826,18 @@ async def get_ctr_opportunities():
 async def get_page_gsc_insights():
     """
     Per-page GSC data: which pages get the most clicks/impressions.
-    Uses GSC dimension=page.
+    Uses GSC dimension=page with full pagination.
     """
-    from shared.google_auth import get_access_token, is_gsc_configured
-    from agents.seo import GSC_SITE_URL, GSC_API
     from datetime import datetime, timedelta
-    import httpx as _httpx
-
-    if not is_gsc_configured():
-        return {"success": False, "message": "GSC not configured", "pages": []}
 
     try:
-        token = await get_access_token("gsc")
-        if not token:
-            return {"success": False, "message": "GSC auth failed", "pages": []}
+        rows = await seo_agent._fetch_gsc_paginated(["page"])
+        if not rows:
+            return {"success": True, "pages": [], "message": "No page data available"}
 
         end_date = datetime.utcnow().strftime("%Y-%m-%d")
         start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
-        encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
-        url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
 
-        async with _httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json={
-                "startDate": start_date,
-                "endDate": end_date,
-                "dimensions": ["page"],
-                "rowLimit": 25
-            }, headers={"Authorization": f"Bearer {token}"})
-
-        if resp.status_code != 200:
-            return {"success": False, "message": f"GSC returned {resp.status_code}", "pages": []}
-
-        rows = resp.json().get("rows", [])
         pages = [
             {
                 "page": row["keys"][0],
