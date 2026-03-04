@@ -43,7 +43,7 @@ async def get_dashboard_status():
                 return None
 
         kw_res, content_res, audit_res, alert_res, log_res = await asyncio.gather(
-            asyncio.to_thread(lambda: _safe_count(sb, "keywords")),
+            asyncio.to_thread(lambda: _safe_count(sb, "seo_keywords")),
             asyncio.to_thread(lambda: _safe_count(sb, "content_pieces")),
             asyncio.to_thread(lambda: _safe_count(sb, "seo_audits")),
             asyncio.to_thread(lambda: _safe_count(sb, "alerts")),
@@ -85,7 +85,7 @@ async def get_smart_recommendations():
 
         # Gather data in parallel
         kw_data, alert_data, audit_data, content_data = await asyncio.gather(
-            asyncio.to_thread(lambda: _safe_query(sb, "keywords", "keyword,current_position,current_ctr,current_impressions,last_checked_at", 100)),
+            asyncio.to_thread(lambda: _safe_query(sb, "seo_keywords", "keyword,current_position,current_ctr,current_impressions,last_checked_at", 100)),
             asyncio.to_thread(lambda: _safe_query(sb, "alerts", "id,alert_type,severity,status,created_at", 50)),
             asyncio.to_thread(lambda: _safe_query(sb, "seo_audits", "id,audit_date,critical_issues,high_issues", 3)),
             asyncio.to_thread(lambda: _safe_query(sb, "content_pieces", "id,title,status,impressions_30d,clicks_30d,created_at", 50)),

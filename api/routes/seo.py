@@ -30,6 +30,44 @@ async def get_status():
         }
 
 
+@router.get("/stats")
+async def get_seo_stats():
+    """Return aggregated SEO statistics for the dashboard."""
+    from shared.database import get_supabase
+
+    try:
+        sb = get_supabase()
+        result = sb.table("seo_keywords").select("*").execute()
+        keywords = result.data or []
+
+        positions = [kw["current_position"] for kw in keywords if kw.get("current_position")]
+        total_clicks = sum(kw.get("current_clicks", 0) for kw in keywords)
+        total_impressions = sum(kw.get("current_impressions", 0) for kw in keywords)
+        avg_position = round(sum(positions) / len(positions), 1) if positions else 0
+        avg_ctr = round((total_clicks / total_impressions * 100), 2) if total_impressions else 0
+
+        return {
+            "total_keywords": len(keywords),
+            "avg_position": avg_position,
+            "total_clicks": total_clicks,
+            "total_impressions": total_impressions,
+            "avg_ctr": avg_ctr,
+            "top_10": sum(1 for p in positions if p <= 10),
+            "top_3": sum(1 for p in positions if p <= 3),
+        }
+    except Exception as e:
+        return {
+            "total_keywords": 0,
+            "avg_position": 0,
+            "total_clicks": 0,
+            "total_impressions": 0,
+            "avg_ctr": 0,
+            "top_10": 0,
+            "top_3": 0,
+            "error": str(e),
+        }
+
+
 @router.post("/initialize")
 async def initialize_keywords():
     """Initialize keyword tracking database"""
