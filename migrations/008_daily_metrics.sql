@@ -20,3 +20,6 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
 
 CREATE INDEX IF NOT EXISTS idx_daily_metrics_date ON daily_metrics(date DESC);
 CREATE INDEX IF NOT EXISTS idx_daily_metrics_channel ON daily_metrics(channel, date DESC);
+
+-- Disable RLS so the service-role key can insert/read without policies
+ALTER TABLE daily_metrics DISABLE ROW LEVEL SECURITY;
