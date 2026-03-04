@@ -205,10 +205,22 @@ async def get_content_actions(status: str = None, limit: int = 100):
 
 
 @router.post("/analyze")
-async def run_content_analysis():
-    """Analyze content using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+async def run_content_analysis(background: bool = True):
+    """Run content analysis. With background=true (default), returns immediately with cycle_id for polling."""
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
+
+    if background:
+        from shared.background_analysis import start_background_analysis
+        return await start_background_analysis("content", run_content_analysis_with_ooda)
+
     return await run_content_analysis_with_ooda()
+
+
+@router.get("/cycle-status")
+async def content_cycle_status(cycle_id: str = None):
+    """Poll analysis progress."""
+    from shared.background_analysis import get_cycle_status
+    return await get_cycle_status("content", cycle_id)
 
 
 @router.post("/analyze-legacy")

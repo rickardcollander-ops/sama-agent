@@ -183,10 +183,22 @@ async def get_social_actions(status: str = None, limit: int = 100):
 
 
 @router.post("/analyze")
-async def run_social_analysis():
-    """Analyze social using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+async def run_social_analysis(background: bool = True):
+    """Run social analysis. With background=true (default), returns immediately with cycle_id for polling."""
     from api.routes.social_analyze_ooda import run_social_analysis_with_ooda
+
+    if background:
+        from shared.background_analysis import start_background_analysis
+        return await start_background_analysis("social", run_social_analysis_with_ooda)
+
     return await run_social_analysis_with_ooda()
+
+
+@router.get("/cycle-status")
+async def social_cycle_status(cycle_id: str = None):
+    """Poll analysis progress."""
+    from shared.background_analysis import get_cycle_status
+    return await get_cycle_status("social", cycle_id)
 
 
 @router.post("/analyze-legacy")

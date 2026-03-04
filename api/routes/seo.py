@@ -611,10 +611,22 @@ async def delete_strategy_task(task_id: str):
 
 
 @router.post("/analyze")
-async def run_full_analysis():
-    """Run full SEO analysis using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+async def run_full_analysis(background: bool = True):
+    """Run full SEO analysis. With background=true (default), returns immediately with cycle_id for polling."""
     from api.routes.seo_analyze_ooda import run_seo_analysis_with_ooda
+
+    if background:
+        from shared.background_analysis import start_background_analysis
+        return await start_background_analysis("seo", run_seo_analysis_with_ooda)
+
     return await run_seo_analysis_with_ooda()
+
+
+@router.get("/cycle-status")
+async def seo_cycle_status(cycle_id: str = None):
+    """Poll analysis progress. Returns phase, progress %, and done flag."""
+    from shared.background_analysis import get_cycle_status
+    return await get_cycle_status("seo", cycle_id)
 
 
 @router.post("/execute")
