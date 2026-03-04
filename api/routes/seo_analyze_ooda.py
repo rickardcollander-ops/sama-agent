@@ -320,6 +320,15 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         except Exception as e:
             observations["ranking_changes"] = {"error": str(e)}
 
+        # Sync all GSC keywords into seo_keywords table so every ranking query shows up
+        try:
+            observations["gsc_sync"] = await seo_agent.sync_gsc_keywords(min_impressions=1)
+            logger.info(f"✅ GSC sync: {observations['gsc_sync'].get('inserted', 0)} new, "
+                        f"{observations['gsc_sync'].get('updated', 0)} updated")
+        except Exception as e:
+            observations["gsc_sync"] = {"error": str(e)}
+            logger.warning(f"GSC keyword sync failed: {e}")
+
         try:
             observations["new_opportunities"] = await seo_agent.discover_keyword_opportunities()
         except Exception as e:

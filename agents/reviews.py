@@ -3,6 +3,7 @@ Review Agent - Review Management Across Platforms
 Manages reviews on G2, Capterra, Trustpilot, and other platforms
 """
 
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
@@ -163,15 +164,17 @@ Requirements:
 - Sign off as the Successifier team
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         response_text = response.content[0].text.strip()
-        
+
         logger.info(f"✅ Response generated for {sentiment} review")
         
         return {
@@ -238,15 +241,17 @@ Include:
 Format as email (subject + body).
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         content = response.content[0].text.strip()
-        
+
         # Split into subject and body
         lines = content.split('\n')
         subject = lines[0].replace("Subject:", "").strip()
@@ -318,13 +323,15 @@ Format as JSON:
 """
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-            
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
+
             import json
             themes = json.loads(response.content[0].text)
         except:

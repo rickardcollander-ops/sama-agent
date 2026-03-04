@@ -3,6 +3,7 @@ Advanced Content Generation Features
 Pillar pages, FAQ pages, content briefs, 30-day refresh workflow
 """
 
+import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from anthropic import Anthropic
@@ -93,12 +94,14 @@ Subtopics to cover:
 Make it comprehensive, actionable, and SEO-optimized."""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=8000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
             
             import json
             result = json.loads(response.content[0].text)
@@ -181,16 +184,18 @@ Format as JSON:
         user_prompt = f"Generate FAQ page about: {topic}"
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-            
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
+
             import json
             result = json.loads(response.content[0].text)
-            
+
             # Generate FAQ schema
             faq_schema = schema_generator.generate_faq_schema(result["faqs"])
             
@@ -265,12 +270,14 @@ Competitor URLs: {', '.join(competitor_urls)}
 Analyze what competitors are doing and suggest how to create better content."""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=3000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=3000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
             
             import json
             result = json.loads(response.content[0].text)
@@ -374,16 +381,18 @@ Results: {', '.join(f'{k}: {v}' for k, v in results.items())}
 Make it compelling and data-driven."""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-            
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
+
             import json
             result = json.loads(response.content[0].text)
-            
+
             # Save to database
             sb = self._get_sb()
             content_data = {
@@ -456,13 +465,15 @@ Format as JSON with updated content."""
 Make it current, relevant, and improved while maintaining the original intent."""
         
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-            
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
+
             import json
             refreshed = json.loads(response.content[0].text)
             

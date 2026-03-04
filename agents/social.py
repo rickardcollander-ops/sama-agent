@@ -4,6 +4,7 @@ Manages social media presence for successifier.com
 Uses Twitter/X API v2 for real posting, mentions, and engagement data.
 """
 
+import asyncio
 import json
 import logging
 import hashlib
@@ -462,15 +463,17 @@ Requirements:
 Format as plain text.
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         content = response.content[0].text.strip()
-        
+
         if thread:
             try:
                 tweets = json.loads(content)
@@ -574,13 +577,15 @@ Requirements:
 Format as plain text.
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=512,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=512,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         reply = response.content[0].text.strip()[:280]
         logger.info(f"✅ Reply generated")
         return reply

@@ -3,6 +3,7 @@ Weekly Master Report Generation
 Comprehensive weekly performance report across all agents
 """
 
+import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from anthropic import Anthropic
@@ -176,12 +177,14 @@ Provide:
 
 Keep it concise and actionable."""
             
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1000,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            response = await asyncio.to_thread(_call)
+
             return response.content[0].text
             
         except Exception as e:

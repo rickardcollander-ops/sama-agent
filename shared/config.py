@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     # LinkedIn
     LINKEDIN_ACCESS_TOKEN: str = ""
     LINKEDIN_ORG_ID: str = ""
+
+    # Reddit
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USERNAME: str = ""
+    REDDIT_PASSWORD: str = ""
     
     # Google Analytics 4
     GA4_PROPERTY_ID: str = ""
@@ -71,6 +77,9 @@ class Settings(BaseSettings):
     TEMPORAL_HOST: str = "localhost:7233"
     TEMPORAL_NAMESPACE: str = "sama"
     
+    # Perplexity
+    PERPLEXITY_API_KEY: str = ""
+
     # Monitoring
     SENTRY_DSN: str = ""
     DATADOG_API_KEY: str = ""
@@ -80,8 +89,24 @@ class Settings(BaseSettings):
     
     # Application
     SUCCESSIFIER_DOMAIN: str = "successifier.com"
+    SUCCESSIFIER_SITE_URL: str = "https://successifier.com"
     SUCCESSIFIER_CMS_API_URL: str = "https://successifier.com/api"
     SUCCESSIFIER_CMS_API_KEY: str = ""
+
+    # AI Model
+    CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+
+    # SEO Config
+    GSC_SITE_URL: str = "sc-domain:successifier.com"
+    SEO_COMPETITORS: List[str] = ["gainsight.com", "totango.com", "churnzero.com", "custify.com", "vitally.io"]
+
+    # Anomaly Detection
+    ANOMALY_THRESHOLD: float = 0.30
+    ANOMALY_MIN_DATA_POINTS: int = 7
+
+    # Budget Optimizer
+    MIN_ROAS_THRESHOLD: float = 2.0
+    MIN_CAMPAIGN_BUDGET: float = 10.0
     
     # LinkedIn Agent Integration
     LINKEDIN_AGENT_EVENT_BUS_ENABLED: bool = True

@@ -3,6 +3,7 @@ SAMA 2.0 Orchestrator Agent
 Coordinates all specialist agents and manages cross-channel strategy
 """
 
+import asyncio
 import logging
 from typing import Dict, Any, List
 from anthropic import Anthropic
@@ -56,13 +57,14 @@ Always cite data. Always state confidence level. Always provide next action."""
         context_str = self._build_context(context or {})
         
         # Get orchestration plan from Claude
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=self.SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": f"""Goal: {goal}
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                system=self.SYSTEM_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Goal: {goal}
 
 Current Context:
 {context_str}
@@ -83,9 +85,10 @@ For each task, specify:
 5. Approval required (yes/no)
 
 Format as JSON."""
-            }]
-        )
-        
+                }]
+            )
+        response = await asyncio.to_thread(_call)
+
         # Parse response and distribute tasks
         plan = self._parse_plan(response.content[0].text)
         

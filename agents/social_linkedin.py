@@ -3,6 +3,7 @@ LinkedIn Integration for Social Agent
 Handles LinkedIn posting, engagement, and analytics
 """
 
+import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 import httpx
@@ -247,13 +248,15 @@ Format as JSON:
 }}"""
         
         try:
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": f"Create LinkedIn post about: {topic}"}]
-            )
-            
+            def _call():
+                return client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=1000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": f"Create LinkedIn post about: {topic}"}]
+                )
+            response = await asyncio.to_thread(_call)
+
             import json
             result = json.loads(response.content[0].text)
             
