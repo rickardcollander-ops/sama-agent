@@ -77,6 +77,6 @@ Successifier uses the Google Ads API to automate campaign optimization, bid mana
 
 ---
 
-**Contact:** rc@successifier.com  
+**Contact:** rickard.collander@gmail.com  
 **Website:** https://successifier.com  
 **Date:** February 2026
