@@ -346,59 +346,90 @@ async def execute_ads_action(action: Dict[str, Any] = Body(...)):
     """Execute an Ads action"""
     if not action:
         raise HTTPException(status_code=400, detail="No action provided")
-    
-    action_type = action.get("type", "")
+
+    action_type = action.get("action_type") or action.get("type", "")
     campaign = action.get("campaign", "")
     keyword = action.get("keyword", "")
-    
+    db_row_id = action.get("id")
+
+    def _mark_status(status: str, result_data: dict = None, error: str = None):
+        if not db_row_id:
+            return
+        try:
+            from shared.database import get_supabase
+            from datetime import datetime
+            sb = get_supabase()
+            update = {"status": status, "executed_at": datetime.utcnow().isoformat()}
+            if result_data:
+                update["execution_result"] = result_data
+            if error:
+                update["error_message"] = error
+            sb.table("agent_actions").update(update).eq("id", db_row_id).execute()
+        except Exception:
+            pass
+
     try:
         if action_type == "ad_copy":
-            # Generate new RSA variants
             result = await ads_agent.generate_rsa(
                 campaign=campaign,
                 ad_group=campaign,
                 target_keyword=keyword or None
             )
-            return {
+            outcome = {
                 "success": True,
                 "action_type": "rsa_generated",
                 "campaign": campaign,
                 "result": result
             }
-        
+            _mark_status("completed", outcome)
+            return outcome
+
         elif action_type == "bid_optimization":
-            result = await ads_agent.optimize_bids()
-            return {
+            result = await ads_agent.optimize_bids(
+                campaign_id=campaign or None,
+                performance_data=action.get("performance_data")
+            )
+            outcome = {
                 "success": True,
                 "action_type": "bids_optimized",
+                "campaign": campaign,
                 "result": result
             }
-        
+            _mark_status("completed", outcome)
+            return outcome
+
         elif action_type == "negative_keywords":
             terms = action.get("terms", [])
-            result = await ads_agent.harvest_negative_keywords()
-            return {
+            result = await ads_agent.harvest_negative_keywords(
+                search_terms_report=[{"query": t} for t in terms] if terms else None
+            )
+            outcome = {
                 "success": True,
                 "action_type": "negatives_harvested",
-                "count": len(result),
-                "keywords": result[:20]
+                "count": len(result) if isinstance(result, list) else 0,
+                "keywords": result[:20] if isinstance(result, list) else result
             }
-        
+            _mark_status("completed", outcome)
+            return outcome
+
         elif action_type == "campaign_creation":
             camp_type = action.get("campaign_type", "")
             if camp_type:
                 result = await ads_agent.create_campaign(camp_type)
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "campaign_created",
                     "result": result
                 }
+                _mark_status("completed", outcome)
+                return outcome
             return {"success": False, "message": "No campaign_type specified"}
-        
+
         elif action_type == "quality_score":
-            # Generate AI suggestions for improving QS
+            import asyncio as _asyncio
             if ads_agent.client:
-                response = ads_agent.client.messages.create(
+                response = await _asyncio.to_thread(
+                    ads_agent.client.messages.create,
                     model=ads_agent.model,
                     max_tokens=1024,
                     messages=[{"role": "user", "content": f"""For the Google Ads keyword '{keyword}' in campaign '{campaign}' for Successifier (customer success platform), provide specific recommendations to improve Quality Score:
@@ -410,28 +441,35 @@ async def execute_ads_action(action: Dict[str, Any] = Body(...)):
 
 Be specific and actionable."""}]
                 )
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "qs_recommendations",
                     "keyword": keyword,
                     "suggestions": response.content[0].text
                 }
-            return {
-                "success": True,
-                "action_type": "qs_recommendations",
-                "keyword": keyword,
-                "suggestions": f"1. Add '{keyword}' to ad headlines\n2. Create dedicated landing page\n3. Use exact match for better relevance\n4. Improve page load speed"
-            }
-        
+            else:
+                outcome = {
+                    "success": True,
+                    "action_type": "qs_recommendations",
+                    "keyword": keyword,
+                    "suggestions": f"1. Add '{keyword}' to ad headlines\n2. Create dedicated landing page\n3. Use exact match for better relevance\n4. Improve page load speed"
+                }
+            _mark_status("completed", outcome)
+            return outcome
+
         elif action_type in ("budget", "keyword_management"):
-            return {
+            outcome = {
                 "success": True,
                 "action_type": "flagged",
                 "message": f"Action flagged for manual review: {action.get('title', action_type)}"
             }
-        
+            _mark_status("completed", outcome)
+            return outcome
+
         else:
+            _mark_status("failed", error=f"Unknown action type: {action_type}")
             return {"success": False, "message": f"Unknown action type: {action_type}"}
-    
+
     except Exception as e:
+        _mark_status("failed", error=str(e))
         return {"success": False, "error": str(e)}

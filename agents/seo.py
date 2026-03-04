@@ -398,6 +398,93 @@ class SEOAgent:
 
         return opportunities[:30]
 
+    async def sync_gsc_keywords(self, min_impressions: int = 1) -> Dict[str, Any]:
+        """
+        Sync ALL keywords from Google Search Console into seo_keywords table.
+        - New keywords get inserted with their GSC data
+        - Existing keywords get their metrics updated
+        Returns counts of inserted, updated, and total GSC queries.
+        """
+        logger.info("🔄 Syncing all GSC keywords to seo_keywords table...")
+        sb = self._get_sb()
+
+        # Fetch all GSC keyword data (paginated, no limit)
+        gsc_data = await self._fetch_gsc_keyword_data()
+        if not gsc_data:
+            return {"inserted": 0, "updated": 0, "total_gsc": 0, "message": "No GSC data available"}
+
+        # Get existing keywords from DB
+        existing_result = sb.table(KEYWORDS_TABLE).select("id,keyword,current_position").execute()
+        existing_map = {row["keyword"].lower(): row for row in (existing_result.data or [])}
+
+        inserted = 0
+        updated = 0
+        now = datetime.utcnow().isoformat()
+
+        for query, data in gsc_data.items():
+            impressions = data.get("impressions", 0)
+            if impressions < min_impressions:
+                continue
+
+            position = data.get("position")
+            clicks = data.get("clicks", 0)
+            ctr = data.get("ctr", 0.0)
+
+            if query.lower() in existing_map:
+                # Update existing keyword with fresh GSC data
+                row = existing_map[query.lower()]
+                try:
+                    sb.table(KEYWORDS_TABLE).update({
+                        "current_position": int(position) if position else None,
+                        "current_clicks": clicks,
+                        "current_impressions": impressions,
+                        "current_ctr": ctr,
+                        "last_checked_at": now,
+                    }).eq("id", row["id"]).execute()
+                    updated += 1
+                except Exception:
+                    pass
+            else:
+                # Insert new keyword discovered from GSC
+                # Determine intent from query
+                intent = "gsc_discovered"
+                query_lower = query.lower()
+                if "successifier" in query_lower or "succesif" in query_lower:
+                    intent = "brand"
+                elif any(w in query_lower for w in ["price", "pricing", "cost", "buy", "demo", "trial"]):
+                    intent = "transactional"
+                elif any(w in query_lower for w in ["vs", "alternative", "compare", "best"]):
+                    intent = "commercial"
+                elif any(w in query_lower for w in ["how to", "what is", "guide", "tips", "why"]):
+                    intent = "informational"
+
+                priority = "high" if clicks > 0 or impressions >= 20 else "medium" if impressions >= 5 else "low"
+
+                try:
+                    sb.table(KEYWORDS_TABLE).insert({
+                        "keyword": query,
+                        "intent": intent,
+                        "priority": priority,
+                        "target_page": data.get("page", "/"),
+                        "current_position": int(position) if position else None,
+                        "current_clicks": clicks,
+                        "current_impressions": impressions,
+                        "current_ctr": ctr,
+                        "position_history": [],
+                        "last_checked_at": now,
+                    }).execute()
+                    inserted += 1
+                except Exception:
+                    pass  # Duplicate or constraint error
+
+        logger.info(f"✅ GSC sync: {inserted} new keywords, {updated} updated, {len(gsc_data)} total GSC queries")
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "total_gsc": len(gsc_data),
+            "total_tracked": len(existing_map) + inserted,
+        }
+
     async def get_ctr_opportunities(self) -> List[Dict[str, Any]]:
         """
         Find tracked keywords where CTR is below 2% despite decent position (≤20).

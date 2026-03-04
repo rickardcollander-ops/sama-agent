@@ -426,9 +426,26 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
     """Execute a content action"""
     if not action:
         raise HTTPException(status_code=400, detail="No action provided")
-    
-    action_type = action.get("type", "")
+
+    action_type = action.get("action_type") or action.get("type", "")
     keyword = action.get("keyword", "")
+    db_row_id = action.get("id")  # UUID from agent_actions table
+
+    def _mark_status(status: str, result_data: dict = None, error: str = None):
+        if not db_row_id:
+            return
+        try:
+            from shared.database import get_supabase
+            from datetime import datetime
+            sb = get_supabase()
+            update = {"status": status, "executed_at": datetime.utcnow().isoformat()}
+            if result_data:
+                update["execution_result"] = result_data
+            if error:
+                update["error_message"] = error
+            sb.table("agent_actions").update(update).eq("id", db_row_id).execute()
+        except Exception:
+            pass
     
     try:
         if action_type == "blog_post":
@@ -455,7 +472,7 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                 author="SAMA Content Agent"
             )
             
-            return {
+            outcome = {
                 "success": True,
                 "action_type": "blog_generated",
                 "result": {
@@ -466,6 +483,8 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                     "github": github_result
                 }
             }
+            _mark_status("completed", outcome)
+            return outcome
         
         elif action_type == "comparison":
             competitor = action.get("competitor", "")
@@ -480,7 +499,7 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                     content=result.get("content", "")
                 )
                 
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "comparison_generated",
                     "github": github_result,
@@ -490,6 +509,8 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                         "status": result.get("status", "draft")
                     }
                 }
+                _mark_status("completed", outcome)
+                return outcome
             return {"success": False, "message": "No competitor specified"}
         
         elif action_type == "optimize":
@@ -499,11 +520,13 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                     content_id=content_id,
                     target_keyword=keyword
                 )
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "content_optimized",
                     "result": result
                 }
+                _mark_status("completed", outcome)
+                return outcome
             return {"success": False, "message": "Missing content_id or keyword"}
         
         elif action_type == "meta":
@@ -516,11 +539,13 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                     cp = cp_result.data[0]
                     meta = await content_agent._generate_meta_description(cp["title"], cp.get("content", ""))
                     sb.table("content_pieces").update({"meta_description": meta}).eq("id", content_id).execute()
-                    return {
+                    outcome = {
                         "success": True,
                         "action_type": "meta_generated",
                         "meta_description": meta
                     }
+                    _mark_status("completed", outcome)
+                    return outcome
             return {"success": False, "message": "Content not found"}
         
         elif action_type == "publish":
@@ -529,15 +554,19 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                 from shared.database import get_supabase
                 sb = get_supabase()
                 sb.table("content_pieces").update({"status": "published"}).eq("id", content_id).execute()
-                return {
+                outcome = {
                     "success": True,
                     "action_type": "content_published",
                     "content_id": content_id
                 }
+                _mark_status("completed", outcome)
+                return outcome
             return {"success": False, "message": "No content_id specified"}
-        
+
         else:
+            _mark_status("failed", error=f"Unknown action type: {action_type}")
             return {"success": False, "message": f"Unknown action type: {action_type}"}
-    
+
     except Exception as e:
+        _mark_status("failed", error=str(e))
         return {"success": False, "error": str(e)}

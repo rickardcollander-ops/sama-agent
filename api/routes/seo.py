@@ -513,6 +513,17 @@ async def discover_opportunities():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/keywords/sync-gsc")
+async def sync_gsc_keywords(min_impressions: int = 1):
+    """Sync all keywords from Google Search Console into the seo_keywords table.
+    New keywords are auto-added, existing ones get updated metrics."""
+    try:
+        result = await seo_agent.sync_gsc_keywords(min_impressions=min_impressions)
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/actions")
 async def get_seo_actions(status: str = None, limit: int = 100):
     """Get SEO actions from database"""
