@@ -157,45 +157,58 @@ async def run_content_generation_workflow(background_tasks: BackgroundTasks):
 
 @router.get("/status")
 async def get_automation_status():
-    """Get status of all automation workflows"""
+    """Get real status of all automation workflows"""
+    from shared.scheduler import get_job_history, scheduler
+
+    history = get_job_history()
+    running = scheduler.running
+
+    def next_run(job_id: str) -> Optional[str]:
+        job = scheduler.get_job(job_id)
+        if job and job.next_run_time:
+            return job.next_run_time.isoformat()
+        return None
+
     return {
+        "scheduler_running": running,
         "workflows": {
-            "daily_workflow": {
-                "enabled": True,
-                "schedule": "Every day at 03:00 UTC",
-                "last_run": None  # TODO: Track in database
+            "daily_keyword_tracking": {
+                "schedule": "Every day at 02:00 UTC",
+                "next_run": next_run("daily_keyword_tracking"),
+                **history["daily_keyword_tracking"],
             },
             "weekly_seo_audit": {
-                "enabled": True,
                 "schedule": "Every Monday at 03:00 UTC",
-                "last_run": None
+                "next_run": next_run("weekly_seo_audit"),
+                **history["weekly_seo_audit"],
             },
-            "content_generation": {
-                "enabled": False,
-                "schedule": "On-demand",
-                "last_run": None
-            }
+            "daily_workflow": {
+                "schedule": "Every day at 06:00 UTC",
+                "next_run": next_run("daily_workflow"),
+                **history["daily_workflow"],
+            },
         },
-        "next_scheduled_run": "2026-02-18T03:00:00Z"
     }
 
 
-@router.post("/schedule/enable")
-async def enable_automation():
-    """Enable automated workflows"""
-    return {
-        "success": True,
-        "message": "Automation enabled. Workflows will run on schedule."
-    }
+@router.post("/trigger/keyword-tracking")
+async def trigger_keyword_tracking():
+    """Manually trigger keyword tracking right now"""
+    from shared.scheduler import _run_daily_keyword_tracking
+    try:
+        await _run_daily_keyword_tracking()
+        from shared.scheduler import get_job_history
+        return {"success": True, **get_job_history()["daily_keyword_tracking"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/schedule/disable")
-async def disable_automation():
-    """Disable automated workflows"""
-    return {
-        "success": True,
-        "message": "Automation disabled. Workflows will not run automatically."
-    }
+@router.post("/trigger/seo-audit")
+async def trigger_seo_audit(background_tasks: BackgroundTasks):
+    """Manually trigger SEO audit in background"""
+    from shared.scheduler import _run_weekly_seo_audit
+    background_tasks.add_task(_run_weekly_seo_audit)
+    return {"success": True, "message": "SEO audit started in background"}
 
 
 @router.post("/content-refresh")

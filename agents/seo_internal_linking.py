@@ -1,6 +1,9 @@
 """
 Internal Linking Optimization
-Analyzes content and suggests internal links to improve site structure
+Analyzes content and suggests internal links to improve site structure.
+
+Uses the 'content' table (same as ContentAgent) with columns:
+  id, title, url_path, content_type, target_keyword, status
 """
 
 from typing import Dict, Any, List, Optional
@@ -12,14 +15,16 @@ from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
 
+CONTENT_TABLE = "content"
+
 
 class InternalLinkingOptimizer:
     """Optimize internal linking structure"""
-    
+
     def __init__(self):
         self.sb = None
-        
-        # Define content clusters and related keywords
+
+        # Content clusters with associated keywords and anchor text options
         self.content_clusters = {
             "churn_prevention": {
                 "keywords": ["churn", "retention", "customer retention", "reduce churn", "churn rate"],
@@ -46,205 +51,212 @@ class InternalLinkingOptimizer:
                 "anchor_texts": ["CS analytics", "customer success metrics", "KPI tracking"]
             }
         }
-    
+
     def _get_sb(self):
         if not self.sb:
             self.sb = get_supabase()
         return self.sb
-    
+
     async def analyze_content_for_links(self, content: str, current_url: str) -> Dict[str, Any]:
         """
-        Analyze content and suggest internal links
-        
+        Analyze content and suggest internal links.
+
         Args:
             content: The content text to analyze
-            current_url: URL of the current page (to avoid self-linking)
-        
+            current_url: URL path of the current page (to avoid self-linking)
+
         Returns:
             Suggested internal links with anchor text and target URLs
         """
         suggestions = []
-        
-        # Get all published content from database
         sb = self._get_sb()
-        result = sb.table("content_library")\
-            .select("id, title, url, pillar, target_keyword")\
-            .eq("status", "published")\
+
+        # Fetch published content from the actual table used by ContentAgent
+        result = (
+            sb.table(CONTENT_TABLE)
+            .select("id, title, url_path, content_type, target_keyword")
+            .eq("status", "published")
             .execute()
-        
-        published_content = result.data if result.data else []
-        
-        # Analyze content for each cluster
+        )
+        published_content = result.data or []
+
         for cluster_name, cluster_data in self.content_clusters.items():
             for keyword in cluster_data["keywords"]:
-                # Check if keyword appears in content
                 pattern = re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
-                matches = pattern.findall(content)
-                
-                if matches:
-                    # Find relevant content to link to
-                    for article in published_content:
-                        if article.get("url") == current_url:
-                            continue  # Skip self-linking
-                        
-                        # Check if article is in same cluster or related
-                        if (article.get("pillar") == cluster_name or 
-                            keyword.lower() in article.get("target_keyword", "").lower()):
-                            
-                            # Suggest link
-                            suggestions.append({
-                                "keyword": keyword,
-                                "target_url": article.get("url"),
-                                "target_title": article.get("title"),
-                                "anchor_text": self._generate_anchor_text(keyword, cluster_data["anchor_texts"]),
-                                "cluster": cluster_name,
-                                "relevance_score": self._calculate_relevance(keyword, article)
-                            })
-        
-        # Sort by relevance and deduplicate
+                if not pattern.search(content):
+                    continue
+
+                for article in published_content:
+                    article_url = article.get("url_path") or ""
+                    if article_url == current_url:
+                        continue  # avoid self-linking
+
+                    target_kw = article.get("target_keyword") or ""
+                    title = article.get("title") or ""
+
+                    if keyword.lower() in target_kw.lower() or keyword.lower() in title.lower():
+                        suggestions.append({
+                            "keyword": keyword,
+                            "target_url": article_url,
+                            "target_title": title,
+                            "anchor_text": self._generate_anchor_text(keyword, cluster_data["anchor_texts"]),
+                            "cluster": cluster_name,
+                            "relevance_score": self._calculate_relevance(keyword, article)
+                        })
+
         suggestions = sorted(suggestions, key=lambda x: x["relevance_score"], reverse=True)
         suggestions = self._deduplicate_suggestions(suggestions)
-        
+
         return {
             "total_suggestions": len(suggestions),
-            "suggestions": suggestions[:10],  # Top 10 suggestions
+            "suggestions": suggestions[:10],
             "clusters_found": list(set(s["cluster"] for s in suggestions))
         }
-    
+
     def _generate_anchor_text(self, keyword: str, anchor_options: List[str]) -> str:
-        """Generate appropriate anchor text"""
-        # Use keyword as base, or pick from predefined options
         for option in anchor_options:
             if keyword.lower() in option.lower():
                 return option
         return keyword
-    
+
     def _calculate_relevance(self, keyword: str, article: Dict[str, Any]) -> float:
-        """Calculate relevance score between keyword and article"""
         score = 0.0
-        
-        # Exact keyword match in target_keyword
-        if keyword.lower() in article.get("target_keyword", "").lower():
+        if keyword.lower() in (article.get("target_keyword") or "").lower():
             score += 1.0
-        
-        # Keyword in title
-        if keyword.lower() in article.get("title", "").lower():
+        if keyword.lower() in (article.get("title") or "").lower():
             score += 0.5
-        
         return score
-    
+
     def _deduplicate_suggestions(self, suggestions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove duplicate suggestions to same URL"""
-        seen_urls = set()
+        seen_urls: set = set()
         unique = []
-        
         for suggestion in suggestions:
             url = suggestion["target_url"]
             if url not in seen_urls:
                 seen_urls.add(url)
                 unique.append(suggestion)
-        
         return unique
-    
+
     async def generate_link_graph(self) -> Dict[str, Any]:
         """
-        Generate site-wide internal linking graph
-        Shows which pages link to which
+        Generate site-wide internal linking graph based on content in the database.
+        Since content rows don't store explicit internal_links, we infer connections
+        via shared keywords/clusters.
         """
         sb = self._get_sb()
-        
-        # Get all content
-        result = sb.table("content_library")\
-            .select("id, title, url, internal_links")\
-            .eq("status", "published")\
+        result = (
+            sb.table(CONTENT_TABLE)
+            .select("id, title, url_path, target_keyword, content_type")
+            .eq("status", "published")
             .execute()
-        
-        content = result.data if result.data else []
-        
-        # Build graph
-        graph = defaultdict(list)
-        incoming_links = defaultdict(int)
-        
+        )
+        content = result.data or []
+
+        if not content:
+            return {
+                "total_pages": 0,
+                "total_internal_links": 0,
+                "avg_links_per_page": 0,
+                "orphan_pages": [],
+                "hub_pages": [],
+                "authority_pages": []
+            }
+
+        # Build keyword → articles index
+        kw_to_articles: Dict[str, List[str]] = defaultdict(list)
         for article in content:
-            url = article.get("url")
-            links = article.get("internal_links", [])
-            
-            for link in links:
-                graph[url].append(link)
-                incoming_links[link] += 1
-        
-        # Find orphan pages (no incoming links)
-        all_urls = {a.get("url") for a in content}
-        orphan_pages = [url for url in all_urls if incoming_links[url] == 0]
-        
-        # Find hub pages (many outgoing links)
+            url = article.get("url_path") or ""
+            kw = (article.get("target_keyword") or "").lower()
+            if kw and url:
+                kw_to_articles[kw].append(url)
+
+        # Build graph: articles that share keyword clusters link to each other
+        graph: Dict[str, List[str]] = defaultdict(list)
+        incoming: Dict[str, int] = defaultdict(int)
+        all_urls = {a.get("url_path") for a in content if a.get("url_path")}
+
+        for cluster_data in self.content_clusters.values():
+            matching_urls = []
+            for kw in cluster_data["keywords"]:
+                for url in kw_to_articles.get(kw, []):
+                    if url not in matching_urls:
+                        matching_urls.append(url)
+            # Each matching URL can link to all others in the cluster
+            for url in matching_urls:
+                for target in matching_urls:
+                    if target != url and target not in graph[url]:
+                        graph[url].append(target)
+                        incoming[target] += 1
+
+        orphan_pages = [url for url in all_urls if incoming[url] == 0]
         hub_pages = sorted(
             [(url, len(links)) for url, links in graph.items()],
-            key=lambda x: x[1],
-            reverse=True
+            key=lambda x: x[1], reverse=True
         )[:10]
-        
-        # Find authority pages (many incoming links)
-        authority_pages = sorted(
-            incoming_links.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:10]
-        
+        authority_pages = sorted(incoming.items(), key=lambda x: x[1], reverse=True)[:10]
+        total_links = sum(len(v) for v in graph.values())
+
         return {
             "total_pages": len(content),
-            "total_internal_links": sum(len(links) for links in graph.values()),
-            "avg_links_per_page": sum(len(links) for links in graph.values()) / len(content) if content else 0,
-            "orphan_pages": orphan_pages,
-            "hub_pages": [{"url": url, "outgoing_links": count} for url, count in hub_pages],
-            "authority_pages": [{"url": url, "incoming_links": count} for url, count in authority_pages]
+            "total_internal_links": total_links,
+            "avg_links_per_page": round(total_links / len(content), 1) if content else 0,
+            "orphan_pages": list(orphan_pages),
+            "hub_pages": [{"url": u, "outgoing_links": c} for u, c in hub_pages],
+            "authority_pages": [{"url": u, "incoming_links": c} for u, c in authority_pages]
         }
-    
+
     async def suggest_pillar_page_links(self, pillar: str) -> List[Dict[str, Any]]:
         """
-        Suggest which supporting articles should link to pillar page
-        
-        Args:
-            pillar: Content pillar name
+        Suggest which supporting articles should link to a pillar page.
+        Uses content_type='pillar_page' to identify pillar articles.
         """
         sb = self._get_sb()
-        
-        # Get pillar page
-        pillar_result = sb.table("content_library")\
-            .select("*")\
-            .eq("pillar", pillar)\
-            .eq("type", "pillar_page")\
-            .limit(1)\
+
+        # Find pillar page — content_type == 'pillar_page' and keyword matches pillar name
+        pillar_result = (
+            sb.table(CONTENT_TABLE)
+            .select("*")
+            .eq("content_type", "pillar_page")
             .execute()
-        
-        if not pillar_result.data:
+        )
+        pillar_rows = pillar_result.data or []
+        # Match by pillar name in title or target_keyword
+        pillar_page = next(
+            (r for r in pillar_rows if pillar.lower().replace("_", " ") in (r.get("title") or "").lower()
+             or pillar.lower() in (r.get("target_keyword") or "").lower()),
+            None
+        )
+        if not pillar_page:
             return []
-        
-        pillar_page = pillar_result.data[0]
-        
-        # Get supporting articles in same pillar
-        supporting_result = sb.table("content_library")\
-            .select("*")\
-            .eq("pillar", pillar)\
-            .neq("type", "pillar_page")\
-            .eq("status", "published")\
+
+        pillar_url = pillar_page.get("url_path", "")
+
+        # Get supporting articles whose target keyword relates to this pillar
+        cluster = self.content_clusters.get(pillar, {})
+        cluster_keywords = cluster.get("keywords", [])
+
+        supporting_result = (
+            sb.table(CONTENT_TABLE)
+            .select("id, title, url_path, target_keyword")
+            .eq("status", "published")
             .execute()
-        
-        supporting_articles = supporting_result.data if supporting_result.data else []
-        
+        )
+        supporting_articles = supporting_result.data or []
+
         suggestions = []
         for article in supporting_articles:
-            # Check if already links to pillar
-            existing_links = article.get("internal_links", [])
-            if pillar_page.get("url") not in existing_links:
+            if article.get("url_path") == pillar_url:
+                continue
+            target_kw = (article.get("target_keyword") or "").lower()
+            if any(kw in target_kw for kw in cluster_keywords):
                 suggestions.append({
-                    "article_url": article.get("url"),
+                    "article_url": article.get("url_path"),
                     "article_title": article.get("title"),
-                    "pillar_url": pillar_page.get("url"),
+                    "pillar_url": pillar_url,
                     "pillar_title": pillar_page.get("title"),
                     "suggested_anchor": f"Learn more about {pillar.replace('_', ' ')}"
                 })
-        
+
         return suggestions
 
 

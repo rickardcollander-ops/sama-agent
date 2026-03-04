@@ -3,7 +3,7 @@ Schema Markup Management for SEO Agent
 Generates and validates JSON-LD structured data
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 import json
 import logging
@@ -11,11 +11,37 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+async def _get_real_ratings() -> Tuple[float, int]:
+    """
+    Fetch real aggregate rating and review count from the reviews table.
+    Falls back to conservative defaults if data is unavailable.
+    """
+    try:
+        from shared.database import get_supabase
+        sb = get_supabase()
+        result = sb.table("reviews").select("rating").not_.is_("rating", "null").execute()
+        rows = result.data or []
+        if rows:
+            ratings = [float(r["rating"]) for r in rows if r.get("rating")]
+            if ratings:
+                avg = round(sum(ratings) / len(ratings), 1)
+                return avg, len(ratings)
+    except Exception as e:
+        logger.debug(f"Could not fetch real ratings: {e}")
+    return 4.5, 0  # conservative default
+
+
 class SchemaMarkupGenerator:
     """Generate JSON-LD schema markup for different content types"""
-    
+
     def __init__(self):
-        self.base_organization = {
+        # Populated lazily via get_base_organization()
+        self._base_organization: Optional[Dict[str, Any]] = None
+
+    async def get_base_organization(self) -> Dict[str, Any]:
+        """Return base SoftwareApplication schema with real review data."""
+        rating, count = await _get_real_ratings()
+        schema: Dict[str, Any] = {
             "@context": "https://schema.org",
             "@type": "SoftwareApplication",
             "name": "Successifier",
@@ -26,12 +52,14 @@ class SchemaMarkupGenerator:
                 "price": "0",
                 "priceCurrency": "USD"
             },
-            "aggregateRating": {
-                "@type": "AggregateRating",
-                "ratingValue": "4.7",
-                "ratingCount": "87"
-            }
         }
+        if count > 0:
+            schema["aggregateRating"] = {
+                "@type": "AggregateRating",
+                "ratingValue": str(rating),
+                "ratingCount": str(count)
+            }
+        return schema
     
     def generate_article_schema(
         self,

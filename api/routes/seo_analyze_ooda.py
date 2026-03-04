@@ -9,6 +9,7 @@ Flow:
 4. Content actions are queued for Content Agent to execute
 """
 
+import asyncio
 import hashlib
 import logging
 from typing import Dict, Any, List
@@ -121,7 +122,8 @@ Return ONLY valid JSON (no markdown, no explanation):
 }}"""
 
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = client.messages.create(
+    response = await asyncio.to_thread(
+        client.messages.create,
         model="claude-sonnet-4-5-20250929",
         max_tokens=2500,
         messages=[{"role": "user", "content": prompt}]

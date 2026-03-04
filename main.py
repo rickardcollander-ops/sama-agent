@@ -18,6 +18,7 @@ from api.routes import (
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
+from shared import scheduler as job_scheduler
 
 # Configure logging
 logging.basicConfig(
@@ -42,17 +43,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # Initialize event bus (optional) - skip for now to ensure startup
     event_bus = None
     logger.info("⚠️ Event bus skipped (optional)")
-    
+
     # Setup monitoring (optional) - skip for now to ensure startup
     logger.info("⚠️ Monitoring skipped (optional)")
-    
+
+    # Start job scheduler
+    try:
+        job_scheduler.start()
+        logger.info("✅ Scheduler started")
+    except Exception as e:
+        logger.warning(f"⚠️ Scheduler failed to start: {e}")
+
     logger.info("🎯 SAMA 2.0 is ready!")
-    
+
     yield
-    
+
     # Cleanup
     if event_bus:
         await event_bus.disconnect()
+    job_scheduler.stop()
     logger.info("👋 SAMA 2.0 shutting down")
 
 
