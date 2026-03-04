@@ -4,12 +4,14 @@ Handles all SEO activities for successifier.com
 Uses Supabase for persistence and real Google APIs where configured.
 """
 
+import asyncio
 import logging
 import re
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 from anthropic import Anthropic
 import httpx
+from bs4 import BeautifulSoup
 
 from shared.config import settings
 from shared.database import get_supabase
@@ -197,13 +199,38 @@ class SEOAgent:
                     "impressions": current_impressions
                 })
                 history = history[-90:]  # Keep last 90 entries
-            
+
+            # Calculate velocity: compare to position 7 days ago
+            position_trend = "stable"
+            position_change = 0
+            if current_position is not None and len(history) >= 2:
+                week_ago = datetime.utcnow() - timedelta(days=7)
+                past = [
+                    h for h in history[:-1]
+                    if datetime.fromisoformat(h["date"].replace("Z", "+00:00").replace("+00:00", "")) < week_ago
+                    or True  # take any entry that's older in the list
+                ]
+                # Use the oldest available within 14 days as baseline
+                baseline_entries = [
+                    h for h in history[:-1]
+                    if (datetime.utcnow() - timedelta(days=14)).isoformat() <= h["date"]
+                ]
+                if baseline_entries:
+                    baseline_pos = baseline_entries[0]["position"]
+                    position_change = round(baseline_pos - current_position, 1)
+                    if position_change >= 3:
+                        position_trend = "improving"
+                    elif position_change <= -3:
+                        position_trend = "declining"
+
             # Update keyword in Supabase
             update_data = {
                 "current_clicks": current_clicks,
                 "current_impressions": current_impressions,
                 "current_ctr": current_ctr,
                 "position_history": history,
+                "position_trend": position_trend,
+                "position_change": position_change,
                 "last_checked_at": datetime.utcnow().isoformat()
             }
             if current_position is not None:
@@ -328,74 +355,125 @@ class SEOAgent:
         return {"inserted": inserted, "skipped": skipped, "total_target": len(self.TARGET_KEYWORDS)}
 
     async def discover_keyword_opportunities(self) -> List[Dict[str, Any]]:
-        """Discover new keyword opportunities using GSC data"""
+        """
+        Discover new keyword opportunities using GSC data.
+        Scores each query by opportunity size = impressions × (1 − CTR/100).
+        High impressions + low CTR = big untapped potential.
+        """
         logger.info("🔎 Discovering keyword opportunities...")
-        
         opportunities = []
-        
         try:
-            gsc_data = await self._fetch_gsc_keyword_data(limit=100)
+            gsc_data = await self._fetch_gsc_keyword_data(limit=200)
             existing = await self.get_keywords()
             existing_keywords = {k["keyword"].lower() for k in existing}
-            
+
             for query, data in gsc_data.items():
-                if query not in existing_keywords and data.get("impressions", 0) > 10:
-                    opportunities.append({
-                        "keyword": query,
-                        "impressions": data["impressions"],
-                        "clicks": data["clicks"],
-                        "position": data.get("position"),
-                        "ctr": data.get("ctr", 0),
-                        "source": "gsc_discovery"
-                    })
-            
-            # Sort by impressions
-            opportunities.sort(key=lambda x: x["impressions"], reverse=True)
+                if query in existing_keywords:
+                    continue
+                impressions = data.get("impressions", 0)
+                if impressions < 5:
+                    continue
+                ctr = data.get("ctr", 0)           # already as percentage (e.g. 2.5)
+                position = data.get("position")
+                clicks = data.get("clicks", 0)
+                # Opportunity score: missed clicks
+                opportunity_score = round(impressions * (1 - ctr / 100), 1)
+                # Category: page-2 keywords are quick wins
+                category = "quick_win" if position and 10 < position <= 20 else "untapped"
+                opportunities.append({
+                    "keyword": query,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "position": position,
+                    "ctr": ctr,
+                    "opportunity_score": opportunity_score,
+                    "category": category,
+                    "source": "gsc_discovery"
+                })
+
+            # Sort by opportunity score descending
+            opportunities.sort(key=lambda x: x["opportunity_score"], reverse=True)
         except Exception as e:
             logger.warning(f"Keyword discovery failed: {e}")
-        
-        return opportunities[:20]
+
+        return opportunities[:30]
+
+    async def get_ctr_opportunities(self) -> List[Dict[str, Any]]:
+        """
+        Find tracked keywords where CTR is below 2% despite decent position (≤20).
+        These are title/meta-description optimization targets — quick wins.
+        """
+        keywords = await self.get_keywords()
+        opportunities = []
+        for kw in keywords:
+            pos = kw.get("current_position")
+            ctr = kw.get("current_ctr", 0)
+            impressions = kw.get("current_impressions", 0)
+            if pos and pos <= 20 and impressions >= 20 and ctr < 2.0:
+                missed_clicks = round(impressions * (0.02 - ctr / 100))
+                opportunities.append({
+                    "keyword": kw["keyword"],
+                    "current_position": pos,
+                    "current_ctr": ctr,
+                    "impressions": impressions,
+                    "current_clicks": kw.get("current_clicks", 0),
+                    "missed_clicks_estimate": missed_clicks,
+                    "suggestion": "Optimise title tag and meta description to improve CTR",
+                    "target_page": kw.get("target_page", "/"),
+                })
+        # Sort by potential impact
+        opportunities.sort(key=lambda x: x["missed_clicks_estimate"], reverse=True)
+        return opportunities
     
     # ── Real API integrations ──────────────────────────────────────────
     
-    async def _check_core_web_vitals(self) -> Dict[str, Any]:
-        """Check Core Web Vitals via PageSpeed Insights API (free, no key needed)"""
-        params = {
-            "url": SITE_URL,
-            "strategy": "mobile",
-            "category": "performance"
-        }
-        
-        resp = await self.http_client.get(PAGESPEED_API, params=params)
-        
+    async def _fetch_pagespeed(self, url: str, strategy: str) -> Dict[str, Any]:
+        """Fetch PageSpeed Insights data for one URL + strategy"""
+        params = {"url": url, "strategy": strategy, "category": "performance"}
+        resp = await self.http_client.get(PAGESPEED_API, params=params, timeout=45.0)
         if resp.status_code != 200:
-            logger.warning(f"PageSpeed API returned {resp.status_code}")
             return {"error": f"API returned {resp.status_code}"}
-        
         data = resp.json()
-        
-        # Extract metrics from Lighthouse
         audits = data.get("lighthouseResult", {}).get("audits", {})
-        
-        lcp = audits.get("largest-contentful-paint", {}).get("numericValue", 0)
-        fcp = audits.get("first-contentful-paint", {}).get("numericValue", 0)
-        cls = audits.get("cumulative-layout-shift", {}).get("numericValue", 0)
-        tbt = audits.get("total-blocking-time", {}).get("numericValue", 0)
-        si = audits.get("speed-index", {}).get("numericValue", 0)
-        
-        # Overall performance score
-        perf_score = data.get("lighthouseResult", {}).get("categories", {}).get("performance", {}).get("score", 0)
-        
+        perf_score = (
+            data.get("lighthouseResult", {})
+            .get("categories", {})
+            .get("performance", {})
+            .get("score", 0)
+        )
+        # TTFB from server-response-time audit
+        ttfb = audits.get("server-response-time", {}).get("numericValue", 0)
+        # INP (Interaction to Next Paint) — replaces FID in Core Web Vitals 2024
+        inp = audits.get("interactive", {}).get("numericValue", 0)
         return {
-            "lcp": round(lcp, 0),
-            "fcp": round(fcp, 0),
-            "cls": round(cls, 4),
-            "tbt": round(tbt, 0),
-            "speed_index": round(si, 0),
+            "lcp":               round(audits.get("largest-contentful-paint", {}).get("numericValue", 0), 0),
+            "fcp":               round(audits.get("first-contentful-paint", {}).get("numericValue", 0), 0),
+            "cls":               round(audits.get("cumulative-layout-shift", {}).get("numericValue", 0), 4),
+            "tbt":               round(audits.get("total-blocking-time", {}).get("numericValue", 0), 0),
+            "speed_index":       round(audits.get("speed-index", {}).get("numericValue", 0), 0),
+            "ttfb":              round(ttfb, 0),
+            "tti":               round(inp, 0),
             "performance_score": round(perf_score * 100, 0) if perf_score else 0,
-            "strategy": "mobile",
-            "url": SITE_URL
+            "strategy":          strategy,
+            "url":               url,
         }
+
+    async def _check_core_web_vitals(self) -> Dict[str, Any]:
+        """Check Core Web Vitals for mobile (primary) + desktop in parallel"""
+        mobile, desktop = await asyncio.gather(
+            self._fetch_pagespeed(SITE_URL, "mobile"),
+            self._fetch_pagespeed(SITE_URL, "desktop"),
+            return_exceptions=True
+        )
+        if isinstance(mobile, Exception):
+            mobile = {"error": str(mobile)}
+        if isinstance(desktop, Exception):
+            desktop = {"error": str(desktop)}
+
+        # Top-level fields are mobile (Google's ranking signal is mobile-first)
+        result = {**mobile}
+        result["desktop"] = desktop
+        return result
     
     async def _fetch_gsc_data(self) -> Dict[str, Any]:
         """Fetch Google Search Console summary data via real API"""
@@ -572,70 +650,127 @@ class SEOAgent:
         known = await self.get_known_pages()
         live_pages = known["live"]
 
-        # Check all live pages + expected pages
         pages_to_check = set()
         pages_to_check.update(live_pages)
         pages_to_check.update(known["expected"])
-        # Always check core pages
         pages_to_check.update(["/", "/product", "/pricing"])
 
         checked = 0
         for page in sorted(pages_to_check):
             url = f"{SITE_URL}{page}"
             try:
-                resp = await self.http_client.get(url, follow_redirects=True)
+                import time as _time
+                t0 = _time.monotonic()
+                resp = await self.http_client.get(url, follow_redirects=True, timeout=15.0)
+                response_time_ms = round((_time.monotonic() - t0) * 1000)
                 checked += 1
 
                 if resp.status_code == 404:
-                    # Only flag as critical if it's an expected page (keyword target or content)
-                    if page in known["expected"] or page in known["content_urls"]:
-                        issues["critical"].append({
-                            "type": "page_not_found",
-                            "url": url,
-                            "status_code": 404,
-                            "message": f"Expected page {page} returns 404"
-                        })
-                    else:
-                        issues["medium"].append({
-                            "type": "page_not_found",
-                            "url": url,
-                            "status_code": 404
-                        })
+                    severity = "critical" if (page in known["expected"] or page in known.get("content_urls", set())) else "medium"
+                    issues[severity].append({
+                        "type": "page_not_found",
+                        "url": url,
+                        "status_code": 404,
+                        "message": f"Expected page {page} returns 404"
+                    })
                 elif resp.status_code >= 500:
                     issues["critical"].append({
                         "type": "server_error",
                         "url": url,
                         "status_code": resp.status_code
                     })
-                elif resp.status_code >= 300 and resp.status_code < 400:
+                elif 300 <= resp.status_code < 400:
                     issues["medium"].append({
                         "type": "redirect",
                         "url": url,
                         "status_code": resp.status_code
                     })
 
-                # Check for basic SEO elements in HTML
+                # Slow TTFB at the page level
+                if resp.status_code == 200 and response_time_ms > 800:
+                    severity = "high" if response_time_ms > 2000 else "medium"
+                    issues[severity].append({
+                        "type": "slow_response",
+                        "url": url,
+                        "response_time_ms": response_time_ms,
+                        "message": f"Response time {response_time_ms}ms (target <800ms)"
+                    })
+
                 if resp.status_code == 200:
-                    html = resp.text.lower()
-                    if "<title>" not in html or "</title>" not in html:
-                        issues["high"].append({
-                            "type": "missing_title",
-                            "url": url
-                        })
-                    if 'meta name="description"' not in html:
-                        issues["high"].append({
-                            "type": "missing_meta_description",
-                            "url": url
-                        })
-                    if "<h1" not in html:
+                    html_raw = resp.text
+                    soup = BeautifulSoup(html_raw, "lxml")
+                    html = html_raw.lower()
+
+                    # Title tag
+                    title_tag = soup.find("title")
+                    if not title_tag:
+                        issues["high"].append({"type": "missing_title", "url": url})
+                    else:
+                        title_len = len(title_tag.get_text().strip())
+                        if title_len > 60:
+                            issues["medium"].append({
+                                "type": "title_too_long",
+                                "url": url,
+                                "length": title_len,
+                                "message": f"Title is {title_len} chars (target ≤60)"
+                            })
+                        elif title_len < 30:
+                            issues["medium"].append({
+                                "type": "title_too_short",
+                                "url": url,
+                                "length": title_len,
+                                "message": f"Title is only {title_len} chars (target ≥30)"
+                            })
+
+                    # Meta description
+                    meta_desc = soup.find("meta", attrs={"name": "description"})
+                    if not meta_desc:
+                        issues["high"].append({"type": "missing_meta_description", "url": url})
+                    else:
+                        desc_len = len((meta_desc.get("content") or "").strip())
+                        if desc_len > 160:
+                            issues["medium"].append({
+                                "type": "meta_description_too_long",
+                                "url": url,
+                                "length": desc_len,
+                                "message": f"Meta description is {desc_len} chars (target ≤160)"
+                            })
+                        elif desc_len < 50:
+                            issues["medium"].append({
+                                "type": "meta_description_too_short",
+                                "url": url,
+                                "length": desc_len,
+                                "message": f"Meta description only {desc_len} chars (target ≥50)"
+                            })
+
+                    # H1 check
+                    h1_tags = soup.find_all("h1")
+                    if not h1_tags:
+                        issues["medium"].append({"type": "missing_h1", "url": url})
+                    elif len(h1_tags) > 1:
                         issues["medium"].append({
-                            "type": "missing_h1",
-                            "url": url
+                            "type": "multiple_h1",
+                            "url": url,
+                            "count": len(h1_tags),
+                            "message": f"Page has {len(h1_tags)} H1 tags (should have exactly 1)"
                         })
+
+                    # Canonical
                     if 'rel="canonical"' not in html:
+                        issues["medium"].append({"type": "missing_canonical", "url": url})
+
+                    # Images without alt text
+                    imgs_without_alt = [
+                        img.get("src", "")[:80]
+                        for img in soup.find_all("img")
+                        if not img.get("alt")
+                    ]
+                    if imgs_without_alt:
                         issues["medium"].append({
-                            "type": "missing_canonical",
-                            "url": url
+                            "type": "images_missing_alt",
+                            "url": url,
+                            "count": len(imgs_without_alt),
+                            "message": f"{len(imgs_without_alt)} images missing alt text"
                         })
 
             except httpx.ConnectError:
@@ -652,19 +787,20 @@ class SEOAgent:
         return issues
     
     async def _generate_recommendations(self, audit_data: Dict[str, Any]) -> List[str]:
-        """Generate SEO recommendations using Claude"""
+        """Generate SEO recommendations using Claude (runs in thread to avoid blocking event loop)"""
         cwv = audit_data.get("core_web_vitals", {})
-        
-        prompt = f"""Based on this SEO audit data for successifier.com, provide 5 actionable recommendations:
+
+        prompt = f"""Based on this SEO audit data for successifier.com, provide 5 specific actionable recommendations:
 
 Audit Summary:
 - Critical Issues: {len(audit_data['critical_issues'])}
 - High Issues: {len(audit_data['high_issues'])}
 - Medium Issues: {len(audit_data['medium_issues'])}
 
-Core Web Vitals:
-- LCP: {cwv.get('lcp', 'N/A')}ms
-- CLS: {cwv.get('cls', 'N/A')}
+Core Web Vitals (mobile):
+- LCP: {cwv.get('lcp', 'N/A')}ms (target <2500ms)
+- CLS: {cwv.get('cls', 'N/A')} (target <0.1)
+- TBT: {cwv.get('tbt', 'N/A')}ms
 - Performance Score: {cwv.get('performance_score', 'N/A')}/100
 
 Critical Issues:
@@ -673,14 +809,16 @@ Critical Issues:
 High Issues:
 {audit_data['high_issues'][:5]}
 
-Provide specific, actionable recommendations prioritized by impact. Be concise."""
+List exactly 5 actionable recommendations, one per line, starting with a number. Be specific to successifier.com."""
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+        response = await asyncio.to_thread(_call)
         recommendations = response.content[0].text.strip().split("\n")
         return [r.strip() for r in recommendations if r.strip()]
     

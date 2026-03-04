@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -413,7 +414,8 @@ Give your response in this exact JSON structure:
 Be specific to successifier.com and the customer success SaaS space. Focus on realistic wins. Make each action in month1/month2/month3 a concrete single task someone can do and check off."""
 
         client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        response = client.messages.create(
+        response = await asyncio.to_thread(
+            client.messages.create,
             model="claude-sonnet-4-5-20250929",
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}]
@@ -611,10 +613,7 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
             description = action.get("description", "")
             target_page = action.get("target_page", "")
             if seo_agent.client:
-                response = seo_agent.client.messages.create(
-                    model=seo_agent.model,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": f"""You are an SEO specialist for successifier.com — an AI customer success platform.
+                _on_page_prompt = f"""You are an SEO specialist for successifier.com — an AI customer success platform.
 
 Page: {target_page or 'unknown'}
 Context: {description}
@@ -637,7 +636,12 @@ Rules:
 - meta_description: max 155 chars, compelling CTA
 - Use real successifier.com paths: /, /pricing, /blog, /vs/gainsight, /vs/totango, /vs/churnzero, /product
 - 3 internal links, 3 LSI keywords, 3 quick wins
-- Be specific to successifier.com, not generic"""}]
+- Be specific to successifier.com, not generic"""
+                response = await asyncio.to_thread(
+                    seo_agent.client.messages.create,
+                    model=seo_agent.model,
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": _on_page_prompt}]
                 )
                 import json as _json, re as _re
                 raw = response.content[0].text.strip()
@@ -703,10 +707,7 @@ Rules:
 
             # Other technical issues: generate a structured fix plan
             if seo_agent.client:
-                response = seo_agent.client.messages.create(
-                    model=seo_agent.model,
-                    max_tokens=700,
-                    messages=[{"role": "user", "content": f"""Technical SEO issue on successifier.com:
+                _tech_prompt = f"""Technical SEO issue on successifier.com:
 Issue: {title}
 Details: {action.get('description', '')}
 Page: {target_page}
@@ -720,7 +721,12 @@ Reply with ONLY this exact JSON:
   "expected_impact": "one sentence on SEO impact after fix"
 }}
 
-Be developer-ready. No generic advice."""}]
+Be developer-ready. No generic advice."""
+                response = await asyncio.to_thread(
+                    seo_agent.client.messages.create,
+                    model=seo_agent.model,
+                    max_tokens=700,
+                    messages=[{"role": "user", "content": _tech_prompt}]
                 )
                 import json as _json, re as _re
                 raw = response.content[0].text.strip()
@@ -758,6 +764,71 @@ Be developer-ready. No generic advice."""}]
     except Exception as e:
         mark_failed(str(e))
         return {"success": False, "error": str(e)}
+
+
+@router.get("/keywords/ctr-opportunities")
+async def get_ctr_opportunities():
+    """
+    Keywords with position ≤ 20 but CTR < 2%.
+    These are quick wins — improving title/meta could boost clicks without ranking changes.
+    """
+    try:
+        opportunities = await seo_agent.get_ctr_opportunities()
+        return {"success": True, "count": len(opportunities), "opportunities": opportunities}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pages/insights")
+async def get_page_gsc_insights():
+    """
+    Per-page GSC data: which pages get the most clicks/impressions.
+    Uses GSC dimension=page.
+    """
+    from shared.google_auth import get_access_token, is_gsc_configured
+    from agents.seo import GSC_SITE_URL, GSC_API
+    from datetime import datetime, timedelta
+    import httpx as _httpx
+
+    if not is_gsc_configured():
+        return {"success": False, "message": "GSC not configured", "pages": []}
+
+    try:
+        token = await get_access_token("gsc")
+        if not token:
+            return {"success": False, "message": "GSC auth failed", "pages": []}
+
+        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
+        encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
+        url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
+
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json={
+                "startDate": start_date,
+                "endDate": end_date,
+                "dimensions": ["page"],
+                "rowLimit": 25
+            }, headers={"Authorization": f"Bearer {token}"})
+
+        if resp.status_code != 200:
+            return {"success": False, "message": f"GSC returned {resp.status_code}", "pages": []}
+
+        rows = resp.json().get("rows", [])
+        pages = [
+            {
+                "page": row["keys"][0],
+                "clicks": row.get("clicks", 0),
+                "impressions": row.get("impressions", 0),
+                "ctr": round(row.get("ctr", 0) * 100, 2),
+                "avg_position": round(row.get("position", 0), 1)
+            }
+            for row in rows
+        ]
+        pages.sort(key=lambda x: x["clicks"], reverse=True)
+        return {"success": True, "date_range": f"{start_date} to {end_date}", "pages": pages}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/audits")
