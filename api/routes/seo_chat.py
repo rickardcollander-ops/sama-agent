@@ -13,6 +13,7 @@ Supported actions (examples):
   "what should I focus on?"                  → AI strategy advice
 """
 
+import asyncio
 from fastapi import APIRouter, Body, HTTPException
 from typing import Dict, Any
 from agents.seo import seo_agent
@@ -97,12 +98,7 @@ async def chat_with_seo_agent(request: Dict[str, Any] = Body(...)):
             action_summary += f"  - [{a.get('priority', '?').upper()}] {a.get('title', '')}\n"
 
         # ── Intent classification ─────────────────────────────────────────
-        classification = seo_agent.client.messages.create(
-            model=seo_agent.model,
-            max_tokens=512,
-            messages=[{
-                "role": "user",
-                "content": f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform).
+        _cls_prompt = f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform).
 {conversation_context}
 Current message: "{message}"
 {kw_summary}{action_summary}
@@ -127,7 +123,12 @@ ACTION: [type]
 KEYWORD: [keyword or N/A]
 ACTION_TITLE: [title fragment or N/A]
 EXPLANATION: [one sentence]"""
-            }]
+
+        classification = await asyncio.to_thread(
+            seo_agent.client.messages.create,
+            model=seo_agent.model,
+            max_tokens=512,
+            messages=[{"role": "user", "content": _cls_prompt}]
         )
 
         lines = classification.content[0].text.strip().split("\n")
@@ -277,14 +278,21 @@ EXPLANATION: [one sentence]"""
                     lcp_emoji = "🟢" if lcp <= 2500 else "🔴"
                     cls = cwv.get("cls", 0)
                     cls_emoji = "🟢" if cls <= 0.1 else "🔴"
+                    ttfb = cwv.get("ttfb", 0)
+                    ttfb_emoji = "🟢" if ttfb <= 800 else "🟡" if ttfb <= 1800 else "🔴"
                     response_text = (
-                        f"⚡ **Core Web Vitals — successifier.com (mobile)**\n\n"
-                        f"  {score_emoji} Performance score: **{score}/100**\n"
+                        f"⚡ **Core Web Vitals — successifier.com**\n\n"
+                        f"  **Mobile** {score_emoji} {score}/100\n"
                         f"  {lcp_emoji} LCP: **{lcp:,.0f}ms** (target <2,500ms)\n"
                         f"  {cls_emoji} CLS: **{cls}** (target <0.1)\n"
-                        f"  • FCP: {cwv.get('fcp', 0):,.0f}ms\n"
-                        f"  • TBT: {cwv.get('tbt', 0):,.0f}ms\n"
+                        f"  {ttfb_emoji} TTFB: **{ttfb:,.0f}ms** (server speed, target <800ms)\n"
+                        f"  • FCP: {cwv.get('fcp', 0):,.0f}ms · TBT: {cwv.get('tbt', 0):,.0f}ms\n"
                     )
+                    desktop = cwv.get("desktop", {})
+                    if desktop and not desktop.get("error"):
+                        d_score = desktop.get("performance_score", 0)
+                        d_emoji = "🟢" if d_score >= 90 else "🟡" if d_score >= 50 else "🔴"
+                        response_text += f"\n  **Desktop** {d_emoji} {d_score}/100  · LCP: {desktop.get('lcp', 0):,.0f}ms\n"
                     if score < 90:
                         response_text += "\n💡 Say **'run audit'** for a full analysis and fix recommendations."
             except Exception as e:
@@ -295,14 +303,24 @@ EXPLANATION: [one sentence]"""
             try:
                 opportunities = await seo_agent.discover_keyword_opportunities()
                 if opportunities:
-                    response_text += f"\n✅ Found **{len(opportunities)} untapped keywords:**\n"
-                    for opp in opportunities[:8]:
-                        response_text += (
-                            f"  • **'{opp['keyword']}'** — "
-                            f"{opp['impressions']} impressions, "
-                            f"pos {opp.get('position', '?')}, "
-                            f"{opp['clicks']} clicks\n"
-                        )
+                    quick_wins = [o for o in opportunities if o.get("category") == "quick_win"]
+                    untapped   = [o for o in opportunities if o.get("category") != "quick_win"]
+                    response_text += f"\n✅ Found **{len(opportunities)} opportunities:**\n"
+                    if quick_wins:
+                        response_text += f"\n⚡ **Page-2 quick wins** (easiest to rank):\n"
+                        for opp in quick_wins[:4]:
+                            pos = opp.get('position') or '?'
+                            response_text += (
+                                f"  • **'{opp['keyword']}'** — pos {pos:.0f}, "
+                                f"{opp['impressions']} impr, score {opp.get('opportunity_score',0):.0f}\n"
+                            )
+                    if untapped:
+                        response_text += f"\n🎯 **Untapped** (high impressions, no clicks):\n"
+                        for opp in untapped[:4]:
+                            response_text += (
+                                f"  • **'{opp['keyword']}'** — "
+                                f"{opp['impressions']} impr, {opp['clicks']} clicks\n"
+                            )
                     response_text += "\nSay **'track keyword [name]'** to start tracking any of these."
                 else:
                     response_text += "\nNo new opportunities found — all high-impression queries are already tracked."
@@ -353,12 +371,7 @@ EXPLANATION: [one sentence]"""
             except Exception:
                 pass
 
-            strategy_answer = seo_agent.client.messages.create(
-                model=seo_agent.model,
-                max_tokens=800,
-                messages=[{
-                    "role": "user",
-                    "content": f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform targeting SMB SaaS companies).
+            _strategy_prompt = f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform targeting SMB SaaS companies).
 {conversation_context}
 Current question: "{message}"
 
@@ -369,18 +382,17 @@ Context:
 {gsc_summary}
 
 Give specific, actionable SEO strategy advice. Reference real successifier.com pages and real competitors where relevant. Be concise (max 5 bullet points)."""
-                }]
+            strategy_answer = await asyncio.to_thread(
+                seo_agent.client.messages.create,
+                model=seo_agent.model,
+                max_tokens=800,
+                messages=[{"role": "user", "content": _strategy_prompt}]
             )
             response_text = strategy_answer.content[0].text
 
         else:
             # GENERAL fallback
-            general_answer = seo_agent.client.messages.create(
-                model=seo_agent.model,
-                max_tokens=512,
-                messages=[{
-                    "role": "user",
-                    "content": f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform).
+            _general_prompt = f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform).
 {conversation_context}
 Current message: "{message}"
 
@@ -392,10 +404,14 @@ What you can do:
 - Show rankings & GSC data
 - Run technical audits
 - Check Core Web Vitals
-- Find keyword opportunities
+- Find keyword opportunities (with opportunity scoring by missed clicks)
 - Execute pending actions
 - Give SEO strategy advice"""
-                }]
+            general_answer = await asyncio.to_thread(
+                seo_agent.client.messages.create,
+                model=seo_agent.model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": _general_prompt}]
             )
             response_text = general_answer.content[0].text
 
