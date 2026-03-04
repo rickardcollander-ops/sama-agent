@@ -173,10 +173,22 @@ async def get_ads_actions(status: str = None, limit: int = 100):
 
 
 @router.post("/analyze")
-async def run_full_analysis():
-    """Run full Ads analysis using OODA loop (Observe → Orient → Decide → Act → Reflect)"""
+async def run_full_analysis(background: bool = True):
+    """Run ads analysis. With background=true (default), returns immediately with cycle_id for polling."""
     from api.routes.ads_analyze_ooda import run_ads_analysis_with_ooda
+
+    if background:
+        from shared.background_analysis import start_background_analysis
+        return await start_background_analysis("ads", run_ads_analysis_with_ooda)
+
     return await run_ads_analysis_with_ooda()
+
+
+@router.get("/cycle-status")
+async def ads_cycle_status(cycle_id: str = None):
+    """Poll analysis progress."""
+    from shared.background_analysis import get_cycle_status
+    return await get_cycle_status("ads", cycle_id)
 
 
 @router.post("/analyze-legacy")
