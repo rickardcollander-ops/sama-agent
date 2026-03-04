@@ -12,7 +12,7 @@ import httpx
 
 from shared.config import settings
 from shared.database import get_supabase
-from .models import CONTENT_PIECES_TABLE, KEYWORDS_TABLE
+from .models import CONTENT_PIECES_TABLE, KEYWORDS_TABLE, COMPETITOR_ANALYSES_TABLE
 from .brand_voice import brand_voice
 
 logger = logging.getLogger(__name__)
@@ -510,11 +510,371 @@ Requirements:
         keyword: str,
         analysis: Dict[str, Any]
     ) -> str:
-        """Optimize content for keyword"""
-        # This would use Claude to rewrite sections
-        # For now, return original content
-        return content
+        """Optimize content for a target keyword using Claude.
+
+        Takes the current SEO analysis (keyword density, placement flags) and
+        rewrites the content to hit optimal density, improve heading structure,
+        and suggest internal link anchors -- all while preserving the original
+        meaning and brand voice.
+        """
+        if not self.client:
+            logger.warning("No Anthropic client configured; skipping content optimization")
+            return content
+
+        system_prompt = self.brand_voice.get_system_prompt("blog")
+
+        issues: List[str] = []
+        if analysis.get("keyword_density", 0) < 0.5:
+            issues.append(
+                f"Keyword density is too low ({analysis['keyword_density']}%). "
+                "Add more natural mentions of the target keyword."
+            )
+        elif analysis.get("keyword_density", 0) > 2.5:
+            issues.append(
+                f"Keyword density is too high ({analysis['keyword_density']}%). "
+                "Reduce keyword stuffing while keeping the content relevant."
+            )
+        if not analysis.get("in_title"):
+            issues.append("The target keyword is missing from the title/H1. Include it naturally.")
+        if not analysis.get("in_first_paragraph"):
+            issues.append("The target keyword does not appear in the first paragraph. Add it early.")
+
+        # Fetch existing content titles for internal-link suggestions
+        internal_pages: List[str] = []
+        try:
+            sb = self._get_sb()
+            pages_result = sb.table(CONTENT_PIECES_TABLE).select("title,target_url").limit(50).execute()
+            for page in (pages_result.data or []):
+                title = page.get("title", "")
+                url = page.get("target_url", "")
+                if title and url:
+                    internal_pages.append(f"- \"{title}\" ({url})")
+        except Exception:
+            pass
+
+        internal_links_section = ""
+        if internal_pages:
+            internal_links_section = (
+                "\n\nINTERNAL PAGES AVAILABLE FOR LINKING:\n"
+                + "\n".join(internal_pages[:20])
+                + "\n\nWhere relevant, add markdown links to these internal pages using "
+                "natural anchor text. Do not force links where they don't fit."
+            )
+
+        user_prompt = f"""Optimize the following content for the target keyword: "{keyword}"
+
+SEO ISSUES TO FIX:
+{chr(10).join("- " + issue for issue in issues) if issues else "- General optimization needed for keyword relevance."}
+
+OPTIMIZATION REQUIREMENTS:
+1. Achieve a keyword density between 0.8% and 1.5% for "{keyword}" using natural phrasing.
+2. Ensure "{keyword}" appears in the H1/title, first paragraph, at least one H2 subheading, and the conclusion.
+3. Improve heading hierarchy (H1 -> H2 -> H3) for better SEO structure.
+4. Add semantic variations and related terms for "{keyword}" throughout.
+5. Keep the same overall structure, meaning, and tone -- do not shorten the content.
+6. Preserve all existing data points, proof points, and CTAs.{internal_links_section}
+
+ORIGINAL CONTENT:
+{content}
+
+Return ONLY the optimized content in markdown format. Do not include any commentary or explanation."""
+
+        try:
+            def _call():
+                return self.client.messages.create(
+                    model=self.model,
+                    max_tokens=8192,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}]
+                )
+            response = await asyncio.to_thread(_call)
+            optimized = response.content[0].text.strip()
+
+            # Validate the optimization didn't drastically shrink the content
+            original_words = len(content.split())
+            optimized_words = len(optimized.split())
+            if optimized_words < original_words * 0.7:
+                logger.warning(
+                    "Optimized content is significantly shorter than original "
+                    f"({optimized_words} vs {original_words} words); keeping original"
+                )
+                return content
+
+            logger.info(
+                f"Content optimized for '{keyword}': "
+                f"{original_words} -> {optimized_words} words"
+            )
+            return optimized
+
+        except Exception as e:
+            logger.error(f"Failed to optimize content for '{keyword}': {e}")
+            return content
     
+    # ------------------------------------------------------------------ #
+    #  Competitor content themes used for gap analysis                     #
+    # ------------------------------------------------------------------ #
+    COMPETITOR_CONTENT_THEMES: Dict[str, Dict[str, List[str]]] = {
+        "gainsight": {
+            "name": "Gainsight",
+            "themes": [
+                "customer success management",
+                "customer health scoring",
+                "net revenue retention",
+                "customer lifecycle management",
+                "product adoption analytics",
+                "customer journey orchestration",
+                "cs ops and strategy",
+                "customer success qualified leads",
+                "digital customer success",
+                "voice of the customer",
+                "community-led growth",
+                "renewal management",
+                "customer 360 view",
+            ],
+        },
+        "totango": {
+            "name": "Totango",
+            "themes": [
+                "customer success software",
+                "successbloc templates",
+                "customer health monitoring",
+                "customer onboarding automation",
+                "churn prediction",
+                "customer segmentation",
+                "cs workflow automation",
+                "account-based customer success",
+                "proactive customer engagement",
+                "time to value optimization",
+                "customer success KPIs",
+            ],
+        },
+        "churnzero": {
+            "name": "ChurnZero",
+            "themes": [
+                "churn reduction strategies",
+                "real-time customer alerts",
+                "customer engagement scoring",
+                "in-app communication",
+                "customer success automation",
+                "usage tracking and analytics",
+                "SaaS retention strategies",
+                "customer success playbooks",
+                "renewal forecasting",
+                "product usage analytics",
+                "customer health dashboards",
+            ],
+        },
+    }
+
+    async def analyze_competitor_content_gaps(self) -> Dict[str, Any]:
+        """Analyze content gaps relative to competitor themes and SEO keyword data.
+
+        Returns a structured result containing:
+        - ``gaps``: list of actionable gap records, each with a recommended
+          content type, title, target keyword, and rationale.
+        - ``coverage``: per-competitor coverage percentage.
+        - ``summary``: human-readable summary string.
+        """
+        logger.info("Analyzing competitor content gaps")
+
+        sb = self._get_sb()
+
+        # -- 1. Fetch our existing content --------------------------------- #
+        try:
+            cp_result = sb.table(CONTENT_PIECES_TABLE).select(
+                "id,title,target_keyword,content_type,word_count,status"
+            ).limit(200).execute()
+            content_pieces = cp_result.data or []
+        except Exception as e:
+            logger.error(f"Failed to fetch content pieces: {e}")
+            content_pieces = []
+
+        # Build a searchable blob of all our content titles + keywords
+        our_content_text = " ".join(
+            (cp.get("title", "") + " " + (cp.get("target_keyword", "") or "")).lower()
+            for cp in content_pieces
+        )
+
+        # -- 2. Fetch SEO keywords from GSC data -------------------------- #
+        try:
+            kw_result = sb.table(KEYWORDS_TABLE).select("*").execute()
+            seo_keywords = kw_result.data or []
+        except Exception as e:
+            logger.error(f"Failed to fetch SEO keywords: {e}")
+            seo_keywords = []
+
+        # Index keywords by normalised keyword text for fast lookup
+        kw_index: Dict[str, Dict[str, Any]] = {}
+        for kw in seo_keywords:
+            kw_text = kw.get("keyword", "").lower().strip()
+            if kw_text:
+                kw_index[kw_text] = kw
+
+        # Keywords we rank for but have no dedicated content targeting
+        existing_target_keywords = {
+            cp.get("target_keyword", "").lower().strip()
+            for cp in content_pieces
+            if cp.get("target_keyword")
+        }
+        orphan_keywords = [
+            kw for kw_text, kw in kw_index.items()
+            if kw_text not in existing_target_keywords
+        ]
+
+        # -- 3. Fetch any prior competitor analyses ------------------------ #
+        competitor_data: Dict[str, Dict[str, Any]] = {}
+        try:
+            ca_result = sb.table(COMPETITOR_ANALYSES_TABLE).select(
+                "competitor,keyword_gaps,content_opportunities"
+            ).execute()
+            for ca in (ca_result.data or []):
+                comp = ca.get("competitor", "").lower().replace(".com", "")
+                competitor_data[comp] = ca
+        except Exception:
+            pass
+
+        # -- 4. Compare our content against competitor themes -------------- #
+        gaps: List[Dict[str, Any]] = []
+        coverage: Dict[str, Dict[str, Any]] = {}
+
+        for comp_key, comp_info in self.COMPETITOR_CONTENT_THEMES.items():
+            comp_name = comp_info["name"]
+            themes = comp_info["themes"]
+            covered = 0
+            total = len(themes)
+
+            for theme in themes:
+                theme_lower = theme.lower()
+                # Check if any of our content covers this theme
+                theme_words = theme_lower.split()
+                has_coverage = any(
+                    word in our_content_text for word in theme_words if len(word) > 4
+                ) and theme_lower.split()[0] in our_content_text
+
+                if has_coverage:
+                    covered += 1
+                    continue
+
+                # This is a gap -- find the best keyword to target
+                best_keyword = theme  # default to the theme itself
+                best_impressions = 0
+                for kw_text, kw_data in kw_index.items():
+                    # Check if this keyword is semantically related to the theme
+                    theme_tokens = set(theme_lower.split())
+                    kw_tokens = set(kw_text.split())
+                    overlap = theme_tokens & kw_tokens
+                    if len(overlap) >= 1 and len(overlap) / len(theme_tokens) >= 0.3:
+                        imps = kw_data.get("current_impressions", 0)
+                        if imps > best_impressions:
+                            best_impressions = imps
+                            best_keyword = kw_data.get("keyword", theme)
+
+                # Decide content type
+                if "alternative" in theme_lower or "vs" in theme_lower:
+                    content_type = "comparison"
+                elif any(w in theme_lower for w in ["how", "guide", "strategy", "strategies", "best practice"]):
+                    content_type = "blog_post"
+                else:
+                    content_type = "blog_post"
+
+                # Determine priority based on keyword data
+                priority = "high" if best_impressions > 50 else "medium"
+
+                # Merge insights from stored competitor analysis if available
+                extra_context = ""
+                ca = competitor_data.get(comp_key, {})
+                opp_list = ca.get("content_opportunities", [])
+                for opp in (opp_list if isinstance(opp_list, list) else []):
+                    opp_text = opp if isinstance(opp, str) else str(opp)
+                    if theme_lower.split()[0] in opp_text.lower():
+                        extra_context = f" Competitor insight: {opp_text[:120]}"
+                        break
+
+                gaps.append({
+                    "competitor": comp_name,
+                    "theme": theme,
+                    "recommended_type": content_type,
+                    "priority": priority,
+                    "target_keyword": best_keyword,
+                    "keyword_impressions": best_impressions,
+                    "title": f"Write a {content_type.replace('_', ' ')} about {theme} targeting '{best_keyword}'",
+                    "description": (
+                        f"{comp_name} covers '{theme}' but we have no matching content. "
+                        f"Target keyword: '{best_keyword}'"
+                        + (f" ({best_impressions} impressions/month)" if best_impressions else "")
+                        + f".{extra_context}"
+                    ),
+                    "action": (
+                        f"Generate a {content_type.replace('_', ' ')} covering '{theme}' "
+                        f"optimized for the keyword '{best_keyword}'"
+                    ),
+                })
+
+            coverage[comp_key] = {
+                "name": comp_name,
+                "total_themes": total,
+                "covered": covered,
+                "gaps": total - covered,
+                "coverage_pct": round(covered / total * 100, 1) if total else 0,
+            }
+
+        # -- 5. Add orphan-keyword gaps (GSC keywords without content) ----- #
+        for kw_data in orphan_keywords:
+            keyword = kw_data.get("keyword", "")
+            impressions = kw_data.get("current_impressions", 0)
+            position = kw_data.get("current_position", 0)
+            if impressions < 10 and (position or 100) > 50:
+                continue  # skip very low value orphans
+
+            priority = "high" if impressions > 100 else "medium"
+            gaps.append({
+                "competitor": "organic_opportunity",
+                "theme": keyword,
+                "recommended_type": "blog_post",
+                "priority": priority,
+                "target_keyword": keyword,
+                "keyword_impressions": impressions,
+                "title": f"Write a blog post targeting '{keyword}'",
+                "description": (
+                    f"We rank position {position} for '{keyword}' "
+                    f"({impressions} impressions) but have no dedicated content."
+                ),
+                "action": (
+                    f"Generate a blog post targeting '{keyword}' to improve "
+                    f"from position {position} and capture more organic traffic"
+                ),
+            })
+
+        # Sort: high priority first, then by impressions descending
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        gaps.sort(key=lambda g: (
+            priority_order.get(g.get("priority", "low"), 3),
+            -g.get("keyword_impressions", 0),
+        ))
+
+        total_competitor_gaps = sum(c["gaps"] for c in coverage.values())
+        orphan_count = sum(1 for g in gaps if g["competitor"] == "organic_opportunity")
+
+        summary = (
+            f"Found {total_competitor_gaps} competitor theme gaps across "
+            f"{len(self.COMPETITOR_CONTENT_THEMES)} competitors and {orphan_count} "
+            f"orphan keyword opportunities. "
+            + " | ".join(
+                f"{v['name']}: {v['coverage_pct']}% covered"
+                for v in coverage.values()
+            )
+        )
+
+        logger.info(f"Competitor gap analysis complete: {summary}")
+
+        return {
+            "gaps": gaps,
+            "coverage": coverage,
+            "orphan_keywords": orphan_count,
+            "total_gaps": len(gaps),
+            "summary": summary,
+        }
+
     async def _save_content(
         self,
         title: str,

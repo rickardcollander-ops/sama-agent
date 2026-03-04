@@ -355,7 +355,40 @@ async def run_content_analysis_legacy():
                 "competitor": comp,
                 "status": "pending"
             })
-    
+
+    # 7. Competitor content theme gap analysis
+    competitor_gap_result = {}
+    try:
+        competitor_gap_result = await content_agent.analyze_competitor_content_gaps()
+    except Exception:
+        pass
+
+    existing_action_keywords = {a.get("keyword", "").lower() for a in actions if a.get("keyword")}
+    for gap in competitor_gap_result.get("gaps", []):
+        target_kw = gap.get("target_keyword", "")
+        if target_kw.lower() in existing_action_keywords:
+            continue
+        if target_kw.lower() in existing_keywords:
+            continue
+
+        comp_name = gap.get("competitor", "")
+        theme = gap.get("theme", "")
+        impressions = gap.get("keyword_impressions", 0)
+        rec_type = gap.get("recommended_type", "blog_post")
+
+        actions.append({
+            "id": f"comp-gap-{comp_name[:10]}-{theme[:20]}".lower().replace(" ", "-"),
+            "type": rec_type,
+            "priority": gap.get("priority", "medium"),
+            "title": gap.get("title", f"Cover competitor theme: {theme}"),
+            "description": gap.get("description", f"{comp_name} covers '{theme}' but we don't."),
+            "action": gap.get("action", f"Generate a {rec_type} about '{theme}' targeting '{target_kw}'"),
+            "keyword": target_kw,
+            "competitor": comp_name.lower() if comp_name != "organic_opportunity" else None,
+            "status": "pending"
+        })
+        existing_action_keywords.add(target_kw.lower())
+
     # Sort by priority
     priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     actions.sort(key=lambda a: priority_order.get(a.get("priority", "low"), 3))
@@ -369,6 +402,8 @@ async def run_content_analysis_legacy():
             "content_pieces": len(content_pieces),
             "keywords_tracked": len(seo_keywords),
             "content_gaps": sum(1 for a in actions if a["type"] == "blog_post"),
+            "competitor_coverage": competitor_gap_result.get("coverage", {}),
+            "competitor_theme_gaps": competitor_gap_result.get("total_gaps", 0),
         },
         "content": [
             {

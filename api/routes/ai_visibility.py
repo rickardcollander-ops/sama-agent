@@ -3,10 +3,12 @@ AI Visibility API Routes
 GEO (Generative Engine Optimization) monitoring endpoints
 """
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+import asyncio
 import logging
 import threading
+
+from fastapi import APIRouter
+from pydantic import BaseModel
 
 from agents.ai_visibility import ai_visibility_agent
 from shared.database import get_supabase
@@ -85,7 +87,7 @@ async def get_gaps():
 def _run_check_thread():
     try:
         logger.info("AI Visibility monitoring thread started")
-        result = ai_visibility_agent.run_monitoring()
+        result = asyncio.run(ai_visibility_agent.run_monitoring())
         logger.info(f"AI Visibility monitoring done: {result}")
     except Exception as e:
         logger.error(f"AI Visibility monitoring thread error: {e}", exc_info=True)
@@ -172,5 +174,5 @@ async def test_single():
 @router.post("/recommendations")
 async def generate_recommendations():
     """Generate Claude-powered GEO recommendations from open gaps"""
-    recommendations = ai_visibility_agent.generate_geo_recommendations()
+    recommendations = await ai_visibility_agent.generate_geo_recommendations()
     return {"recommendations": recommendations}

@@ -15,6 +15,9 @@ SEO_AUDITS_TABLE = "seo_audits"
 CONTENT_PIECES_TABLE = "content_pieces"
 BACKLINK_PROFILES_TABLE = "backlink_profiles"
 COMPETITOR_ANALYSES_TABLE = "competitor_analyses"
+DAILY_METRICS_TABLE = "daily_metrics"
+REVIEWS_TABLE = "reviews"
+AGENT_ACTIONS_TABLE = "agent_actions"
 
 
 class Keyword(BaseModel):

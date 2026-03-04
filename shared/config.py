@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     # LinkedIn
     LINKEDIN_ACCESS_TOKEN: str = ""
     LINKEDIN_ORG_ID: str = ""
+
+    # Reddit
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USERNAME: str = ""
+    REDDIT_PASSWORD: str = ""
     
     # Google Analytics 4
     GA4_PROPERTY_ID: str = ""
@@ -71,6 +77,9 @@ class Settings(BaseSettings):
     TEMPORAL_HOST: str = "localhost:7233"
     TEMPORAL_NAMESPACE: str = "sama"
     
+    # Perplexity
+    PERPLEXITY_API_KEY: str = ""
+
     # Monitoring
     SENTRY_DSN: str = ""
     DATADOG_API_KEY: str = ""

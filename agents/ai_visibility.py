@@ -1,14 +1,20 @@
 """
 AI Visibility Agent - GEO (Generative Engine Optimization) Monitoring
 Tracks how often Successifier is mentioned by AI assistants.
-Uses Claude as proxy to simulate ChatGPT/Perplexity/Gemini/Copilot responses
-by giving each engine a distinct persona/system prompt.
+
+- Perplexity AI: queried via the real Perplexity API (api.perplexity.ai).
+- Other engines (ChatGPT, Gemini, Copilot): Claude is used as a simulation
+  proxy since direct API access isn't available for those engines.
 """
 
+import asyncio
+import json
 import logging
 import uuid
 from typing import Dict, Any, List
 from datetime import datetime, timezone
+
+import httpx
 from anthropic import Anthropic
 
 from shared.config import settings
@@ -105,10 +111,46 @@ COMPETITORS = [
 
 class AIVisibilityAgent:
 
-    def _simulate_engine_response(self, prompt: str, engine_name: str, engine_config: Dict) -> str:
-        """Simulate a specific AI engine's response via Claude"""
+    async def _query_engine(self, prompt: str, engine_name: str, engine_config: Dict) -> str:
+        """Query an AI engine for its response to *prompt*.
+
+        - Perplexity AI: uses the real Perplexity chat completions API.
+        - All other engines: Claude is used as a simulation proxy since direct
+          API access isn't available for those engines.
+        """
+        if engine_name == "Perplexity AI" and settings.PERPLEXITY_API_KEY:
+            return await self._query_perplexity(prompt)
+
+        # Fallback: simulate via Claude (proxy for engines without direct API access)
+        return await self._query_engine_via_claude(prompt, engine_name, engine_config)
+
+    async def _query_perplexity(self, prompt: str) -> str:
+        """Call the real Perplexity API (api.perplexity.ai) using httpx."""
         try:
-            msg = client.messages.create(
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                resp = await http.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "sonar",
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error(f"Perplexity API error: {e}")
+            return ""
+
+    async def _query_engine_via_claude(self, prompt: str, engine_name: str, engine_config: Dict) -> str:
+        """Simulate an engine response via Claude (used as proxy when direct API access is unavailable)."""
+        try:
+            msg = await asyncio.to_thread(
+                client.messages.create,
                 model="claude-opus-4-6",
                 max_tokens=800,
                 system=engine_config["system"],
@@ -185,17 +227,25 @@ class AIVisibilityAgent:
             "action_type": action_map.get(category, "create_content"),
         }
 
-    def run_monitoring(self) -> Dict[str, Any]:
-        """Run a full monitoring round: each prompt × each AI engine"""
+    async def run_monitoring(self) -> Dict[str, Any]:
+        """Run a full monitoring round: each prompt x each AI engine.
+
+        All engines for a given prompt are queried concurrently via asyncio.gather.
+        """
         sb = get_supabase()
-        results = []
+        results: List[Dict[str, Any]] = []
         gaps_created = 0
         run_id = str(uuid.uuid4())[:8]  # short ID to group this run's checks
 
         for category, prompts in MONITORING_PROMPTS.items():
             for prompt in prompts:
-                for engine_name, engine_config in AI_ENGINES.items():
-                    response_text = self._simulate_engine_response(prompt, engine_name, engine_config)
+                # Query all 5 engines for this prompt in parallel
+                engine_items = list(AI_ENGINES.items())
+                responses = await asyncio.gather(
+                    *(self._query_engine(prompt, name, cfg) for name, cfg in engine_items)
+                )
+
+                for (engine_name, engine_config), response_text in zip(engine_items, responses):
                     if not response_text:
                         continue
 
@@ -216,7 +266,7 @@ class AIVisibilityAgent:
                     }
                     try:
                         sb.table("ai_visibility_checks").insert(check_data).execute()
-                        logger.info(f"[{run_id}] ✓ {engine_name} | {category} | mentioned={analysis['mentioned']}")
+                        logger.info(f"[{run_id}] {engine_name} | {category} | mentioned={analysis['mentioned']}")
                     except Exception as e:
                         logger.error(f"[{run_id}] DB insert check FAILED: {e} | data keys: {list(check_data.keys())}")
 
@@ -326,7 +376,7 @@ class AIVisibilityAgent:
             return {"mention_rate": 0, "avg_rank": None, "total_checks": 0, "open_gaps": 0,
                     "top_competitors": [], "trend": "flat", "last_check_at": None, "engine_stats": {}}
 
-    def generate_geo_recommendations(self) -> List[Dict[str, Any]]:
+    async def generate_geo_recommendations(self) -> List[Dict[str, Any]]:
         sb = get_supabase()
         try:
             gaps = sb.table("ai_visibility_gaps").select("*").eq("status", "open").limit(20).execute().data or []
@@ -362,20 +412,17 @@ Respond ONLY as a JSON array with objects having these fields:
 - effort (low/medium/high)
 """
         try:
-            import asyncio
-            def _call():
-                return client.messages.create(
-                    model="claude-opus-4-6",
-                    max_tokens=1200,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            msg = await asyncio.to_thread(_call)
+            msg = await asyncio.to_thread(
+                client.messages.create,
+                model="claude-opus-4-6",
+                max_tokens=1200,
+                messages=[{"role": "user", "content": prompt}],
+            )
             text = msg.content[0].text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
-            import json
             return json.loads(text.strip())
         except Exception as e:
             logger.error(f"generate_geo_recommendations error: {e}")

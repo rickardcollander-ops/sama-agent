@@ -29,7 +29,7 @@ class InsightsRequest(BaseModel):
 
 @router.get("/metrics")
 async def get_metrics(days: int = 30):
-    """Get daily metrics from Supabase"""
+    """Get daily metrics from Supabase (historical, from daily_metrics table)"""
     from shared.database import get_supabase
     try:
         sb = get_supabase()
@@ -39,21 +39,55 @@ async def get_metrics(days: int = 30):
         return {"metrics": [], "error": str(e)}
 
 
+@router.get("/metrics/live")
+async def get_live_metrics():
+    """
+    Fetch live metrics directly from all configured agents (SEO, Ads,
+    Reviews, Content) without relying on the daily_metrics table.
+
+    Returns real-time data aggregated from each agent's API integrations.
+    """
+    try:
+        data = await analytics_agent.get_live_metrics()
+        return {"success": True, **data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/metrics/collect")
+async def collect_daily_metrics():
+    """
+    Trigger daily metrics collection from all agents and upsert into the
+    daily_metrics table.  Can be called by a cron job, automation endpoint,
+    or manually.
+    """
+    try:
+        result = await analytics_agent.collect_daily_metrics()
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/status")
 async def get_status():
     """Get Analytics agent status"""
+    from shared.google_auth import is_gsc_configured, is_ads_configured
     return {
         "agent": "analytics",
         "status": "operational",
         "channels": list(analytics_agent.CHANNEL_METRICS.keys()),
         "attribution_models": list(analytics_agent.ATTRIBUTION_MODELS.keys()),
-        "report_templates": list(analytics_agent.REPORT_TEMPLATES.keys())
+        "report_templates": list(analytics_agent.REPORT_TEMPLATES.keys()),
+        "integrations": {
+            "gsc_configured": is_gsc_configured(),
+            "ads_configured": is_ads_configured(),
+        },
     }
 
 
 @router.get("/report/weekly")
 async def get_weekly_report(date_range: int = 7):
-    """Generate weekly marketing report"""
+    """Generate weekly marketing report with real data from all agents"""
     try:
         report = await analytics_agent.generate_weekly_report(date_range=date_range)
         return {"success": True, "report": report}
