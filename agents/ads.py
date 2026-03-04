@@ -4,6 +4,7 @@ Manages all Google Ads campaigns for successifier.com
 Uses Google Ads REST API v16 for real campaign data.
 """
 
+import asyncio
 import json
 import logging
 from typing import Dict, Any, List, Optional
@@ -381,12 +382,14 @@ Format as JSON:
 }}
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
         
         try:
             rsa_data = json.loads(response.content[0].text)
@@ -557,11 +560,13 @@ Campaigns:
 
 Focus on: CPA optimization, budget allocation, keyword strategy, ad copy improvements."""
                 
-                resp = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": prompt}]
-                )
+                def _call():
+                    return self.client.messages.create(
+                        model=self.model,
+                        max_tokens=1024,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                resp = await asyncio.to_thread(_call)
                 recommendations = [r.strip() for r in resp.content[0].text.strip().split("\n") if r.strip()]
             except Exception as e:
                 logger.warning(f"AI recommendations failed: {e}")
@@ -640,6 +645,61 @@ Focus on: CPA optimization, budget allocation, keyword strategy, ad copy improve
         
         logger.info(f"✅ Daily optimization complete: {results['campaigns_optimized']} campaigns, {results['bid_adjustments']} adjustments")
         return results
+
+    async def update_campaign_budget(self, campaign_id: str, new_budget: float) -> Dict[str, Any]:
+        """Update a campaign's daily budget via Google Ads API"""
+        if not is_ads_configured():
+            return {"success": False, "error": "Google Ads not configured"}
+
+        try:
+            token = await get_access_token()
+            customer_id = settings.GOOGLE_ADS_CUSTOMER_ID.replace("-", "")
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{GOOGLE_ADS_API}/customers/{customer_id}/campaignBudgets:mutate",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "developer-token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "operations": [{
+                            "update": {
+                                "resourceName": f"customers/{customer_id}/campaignBudgets/{campaign_id}",
+                                "amountMicros": str(int(new_budget * 1_000_000)),
+                            },
+                            "updateMask": "amountMicros",
+                        }]
+                    },
+                    timeout=30.0,
+                )
+
+                if response.status_code == 200:
+                    logger.info(f"✅ Updated campaign {campaign_id} budget to ${new_budget:.2f}")
+                    return {"success": True, "campaign_id": campaign_id, "new_budget": new_budget}
+                else:
+                    error_msg = response.text[:200]
+                    logger.error(f"Failed to update budget: {error_msg}")
+                    return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            logger.error(f"Budget update error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def get_all_campaigns(self) -> List[Dict[str, Any]]:
+        """Get all campaigns from database"""
+        try:
+            sb = get_supabase()
+            result = sb.table("ad_campaigns").select("*").execute()
+            return result.data or []
+        except Exception as e:
+            logger.warning(f"Failed to get campaigns from DB: {e}")
+            # Fall back to API
+            try:
+                return await self.get_campaign_performance()
+            except Exception:
+                return []
 
 
 # Global Google Ads agent instance

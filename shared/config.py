@@ -80,8 +80,24 @@ class Settings(BaseSettings):
     
     # Application
     SUCCESSIFIER_DOMAIN: str = "successifier.com"
+    SUCCESSIFIER_SITE_URL: str = "https://successifier.com"
     SUCCESSIFIER_CMS_API_URL: str = "https://successifier.com/api"
     SUCCESSIFIER_CMS_API_KEY: str = ""
+
+    # AI Model
+    CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+
+    # SEO Config
+    GSC_SITE_URL: str = "sc-domain:successifier.com"
+    SEO_COMPETITORS: List[str] = ["gainsight.com", "totango.com", "churnzero.com", "custify.com", "vitally.io"]
+
+    # Anomaly Detection
+    ANOMALY_THRESHOLD: float = 0.30
+    ANOMALY_MIN_DATA_POINTS: int = 7
+
+    # Budget Optimizer
+    MIN_ROAS_THRESHOLD: float = 2.0
+    MIN_CAMPAIGN_BUDGET: float = 10.0
     
     # LinkedIn Agent Integration
     LINKEDIN_AGENT_EVENT_BUS_ENABLED: bool = True

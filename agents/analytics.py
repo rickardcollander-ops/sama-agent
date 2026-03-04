@@ -3,6 +3,7 @@ Analytics Agent - Cross-Channel Marketing Analytics
 Provides unified reporting and attribution across all marketing channels
 """
 
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
@@ -289,13 +290,15 @@ Focus on:
 - Specific recommendations
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         insights_text = response.content[0].text.strip()
         insights = [i.strip() for i in insights_text.split('\n') if i.strip()]
         

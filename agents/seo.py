@@ -845,6 +845,16 @@ List exactly 5 actionable recommendations, one per line, starting with a number.
         sb.table(SEO_AUDITS_TABLE).insert(record).execute()
         logger.info("✅ Audit saved to Supabase")
 
+    async def get_all_keywords(self) -> list:
+        """Get all tracked keywords from database"""
+        try:
+            sb = get_supabase()
+            result = sb.table(KEYWORDS_TABLE).select("*").execute()
+            return result.data or []
+        except Exception as e:
+            logger.warning(f"Failed to get keywords: {e}")
+            return []
+
 
 # Global SEO agent instance
 seo_agent = SEOAgent()

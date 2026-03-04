@@ -3,6 +3,7 @@ Content Agent - AI-Powered Content Generation
 Generates blog posts, landing pages, comparison pages, and social content
 """
 
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
@@ -97,12 +98,14 @@ Format as markdown with proper headings.
 """
         
         # Generate content
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8192,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=8192,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
         
         content = response.content[0].text
         
@@ -207,17 +210,19 @@ Requirements:
 Format as markdown.
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         content = response.content[0].text
         lines = content.split('\n')
         title = lines[0].replace('#', '').strip() if lines else topic
-        
+
         meta_description = await self._generate_meta_description(title, content)
         validation = brand_voice.validate_content(content)
         
@@ -286,13 +291,15 @@ Requirements:
 Format as markdown.
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8192,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=8192,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         content = response.content[0].text
         title = f"Successifier vs {competitor.title()}"
         target_keyword = f"{competitor} alternative"
@@ -376,15 +383,17 @@ Requirements:
 Format: Plain text, no special formatting.
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         content = response.content[0].text.strip()
-        
+
         # Save as content piece
         saved = await self._save_content(
             title=f"{platform.title()} post: {topic}",
@@ -462,12 +471,14 @@ Requirements:
 - Engaging and click-worthy
 """
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=256,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
+        def _call():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}]
+            )
+        response = await asyncio.to_thread(_call)
+
         return response.content[0].text.strip()
     
     async def _analyze_seo(self, content: str, keyword: str) -> Dict[str, Any]:

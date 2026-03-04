@@ -335,38 +335,41 @@ class AIVisibilityAgent:
 
         if not gaps:
             return [{
-                "title": "Kör en monitoring-körning först",
-                "description": "Inga öppna gaps hittades. Kör en monitoring-körning för att identifiera var Successifier saknas i AI-svar.",
+                "title": "Run a monitoring check first",
+                "description": "No open gaps found. Run a monitoring check to identify where Successifier is missing from AI responses.",
                 "priority": "high", "action_type": "create_content", "effort": "low",
             }]
 
         gap_summary = "\n".join(
-            f"- [{g['priority']}] {g.get('ai_engine','?')} | {g['category']}: \"{g['prompt']}\" → åtgärd: {g['action_type']}"
+            f"- [{g['priority']}] {g.get('ai_engine','?')} | {g['category']}: \"{g['prompt']}\" → action: {g['action_type']}"
             for g in gaps[:15]
         )
 
-        prompt = f"""Du är en GEO-expert (Generative Engine Optimization) för Successifier — en customer success platform för B2B SaaS.
+        prompt = f"""You are a GEO expert (Generative Engine Optimization) for Successifier — a customer success platform for B2B SaaS.
 
-Successifier saknas i följande AI-motorers svar:
+Successifier is missing from the following AI engines' responses:
 
 {gap_summary}
 
-Generera 5 konkreta, prioriterade åtgärder för att förbättra Successifiers synlighet i AI-svar.
-Fokusera på: content creation, page optimization, review building, forum engagement, structured data.
+Generate 5 concrete, prioritized actions to improve Successifier's visibility in AI responses.
+Focus on: content creation, page optimization, review building, forum engagement, structured data.
 
-Svara ENBART som JSON-array med objekt som har fälten:
-- title (kort, max 8 ord)
-- description (2-3 meningar med konkret action)
+Respond ONLY as a JSON array with objects having these fields:
+- title (short, max 8 words)
+- description (2-3 sentences with concrete action)
 - priority (high/medium/low)
 - action_type (create_content/optimize_page/build_reviews/forum_engagement)
 - effort (low/medium/high)
 """
         try:
-            msg = client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1200,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            import asyncio
+            def _call():
+                return client.messages.create(
+                    model="claude-opus-4-6",
+                    max_tokens=1200,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            msg = await asyncio.to_thread(_call)
             text = msg.content[0].text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
