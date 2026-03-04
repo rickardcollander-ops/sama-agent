@@ -12,7 +12,8 @@ from agents.social_reddit import reddit_agent
 router = APIRouter()
 
 
-# ── Request Models ─────────────────────────────────────────────────────
+# -- Request Models -------------------------------------------------------------
+
 
 class GeneratePostRequest(BaseModel):
     topic: str
@@ -39,11 +40,12 @@ class GenerateCommentRequest(BaseModel):
 
 
 class SubmitCommentRequest(BaseModel):
-    parent_id: str
+    thing_id: str
     text: str
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────
+# -- Endpoints ------------------------------------------------------------------
+
 
 @router.get("/status")
 async def get_reddit_status():
@@ -81,7 +83,7 @@ async def search_relevant(limit: int = 25):
 
 @router.get("/search/competitors")
 async def search_competitors(limit: int = 20):
-    """Search Reddit for competitor mentions (Gainsight, Totango, ChurnZero)."""
+    """Search Reddit for competitor mentions (Gainsight, ChurnZero, Totango, Planhat, Vitally)."""
     try:
         posts = await reddit_agent.search_competitors(limit=limit)
         return {"posts": posts, "count": len(posts)}
@@ -120,7 +122,7 @@ async def generate_post(request: GeneratePostRequest):
         )
         if post.get("error"):
             raise HTTPException(status_code=500, detail=post["error"])
-        return {"success": True, "post": post}
+        return {"post": post}
     except HTTPException:
         raise
     except Exception as e:
@@ -136,7 +138,11 @@ async def submit_text_post(request: SubmitTextPostRequest):
             title=request.title,
             text=request.text,
         )
-        return {"success": result.get("success", False), "result": result}
+        return {
+            "success": result.get("success", False),
+            "url": result.get("post_url", ""),
+            "result": result,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -164,7 +170,7 @@ async def generate_comment(request: GenerateCommentRequest):
             post_body=request.post_body,
             subreddit=request.subreddit,
         )
-        return {"success": True, "comment": comment}
+        return {"comment": comment}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -174,7 +180,7 @@ async def submit_comment(request: SubmitCommentRequest):
     """Submit a comment on a Reddit post."""
     try:
         result = await reddit_agent.submit_comment(
-            parent_id=request.parent_id,
+            thing_id=request.thing_id,
             text=request.text,
         )
         return result
