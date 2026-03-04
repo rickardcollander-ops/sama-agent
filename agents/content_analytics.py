@@ -20,7 +20,7 @@ class ContentAnalytics:
     
     def __init__(self):
         self.http_client = httpx.AsyncClient(timeout=30.0)
-        self.property_id = "properties/YOUR_GA4_PROPERTY_ID"  # TODO: Add to settings
+        self.property_id = settings.GA4_PROPERTY_ID or ""
         self.sb = None
     
     def _get_sb(self):
@@ -59,9 +59,12 @@ class ContentAnalytics:
         Returns:
             Performance metrics including pageviews, time on page, bounce rate
         """
+        if not self.property_id:
+            return {"error": "GA4_PROPERTY_ID not configured", "url_path": url_path, "pageviews": 0, "avg_time_on_page": 0, "bounce_rate": 0, "engagement_rate": 0, "conversions": 0, "period_days": days}
+
         if not await rate_limit("google_analytics_api"):
             return {"error": "Rate limit exceeded"}
-        
+
         try:
             access_token = await self._get_access_token()
             
@@ -155,15 +158,18 @@ class ContentAnalytics:
     ) -> List[Dict[str, Any]]:
         """
         Get top performing content pieces
-        
+
         Args:
             days: Number of days to analyze
             limit: Number of results to return
             metric: Metric to sort by (pageviews, engagement_rate, conversions)
-        
+
         Returns:
             List of top performing content
         """
+        if not self.property_id:
+            return []
+
         try:
             access_token = await self._get_access_token()
             
