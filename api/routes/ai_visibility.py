@@ -169,6 +169,15 @@ async def test_single():
         return {"ok": False, "error": str(e), "error_type": type(e).__name__}
 
 
+# ── Strategic Analysis ─────────────────────────────────────────────────────────
+
+@router.post("/strategic-analysis")
+async def strategic_analysis():
+    """Generate a comprehensive, opinionated strategic analysis of AI visibility"""
+    result = await ai_visibility_agent.generate_strategic_analysis()
+    return result
+
+
 # ── GEO Recommendations ────────────────────────────────────────────────────────
 
 @router.post("/recommendations")
