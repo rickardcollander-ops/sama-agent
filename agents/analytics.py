@@ -13,7 +13,7 @@ import httpx
 
 from shared.config import settings
 from shared.database import get_supabase
-from shared.google_auth import is_gsc_configured, is_ads_configured
+from shared.google_auth import is_gsc_configured, is_ads_configured, is_ga4_configured, get_access_token
 from .models import (
     CONTENT_PIECES_TABLE, DAILY_METRICS_TABLE, KEYWORDS_TABLE, REVIEWS_TABLE,
 )
@@ -141,6 +141,81 @@ class AnalyticsAgent:
 
         except Exception as e:
             logger.warning(f"SEO data fetch failed: {e}")
+            channel_data["status"] = "error"
+            channel_data["error"] = str(e)
+
+        return channel_data
+
+    async def _fetch_ga4_data(self, date_range: int = 30) -> Dict[str, Any]:
+        """Fetch site-wide traffic data from Google Analytics 4 Data API."""
+        channel_data = {
+            "configured": is_ga4_configured(),
+            "total_sessions": 0,
+            "total_pageviews": 0,
+            "total_users": 0,
+            "bounce_rate": 0.0,
+            "avg_session_duration": 0.0,
+            "date_range_days": date_range,
+        }
+
+        if not is_ga4_configured():
+            channel_data["status"] = "not_configured"
+            return channel_data
+
+        try:
+            access_token = await get_access_token("gsc")  # reuses same Google OAuth
+            if not access_token:
+                channel_data["status"] = "auth_error"
+                return channel_data
+
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=date_range)
+
+            url = f"https://analyticsdata.googleapis.com/v1beta/{settings.GA4_PROPERTY_ID}:runReport"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "dateRanges": [{
+                    "startDate": start_date.strftime("%Y-%m-%d"),
+                    "endDate": end_date.strftime("%Y-%m-%d"),
+                }],
+                "metrics": [
+                    {"name": "sessions"},
+                    {"name": "screenPageViews"},
+                    {"name": "totalUsers"},
+                    {"name": "bounceRate"},
+                    {"name": "averageSessionDuration"},
+                ],
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+
+            if resp.status_code != 200:
+                logger.warning(f"GA4 API error {resp.status_code}: {resp.text[:200]}")
+                channel_data["status"] = "error"
+                channel_data["error"] = resp.text[:200]
+                return channel_data
+
+            data = resp.json()
+            rows = data.get("rows", [])
+            if rows:
+                metrics = rows[0].get("metricValues", [])
+                channel_data.update({
+                    "status": "ok",
+                    "total_sessions": int(metrics[0]["value"]) if len(metrics) > 0 else 0,
+                    "total_pageviews": int(metrics[1]["value"]) if len(metrics) > 1 else 0,
+                    "total_users": int(metrics[2]["value"]) if len(metrics) > 2 else 0,
+                    "bounce_rate": round(float(metrics[3]["value"]) * 100, 2) if len(metrics) > 3 else 0.0,
+                    "avg_session_duration": round(float(metrics[4]["value"]), 1) if len(metrics) > 4 else 0.0,
+                })
+            else:
+                channel_data["status"] = "no_data"
+
+        except Exception as e:
+            logger.warning(f"GA4 data fetch failed: {e}")
             channel_data["status"] = "error"
             channel_data["error"] = str(e)
 
@@ -469,6 +544,7 @@ class AnalyticsAgent:
         ads_data: Optional[Dict[str, Any]] = None,
         reviews_data: Optional[Dict[str, Any]] = None,
         content_data: Optional[Dict[str, Any]] = None,
+        ga4_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Gather data from all agents and upsert into the daily_metrics table.
@@ -481,6 +557,7 @@ class AnalyticsAgent:
             ads_data: Pre-fetched Ads data dict, or None to fetch fresh.
             reviews_data: Pre-fetched Reviews data dict, or None to fetch fresh.
             content_data: Pre-fetched Content data dict, or None to fetch fresh.
+            ga4_data: Pre-fetched GA4 data dict, or None to fetch fresh.
 
         Returns:
             Summary of what was upserted.
@@ -496,6 +573,8 @@ class AnalyticsAgent:
             reviews_data = await self._fetch_reviews_data()
         if content_data is None:
             content_data = await self._fetch_content_data()
+        if ga4_data is None:
+            ga4_data = await self._fetch_ga4_data()
 
         today = datetime.utcnow().strftime("%Y-%m-%d")
         sb = get_supabase()
@@ -567,6 +646,17 @@ class AnalyticsAgent:
             "avg_position": 0.0,
         })
 
+        # GA4 channel (site-wide sessions & pageviews)
+        if ga4_data.get("status") != "not_configured":
+            _upsert_channel("ga4", {
+                "total_clicks": ga4_data.get("total_pageviews", 0),
+                "total_impressions": ga4_data.get("total_sessions", 0),
+                "total_conversions": 0,
+                "total_revenue": 0.0,
+                "total_ad_spend": 0.0,
+                "avg_position": ga4_data.get("bounce_rate", 0.0),
+            })
+
         result = {
             "date": today,
             "channels_upserted": upserted,
@@ -589,11 +679,12 @@ class AnalyticsAgent:
         """
         logger.info("Fetching live metrics from all agents")
 
-        seo_data, ads_data, reviews_data, content_data = await asyncio.gather(
+        seo_data, ads_data, reviews_data, content_data, ga4_data = await asyncio.gather(
             self._fetch_seo_data(),
             self._fetch_ads_data(),
             self._fetch_reviews_data(),
             self._fetch_content_data(),
+            self._fetch_ga4_data(),
             return_exceptions=True,
         )
 
@@ -606,6 +697,8 @@ class AnalyticsAgent:
             reviews_data = {"status": "error", "error": str(reviews_data)}
         if isinstance(content_data, Exception):
             content_data = {"status": "error", "error": str(content_data)}
+        if isinstance(ga4_data, Exception):
+            ga4_data = {"status": "error", "error": str(ga4_data)}
 
         total_clicks = (
             seo_data.get("total_clicks", 0)
@@ -618,11 +711,18 @@ class AnalyticsAgent:
             + content_data.get("total_impressions", 0)
         )
 
+        # GA4 provides real session/pageview data
+        total_sessions = ga4_data.get("total_sessions", 0)
+        total_pageviews = ga4_data.get("total_pageviews", 0)
+
         return {
             "fetched_at": datetime.utcnow().isoformat(),
             "overview": {
                 "total_clicks": total_clicks,
                 "total_impressions": total_impressions,
+                "total_sessions": total_sessions,
+                "total_pageviews": total_pageviews,
+                "bounce_rate": ga4_data.get("bounce_rate", 0.0),
                 "total_conversions": round(ads_data.get("total_conversions", 0), 2),
                 "total_spend": round(ads_data.get("total_spend", 0), 2),
                 "roas": ads_data.get("roas", 0.0),
@@ -632,6 +732,7 @@ class AnalyticsAgent:
                 "google_ads": {k: v for k, v in ads_data.items() if k != "campaigns"},
                 "reviews": reviews_data,
                 "content": content_data,
+                "ga4": ga4_data,
             },
         }
 
