@@ -26,6 +26,93 @@ class CampaignCreateRequest(BaseModel):
     campaign_type: str  # brand, core_product, churn_prevention, etc.
 
 
+@router.get("/debug")
+async def debug_ads_connection():
+    """Debug Google Ads API connection — shows exactly what's failing"""
+    import httpx
+    from shared.config import settings
+    from shared.google_auth import get_access_token, is_ads_configured, TOKEN_URL
+
+    result = {
+        "step_1_env_vars": {},
+        "step_2_oauth_token": {},
+        "step_3_api_call": {},
+    }
+
+    # Step 1: Check env vars (masked)
+    def mask(val: str) -> str:
+        if not val:
+            return "NOT SET"
+        if len(val) <= 8:
+            return val[:2] + "***"
+        return val[:4] + "***" + val[-4:]
+
+    result["step_1_env_vars"] = {
+        "GOOGLE_ADS_DEVELOPER_TOKEN": mask(settings.GOOGLE_ADS_DEVELOPER_TOKEN),
+        "GOOGLE_ADS_CLIENT_ID": mask(settings.GOOGLE_ADS_CLIENT_ID),
+        "GOOGLE_ADS_CLIENT_SECRET": mask(settings.GOOGLE_ADS_CLIENT_SECRET),
+        "GOOGLE_ADS_REFRESH_TOKEN": mask(settings.GOOGLE_ADS_REFRESH_TOKEN),
+        "GOOGLE_ADS_CUSTOMER_ID": mask(settings.GOOGLE_ADS_CUSTOMER_ID),
+        "GOOGLE_CLIENT_ID_fallback": mask(settings.GOOGLE_CLIENT_ID),
+        "GOOGLE_CLIENT_SECRET_fallback": mask(settings.GOOGLE_CLIENT_SECRET),
+        "is_ads_configured": is_ads_configured(),
+    }
+
+    # Step 2: Try to get OAuth access token
+    try:
+        token = await get_access_token("ads")
+        if token:
+            result["step_2_oauth_token"] = {
+                "success": True,
+                "token_preview": token[:20] + "...",
+            }
+        else:
+            # Try manually to get a more detailed error
+            client_id = settings.GOOGLE_ADS_CLIENT_ID or settings.GOOGLE_CLIENT_ID
+            client_secret = settings.GOOGLE_ADS_CLIENT_SECRET or settings.GOOGLE_CLIENT_SECRET
+            refresh_token = settings.GOOGLE_ADS_REFRESH_TOKEN
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(TOKEN_URL, data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token"
+                })
+                result["step_2_oauth_token"] = {
+                    "success": False,
+                    "status_code": resp.status_code,
+                    "error_response": resp.text[:500],
+                }
+    except Exception as e:
+        result["step_2_oauth_token"] = {"success": False, "exception": str(e)}
+
+    # Step 3: Try a simple API call
+    token = await get_access_token("ads")
+    if token:
+        customer_id = settings.GOOGLE_ADS_CUSTOMER_ID.replace("-", "")
+        url = f"https://googleads.googleapis.com/v16/customers/{customer_id}/googleAds:searchStream"
+        gaql = "SELECT customer.id, customer.descriptive_name FROM customer LIMIT 1"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, json={"query": gaql}, headers={
+                    "Authorization": f"Bearer {token}",
+                    "developer-token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
+                    "Content-Type": "application/json"
+                })
+                result["step_3_api_call"] = {
+                    "status_code": resp.status_code,
+                    "response_body": resp.text[:1000],
+                    "url_used": url,
+                    "customer_id_used": customer_id,
+                }
+        except Exception as e:
+            result["step_3_api_call"] = {"exception": str(e)}
+    else:
+        result["step_3_api_call"] = {"skipped": "No OAuth token available"}
+
+    return result
+
+
 @router.get("/status")
 async def get_status():
     """Get Google Ads agent status — live campaigns from Google Ads API"""
