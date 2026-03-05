@@ -70,7 +70,7 @@ async def debug_ads_connection():
             # Try manually to get a more detailed error
             client_id = settings.GOOGLE_ADS_CLIENT_ID or settings.GOOGLE_CLIENT_ID
             client_secret = settings.GOOGLE_ADS_CLIENT_SECRET or settings.GOOGLE_CLIENT_SECRET
-            refresh_token = settings.GOOGLE_ADS_REFRESH_TOKEN
+            refresh_token = settings.GOOGLE_ADS_REFRESH_TOKEN or settings.GOOGLE_REFRESH_TOKEN
             async with httpx.AsyncClient() as client:
                 resp = await client.post(TOKEN_URL, data={
                     "client_id": client_id,

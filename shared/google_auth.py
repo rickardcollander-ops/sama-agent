@@ -38,7 +38,7 @@ async def get_access_token(scope: str = "gsc") -> Optional[str]:
     if scope == "ads":
         client_id = settings.GOOGLE_ADS_CLIENT_ID or settings.GOOGLE_CLIENT_ID
         client_secret = settings.GOOGLE_ADS_CLIENT_SECRET or settings.GOOGLE_CLIENT_SECRET
-        refresh_token = settings.GOOGLE_ADS_REFRESH_TOKEN
+        refresh_token = settings.GOOGLE_ADS_REFRESH_TOKEN or settings.GOOGLE_REFRESH_TOKEN
     else:
         client_id = settings.GOOGLE_CLIENT_ID
         client_secret = settings.GOOGLE_CLIENT_SECRET
