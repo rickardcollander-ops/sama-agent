@@ -500,6 +500,7 @@ class AnalyticsAgent:
         today = datetime.utcnow().strftime("%Y-%m-%d")
         sb = get_supabase()
         upserted = []
+        errors = []
 
         # Helper to upsert a single channel row
         def _upsert_channel(channel: str, row: Dict[str, Any]):
@@ -522,6 +523,7 @@ class AnalyticsAgent:
                 upserted.append(channel)
             except Exception as e:
                 logger.warning(f"Upsert failed for {channel}: {e}")
+                errors.append({"channel": channel, "error": str(e)})
 
         # SEO channel
         _upsert_channel("seo", {
@@ -570,6 +572,8 @@ class AnalyticsAgent:
             "channels_upserted": upserted,
             "total_channels": len(upserted),
         }
+        if errors:
+            result["errors"] = errors
         logger.info(f"Daily metrics collected: {len(upserted)} channels upserted for {today}")
         return result
 

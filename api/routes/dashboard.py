@@ -66,6 +66,58 @@ async def get_dashboard_status():
     for agent_name in ["seo", "content", "ads", "social", "reviews", "analytics", "ai_visibility"]:
         status["agents"][agent_name] = "operational"
 
+    # Scheduler status — show last run times and next scheduled runs
+    try:
+        from shared import scheduler as job_scheduler
+        job_history = job_scheduler.get_job_history()
+        next_runs = {}
+        if job_scheduler.scheduler.running:
+            for job in job_scheduler.scheduler.get_jobs():
+                next_run = job.next_run_time
+                next_runs[job.id] = next_run.isoformat() if next_run else None
+        status["scheduler"] = {
+            "running": job_scheduler.scheduler.running,
+            "jobs": {
+                name: {
+                    **info,
+                    "next_run": next_runs.get(name),
+                }
+                for name, info in job_history.items()
+            },
+        }
+    except Exception as e:
+        logger.warning(f"Scheduler status error: {e}")
+        status["scheduler"] = {"running": False, "error": str(e)}
+
+    # Pending agent actions count per agent
+    try:
+        sb2 = get_supabase()
+        actions_res = sb2.table("agent_actions").select("agent_name").eq("status", "pending").execute()
+        pending_actions = actions_res.data or []
+        from collections import Counter
+        agent_pending = Counter(a["agent_name"] for a in pending_actions)
+        status["pending_actions"] = dict(agent_pending)
+        status["counts"]["pending_actions"] = len(pending_actions)
+    except Exception:
+        status["pending_actions"] = {}
+        status["counts"]["pending_actions"] = 0
+
+    # Reviews summary
+    try:
+        sb3 = get_supabase()
+        reviews_res = sb3.table("reviews").select("rating").execute()
+        reviews = reviews_res.data or []
+        if reviews:
+            ratings = [r["rating"] for r in reviews if r.get("rating")]
+            status["counts"]["reviews"] = len(reviews)
+            status["counts"]["avg_rating"] = round(sum(ratings) / len(ratings), 1) if ratings else 0
+        else:
+            status["counts"]["reviews"] = 0
+            status["counts"]["avg_rating"] = 0
+    except Exception:
+        status["counts"]["reviews"] = 0
+        status["counts"]["avg_rating"] = 0
+
     return status
 
 

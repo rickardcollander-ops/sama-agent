@@ -17,6 +17,11 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_keyword_tracking": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_seo_audit":       {"last_run": None, "last_status": None, "last_error": None},
     "daily_workflow":         {"last_run": None, "last_status": None, "last_error": None},
+    "daily_metrics":          {"last_run": None, "last_status": None, "last_error": None},
+    "daily_ads_check":        {"last_run": None, "last_status": None, "last_error": None},
+    "weekly_content_analysis": {"last_run": None, "last_status": None, "last_error": None},
+    "weekly_ai_visibility":   {"last_run": None, "last_status": None, "last_error": None},
+    "midday_review_check":    {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -92,6 +97,82 @@ async def _run_daily_workflow():
     logger.info(f"[scheduler] Daily workflow finished with status: {status}")
 
 
+async def _run_daily_metrics():
+    """Collect daily metrics from all channels into the daily_metrics table."""
+    logger.info("[scheduler] Running daily metrics collection...")
+    try:
+        from agents.analytics import analytics_agent
+        result = await analytics_agent.collect_daily_metrics()
+        channels = result.get("total_channels", 0)
+        logger.info(f"[scheduler] Daily metrics collected — {channels} channels")
+        _record("daily_metrics", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Daily metrics collection failed: {e}")
+        _record("daily_metrics", "error", str(e))
+
+
+async def _run_daily_ads_check():
+    """Check Google Ads campaigns and flag underperformers."""
+    logger.info("[scheduler] Running daily ads check...")
+    try:
+        from agents.ads import ads_agent
+        result = await ads_agent.get_campaign_performance(days=7)
+        campaigns = result.get("campaigns", []) if isinstance(result, dict) else []
+        # Flag campaigns with 0 conversions or high CPA
+        flagged = 0
+        for c in campaigns:
+            if c.get("conversions", 0) == 0 and c.get("cost", 0) > 50:
+                flagged += 1
+            elif c.get("cpa", 0) > 100:
+                flagged += 1
+        logger.info(f"[scheduler] Ads check done — {len(campaigns)} campaigns, {flagged} flagged")
+        _record("daily_ads_check", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Daily ads check failed: {e}")
+        _record("daily_ads_check", "error", str(e))
+
+
+async def _run_weekly_content_analysis():
+    """Run content gap analysis and generate actions."""
+    logger.info("[scheduler] Running weekly content analysis...")
+    try:
+        from api.routes.content_analyze_ooda import _run_content_ooda
+        result = await _run_content_ooda()
+        actions = result.get("total_actions", 0) if isinstance(result, dict) else 0
+        logger.info(f"[scheduler] Content analysis done — {actions} actions generated")
+        _record("weekly_content_analysis", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Weekly content analysis failed: {e}")
+        _record("weekly_content_analysis", "error", str(e))
+
+
+async def _run_weekly_ai_visibility():
+    """Check AI visibility across ChatGPT, Claude, Gemini, Perplexity."""
+    logger.info("[scheduler] Running weekly AI visibility check...")
+    try:
+        from agents.ai_visibility import ai_visibility_agent
+        result = await ai_visibility_agent.check_visibility()
+        score = result.get("overall_score", 0) if isinstance(result, dict) else 0
+        logger.info(f"[scheduler] AI visibility check done — score: {score}")
+        _record("weekly_ai_visibility", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] AI visibility check failed: {e}")
+        _record("weekly_ai_visibility", "error", str(e))
+
+
+async def _run_midday_review_check():
+    """Second daily review check — catch reviews posted during the day."""
+    logger.info("[scheduler] Running midday review check...")
+    try:
+        from agents.reviews import review_agent
+        await review_agent.fetch_all_reviews()
+        logger.info("[scheduler] Midday review check done")
+        _record("midday_review_check", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Midday review check failed: {e}")
+        _record("midday_review_check", "error", str(e))
+
+
 def start():
     """Register all jobs and start the scheduler."""
     # Daily keyword tracking — 02:00 UTC every day
@@ -118,8 +199,53 @@ def start():
         replace_existing=True,
     )
 
+    # Daily metrics collection — 04:00 UTC every day (after keyword tracking)
+    scheduler.add_job(
+        _run_daily_metrics,
+        CronTrigger(hour=4, minute=0),
+        id="daily_metrics",
+        replace_existing=True,
+    )
+
+    # Daily ads check — 08:00 UTC every day
+    scheduler.add_job(
+        _run_daily_ads_check,
+        CronTrigger(hour=8, minute=0),
+        id="daily_ads_check",
+        replace_existing=True,
+    )
+
+    # Weekly content gap analysis — Wednesdays 05:00 UTC
+    scheduler.add_job(
+        _run_weekly_content_analysis,
+        CronTrigger(day_of_week="wed", hour=5, minute=0),
+        id="weekly_content_analysis",
+        replace_existing=True,
+    )
+
+    # Weekly AI visibility check — Thursdays 10:00 UTC
+    scheduler.add_job(
+        _run_weekly_ai_visibility,
+        CronTrigger(day_of_week="thu", hour=10, minute=0),
+        id="weekly_ai_visibility",
+        replace_existing=True,
+    )
+
+    # Midday review check — 14:00 UTC every day
+    scheduler.add_job(
+        _run_midday_review_check,
+        CronTrigger(hour=14, minute=0),
+        id="midday_review_check",
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("[scheduler] Started — keyword tracking 02:00, SEO audit Mondays 03:00, daily workflow 06:00 (UTC)")
+    logger.info(
+        "[scheduler] Started — "
+        "keywords 02:00, metrics 04:00, SEO audit Mon 03:00, "
+        "workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
+        "reviews 14:00, content Wed 05:00 (UTC)"
+    )
 
 
 def stop():

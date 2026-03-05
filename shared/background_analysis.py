@@ -10,11 +10,10 @@ import logging
 from typing import Callable, Awaitable, Dict, Any, Optional
 
 from shared.database import get_supabase
-from shared.ooda_loop import OODALoop
 
 logger = logging.getLogger(__name__)
 
-# In-memory store of running analysis tasks (cycle_id → asyncio.Task)
+# In-memory store of running analysis tasks (agent_name → asyncio.Task)
 _running_tasks: Dict[str, asyncio.Task] = {}
 
 
@@ -25,40 +24,37 @@ async def start_background_analysis(
     """
     Start an OODA analysis as a background task.
 
-    1. Creates an OODA cycle record (status=observing) in agent_cycles
-    2. Launches the analysis_fn as a fire-and-forget asyncio task
-    3. Returns immediately with the cycle_id for polling
-
-    The analysis_fn is the existing run_*_analysis_with_ooda() function.
-    It already updates agent_cycles status as it progresses.
+    The analysis_fn (e.g. run_seo_analysis_with_ooda) creates its own
+    OODALoop cycle internally. We don't create a duplicate — we just
+    launch the task and let the frontend poll get_cycle_status() which
+    finds the latest cycle for this agent.
     """
-    # Create cycle record so frontend can start polling immediately
-    ooda = OODALoop(agent_name=agent_name)
-    cycle_id = await ooda.start_cycle()
+    # Prevent duplicate runs
+    existing = _running_tasks.get(agent_name)
+    if existing and not existing.done():
+        return {
+            "started": False,
+            "status": "already_running",
+            "message": f"{agent_name} analysis is already running. Poll /cycle-status for progress.",
+        }
 
     async def _run():
         try:
-            # Run the actual analysis (it manages its own OODA cycle internally,
-            # but we already started one — the analysis will create a second one.
-            # That's fine, the frontend polls for the latest active cycle.)
             await analysis_fn()
         except Exception as e:
             logger.error(f"Background {agent_name} analysis failed: {e}")
-            # Mark cycle as failed
-            try:
-                await ooda.fail_cycle(str(e))
-            except Exception:
-                pass
+            # The analysis_fn's own OODALoop handles fail_cycle internally
         finally:
-            _running_tasks.pop(cycle_id, None)
+            _running_tasks.pop(agent_name, None)
 
     task = asyncio.create_task(_run())
-    _running_tasks[cycle_id] = task
+    _running_tasks[agent_name] = task
 
     return {
         "started": True,
-        "cycle_id": cycle_id,
         "status": "observing",
+        "phase": "Starting analysis...",
+        "progress": 5,
         "message": f"{agent_name} analysis started in background. Poll /cycle-status for progress.",
     }
 
@@ -68,58 +64,68 @@ async def get_cycle_status(agent_name: str, cycle_id: Optional[str] = None) -> D
     Get the status of the latest (or specific) OODA cycle for an agent.
     Returns phase, progress percentage, and whether it's done.
     """
-    sb = get_supabase()
+    try:
+        sb = get_supabase()
 
-    if cycle_id:
-        result = sb.table("agent_cycles").select("*").eq("id", cycle_id).execute()
-    else:
-        # Get latest cycle for this agent
-        result = (
-            sb.table("agent_cycles")
-            .select("*")
-            .eq("agent_name", agent_name)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
+        if cycle_id:
+            result = sb.table("agent_cycles").select("*").eq("id", cycle_id).execute()
+        else:
+            result = (
+                sb.table("agent_cycles")
+                .select("*")
+                .eq("agent_name", agent_name)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
 
-    if not result.data:
+        if not result.data:
+            # No cycles yet — check if a background task is running
+            if agent_name in _running_tasks and not _running_tasks[agent_name].done():
+                return {"status": "observing", "phase": "Starting analysis...", "progress": 5, "done": False}
+            return {"status": "idle", "phase": None, "progress": 0, "done": True}
+
+        cycle = result.data[0]
+        status = cycle.get("status", "unknown")
+
+        # The OODA analyses end at "decide" phase (status becomes "acting")
+        # but ACT happens later via /execute. For background polling purposes
+        # we treat "acting" as done since the analysis part is complete.
+        progress_map = {
+            "observing": 15,
+            "orienting": 40,
+            "deciding": 65,
+            "acting": 100,
+            "reflecting": 100,
+            "completed": 100,
+            "failed": 100,
+        }
+        progress = progress_map.get(status, 0)
+        done = status in ("acting", "reflecting", "completed", "failed")
+
+        phase_labels = {
+            "observing": "Collecting data...",
+            "orienting": "Analyzing gaps, trends, and opportunities...",
+            "deciding": "Generating strategy and prioritizing actions...",
+            "acting": "Analysis complete — actions saved",
+            "reflecting": "Analysis complete",
+            "completed": "Analysis complete",
+            "failed": f"Analysis failed: {cycle.get('error_message', 'unknown error')}",
+        }
+
+        return {
+            "cycle_id": cycle.get("id"),
+            "status": status,
+            "phase": phase_labels.get(status, status),
+            "progress": progress,
+            "done": done,
+            "error": cycle.get("error_message") if status == "failed" else None,
+            "started_at": cycle.get("created_at"),
+            "completed_at": cycle.get("completed_at"),
+        }
+    except Exception as e:
+        logger.error(f"Error fetching cycle status for {agent_name}: {e}")
+        # If the background task is still running, return a safe status
+        if agent_name in _running_tasks and not _running_tasks[agent_name].done():
+            return {"status": "observing", "phase": "Analysis in progress...", "progress": 20, "done": False}
         return {"status": "idle", "phase": None, "progress": 0, "done": True}
-
-    cycle = result.data[0]
-    status = cycle.get("status", "unknown")
-
-    # Map status to progress percentage
-    progress_map = {
-        "observing": 15,
-        "orienting": 40,
-        "deciding": 65,
-        "acting": 80,
-        "reflecting": 90,
-        "completed": 100,
-        "failed": 100,
-    }
-    progress = progress_map.get(status, 0)
-    done = status in ("completed", "failed")
-
-    # Phase labels for UI
-    phase_labels = {
-        "observing": "Collecting data from GSC, keywords, and technical checks...",
-        "orienting": "Analyzing gaps, trends, and opportunities...",
-        "deciding": "Generating strategy and prioritizing actions...",
-        "acting": "Saving actions to queue...",
-        "reflecting": "Recording learnings...",
-        "completed": "Analysis complete",
-        "failed": f"Analysis failed: {cycle.get('error_message', 'unknown error')}",
-    }
-
-    return {
-        "cycle_id": cycle.get("id"),
-        "status": status,
-        "phase": phase_labels.get(status, status),
-        "progress": progress,
-        "done": done,
-        "error": cycle.get("error_message") if status == "failed" else None,
-        "started_at": cycle.get("created_at"),
-        "completed_at": cycle.get("completed_at"),
-    }
