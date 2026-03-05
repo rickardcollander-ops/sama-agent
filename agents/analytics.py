@@ -165,13 +165,19 @@ class AnalyticsAgent:
         try:
             access_token = await get_access_token("gsc")  # reuses same Google OAuth
             if not access_token:
+                logger.warning("GA4: Could not obtain access token")
                 channel_data["status"] = "auth_error"
                 return channel_data
 
             end_date = datetime.utcnow()
             start_date = end_date - timedelta(days=date_range)
 
-            url = f"https://analyticsdata.googleapis.com/v1beta/{settings.GA4_PROPERTY_ID}:runReport"
+            # Normalise property ID — accept both "properties/123" and bare "123"
+            prop_id = settings.GA4_PROPERTY_ID
+            if not prop_id.startswith("properties/"):
+                prop_id = f"properties/{prop_id}"
+
+            url = f"https://analyticsdata.googleapis.com/v1beta/{prop_id}:runReport"
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
