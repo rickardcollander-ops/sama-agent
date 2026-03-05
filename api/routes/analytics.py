@@ -71,7 +71,8 @@ async def collect_daily_metrics():
 @router.get("/status")
 async def get_status():
     """Get Analytics agent status"""
-    from shared.google_auth import is_gsc_configured, is_ads_configured
+    from shared.google_auth import is_gsc_configured, is_ads_configured, is_ga4_configured
+    from shared.config import settings
     return {
         "agent": "analytics",
         "status": "operational",
@@ -81,8 +82,44 @@ async def get_status():
         "integrations": {
             "gsc_configured": is_gsc_configured(),
             "ads_configured": is_ads_configured(),
+            "ga4_configured": is_ga4_configured(),
+            "ga4_property_id": settings.GA4_PROPERTY_ID[:10] + "..." if len(settings.GA4_PROPERTY_ID) > 10 else ("set" if settings.GA4_PROPERTY_ID else "missing"),
+            "supabase_configured": bool(settings.SUPABASE_URL and settings.SUPABASE_KEY),
         },
     }
+
+
+@router.get("/debug")
+async def debug_channels():
+    """
+    Fetch each channel individually and report status/errors.
+    Useful for diagnosing which integrations are working.
+    """
+    import asyncio
+    results = {}
+
+    async def _test(name, coro):
+        try:
+            data = await coro
+            results[name] = {"status": data.get("status", "ok"), "keys": list(data.keys())}
+            if data.get("error"):
+                results[name]["error"] = str(data["error"])[:200]
+            # Include some sample values
+            for k in ("total_clicks", "total_sessions", "total_impressions", "total_pageviews", "bounce_rate", "total_reviews"):
+                if k in data and data[k]:
+                    results[name][k] = data[k]
+        except Exception as e:
+            results[name] = {"status": "exception", "error": str(e)[:200]}
+
+    await asyncio.gather(
+        _test("seo", analytics_agent._fetch_seo_data()),
+        _test("ads", analytics_agent._fetch_ads_data()),
+        _test("reviews", analytics_agent._fetch_reviews_data()),
+        _test("content", analytics_agent._fetch_content_data()),
+        _test("ga4", analytics_agent._fetch_ga4_data()),
+    )
+
+    return {"channels": results}
 
 
 @router.get("/report/weekly")
