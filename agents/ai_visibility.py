@@ -376,6 +376,158 @@ class AIVisibilityAgent:
             return {"mention_rate": 0, "avg_rank": None, "total_checks": 0, "open_gaps": 0,
                     "top_competitors": [], "trend": "flat", "last_check_at": None, "engine_stats": {}}
 
+    async def generate_strategic_analysis(self) -> Dict[str, Any]:
+        """Generate a comprehensive, opinionated strategic analysis of AI visibility."""
+        sb = get_supabase()
+        try:
+            checks = sb.table("ai_visibility_checks").select("*").order("checked_at", desc=True).limit(500).execute().data or []
+            gaps = sb.table("ai_visibility_gaps").select("*").eq("status", "open").limit(50).execute().data or []
+        except Exception:
+            checks = []
+            gaps = []
+
+        if not checks:
+            return {
+                "analysis": "No monitoring data available yet. Run a monitoring check first to generate a strategic analysis.",
+                "verdict": "unknown",
+                "priority_actions": [],
+            }
+
+        # Build rich context for Claude
+        summary = self.get_summary()
+
+        # Per-engine breakdown
+        engine_lines = []
+        for eng, stats in summary.get("engine_stats", {}).items():
+            engine_lines.append(f"  {eng}: {stats['mentioned']}/{stats['total']} mentioned ({round(stats['rate']*100)}%)")
+
+        # Category breakdown
+        cat_stats: Dict[str, Dict] = {}
+        for c in checks:
+            cat = c.get("category", "unknown")
+            if cat not in cat_stats:
+                cat_stats[cat] = {"total": 0, "mentioned": 0}
+            cat_stats[cat]["total"] += 1
+            if c.get("mentioned"):
+                cat_stats[cat]["mentioned"] += 1
+        cat_lines = []
+        for cat, s in cat_stats.items():
+            rate = round(s["mentioned"] / s["total"] * 100) if s["total"] else 0
+            cat_lines.append(f"  {cat}: {s['mentioned']}/{s['total']} ({rate}%)")
+
+        # Competitor frequency
+        comp_lines = []
+        for comp in summary.get("top_competitors", [])[:10]:
+            comp_lines.append(f"  {comp['name']}: mentioned {comp['count']} times")
+
+        # Gap patterns
+        gap_by_engine: Dict[str, int] = {}
+        gap_by_cat: Dict[str, int] = {}
+        for g in gaps:
+            eng = g.get("ai_engine", "?")
+            cat = g.get("category", "?")
+            gap_by_engine[eng] = gap_by_engine.get(eng, 0) + 1
+            gap_by_cat[cat] = gap_by_cat.get(cat, 0) + 1
+
+        # Sample AI responses where Successifier IS mentioned (for quality analysis)
+        positive_excerpts = []
+        for c in checks:
+            if c.get("mentioned") and c.get("ai_response_excerpt"):
+                positive_excerpts.append(f"  [{c.get('ai_engine')}] {c['ai_response_excerpt'][:200]}")
+                if len(positive_excerpts) >= 5:
+                    break
+
+        # Sample AI responses where Successifier is NOT mentioned
+        negative_samples = []
+        for c in checks:
+            if not c.get("mentioned") and c.get("full_response"):
+                negative_samples.append(
+                    f"  [{c.get('ai_engine')}] Prompt: \"{c.get('prompt')}\" → Response mentions: "
+                    f"{', '.join(c.get('competitors_mentioned', [])[:5]) or 'none'}"
+                )
+                if len(negative_samples) >= 5:
+                    break
+
+        prompt = f"""You are a senior GEO (Generative Engine Optimization) strategist performing a comprehensive audit of Successifier's visibility in AI-powered search and assistant tools.
+
+Successifier is a customer success platform for B2B SaaS companies. Your job is to deliver a BOLD, OPINIONATED analysis — not generic advice. Be direct about what's working, what's failing, and what the highest-leverage moves are. Think like a CMO who needs to 10x AI visibility within 90 days.
+
+## CURRENT DATA
+
+**Overall mention rate**: {round(summary.get('mention_rate', 0) * 100)}% ({summary.get('total_checks', 0)} total checks)
+**Average rank when mentioned**: {summary.get('avg_rank', 'N/A')}
+**Open gaps**: {len(gaps)}
+**Trend**: {summary.get('trend', 'flat')}
+
+### Per-engine performance:
+{chr(10).join(engine_lines) or '  No data'}
+
+### Per-category performance:
+{chr(10).join(cat_lines) or '  No data'}
+
+### Top competitors appearing in AI responses:
+{chr(10).join(comp_lines) or '  No data'}
+
+### Gap distribution by engine:
+{chr(10).join(f'  {k}: {v} gaps' for k, v in sorted(gap_by_engine.items(), key=lambda x: -x[1])) or '  No gaps'}
+
+### Gap distribution by category:
+{chr(10).join(f'  {k}: {v} gaps' for k, v in sorted(gap_by_cat.items(), key=lambda x: -x[1])) or '  No gaps'}
+
+### How Successifier is described when mentioned:
+{chr(10).join(positive_excerpts) or '  No positive mentions yet'}
+
+### Where Successifier is missing (sample):
+{chr(10).join(negative_samples) or '  No negative samples'}
+
+## YOUR TASK
+
+Write a strategic analysis in JSON format with these fields:
+
+1. **verdict** (string): One of "critical", "weak", "improving", "strong" — your overall assessment
+2. **headline** (string): A bold, one-sentence summary (max 15 words). Be provocative.
+3. **analysis** (string): 3-5 paragraphs of strategic analysis in markdown. Cover:
+   - The brutal truth about current visibility
+   - Which engines are the biggest opportunity vs lost cause (for now)
+   - How competitors are eating Successifier's lunch and what patterns you see
+   - The #1 structural problem holding back visibility
+   - What the 90-day transformation plan should look like
+4. **priority_actions** (array of objects): Exactly 5 actions, each with:
+   - title (string, max 10 words)
+   - description (string, 2-3 sentences, concrete and specific)
+   - impact (string): "high" / "medium" / "low"
+   - effort (string): "low" / "medium" / "high"
+   - timeline (string): e.g. "Week 1-2", "Month 1", "Ongoing"
+   - engine_target (string): which engine(s) this primarily targets, or "all"
+5. **blind_spots** (array of strings): 3 things the current monitoring might be missing or undervaluing
+6. **competitor_insight** (string): 1-2 paragraphs about what the top competitors are doing right that Successifier can learn from
+
+Be specific to THIS data. No generic GEO advice. Reference actual numbers, engines, and patterns from the data above.
+
+Respond ONLY with valid JSON (no markdown fences).
+"""
+        try:
+            msg = await asyncio.to_thread(
+                client.messages.create,
+                model="claude-opus-4-6",
+                max_tokens=3000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = msg.content[0].text.strip()
+            # Strip markdown fences if present
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text.strip())
+        except Exception as e:
+            logger.error(f"generate_strategic_analysis error: {e}")
+            return {
+                "analysis": f"Failed to generate analysis: {str(e)}",
+                "verdict": "unknown",
+                "priority_actions": [],
+            }
+
     async def generate_geo_recommendations(self) -> List[Dict[str, Any]]:
         sb = get_supabase()
         try:

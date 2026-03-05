@@ -83,11 +83,21 @@ def is_gsc_configured() -> bool:
     )
 
 
+def is_ga4_configured() -> bool:
+    """Check if Google Analytics 4 credentials are configured"""
+    return bool(
+        settings.GA4_PROPERTY_ID
+        and settings.GOOGLE_CLIENT_ID
+        and settings.GOOGLE_CLIENT_SECRET
+        and getattr(settings, 'GOOGLE_REFRESH_TOKEN', '')
+    )
+
+
 def is_ads_configured() -> bool:
     """Check if Google Ads credentials are configured"""
     return bool(
         settings.GOOGLE_ADS_DEVELOPER_TOKEN
         and settings.GOOGLE_ADS_CUSTOMER_ID
         and (settings.GOOGLE_ADS_CLIENT_ID or settings.GOOGLE_CLIENT_ID)
-        and settings.GOOGLE_ADS_REFRESH_TOKEN
+        and (settings.GOOGLE_ADS_REFRESH_TOKEN or getattr(settings, 'GOOGLE_REFRESH_TOKEN', ''))
     )

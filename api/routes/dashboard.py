@@ -121,6 +121,14 @@ async def get_dashboard_status():
     return status
 
 
+@router.get("/pending-actions")
+async def get_all_pending_actions():
+    """Return all pending agent actions across every agent."""
+    from shared.actions_db import get_pending_actions
+    actions = await get_pending_actions()
+    return {"success": True, "total": len(actions), "actions": actions}
+
+
 @router.get("/recommendations")
 async def get_smart_recommendations():
     """

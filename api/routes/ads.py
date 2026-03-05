@@ -28,21 +28,47 @@ class CampaignCreateRequest(BaseModel):
 
 @router.get("/status")
 async def get_status():
-    """Get Google Ads agent status"""
+    """Get Google Ads agent status — live campaigns from Google Ads API"""
+    from shared.google_auth import is_ads_configured
+    configured = is_ads_configured()
+
+    live_campaigns = []
+    if configured:
+        try:
+            live_campaigns = await ads_agent.get_campaign_performance(date_range=30)
+        except Exception:
+            pass
+
     return {
         "agent": "ads",
-        "status": "operational",
-        "campaigns": list(ads_agent.CAMPAIGN_STRUCTURE.keys()),
+        "status": "operational" if configured else "not_configured",
+        "configured": configured,
+        "campaigns": [
+            {"name": c["name"], "status": c["status"], "id": c["campaign_id"]}
+            for c in live_campaigns
+        ],
+        "campaign_count": len(live_campaigns),
+        "campaign_templates": list(ads_agent.CAMPAIGN_STRUCTURE.keys()),
         "optimization_rules": len(ads_agent.OPTIMIZATION_RULES),
-        "rsa_headline_bank": len(ads_agent.RSA_HEADLINE_BANK)
+        "rsa_headline_bank": len(ads_agent.RSA_HEADLINE_BANK),
     }
 
 
 @router.get("/campaigns")
 async def get_campaigns():
-    """Get all campaign configurations"""
+    """Get live campaigns from Google Ads, with templates as reference"""
+    from shared.google_auth import is_ads_configured
+
+    live_campaigns = []
+    if is_ads_configured():
+        try:
+            live_campaigns = await ads_agent.get_campaign_performance(date_range=30)
+        except Exception:
+            pass
+
     return {
-        "campaigns": ads_agent.CAMPAIGN_STRUCTURE
+        "campaigns": live_campaigns,
+        "templates": ads_agent.CAMPAIGN_STRUCTURE,
     }
 
 

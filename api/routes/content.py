@@ -467,14 +467,14 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                 target_keyword=keyword,
                 word_count=2000
             )
-            
-            # Create in GitHub repo if GITHUB_TOKEN is configured
-            from shared.github_helper import create_blog_post
+
+            # Create as PR in GitHub repo (branch → commit → PR for review)
+            from shared.github_helper import create_blog_post_pr
             import re
-            
+
             slug = re.sub(r'[^a-z0-9]+', '-', result.get("title", keyword).lower()).strip('-')
-            
-            github_result = await create_blog_post(
+
+            github_result = await create_blog_post_pr(
                 title=result.get("title", ""),
                 content=result.get("content", ""),
                 slug=slug,
@@ -483,7 +483,7 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                 meta_description=result.get("meta_description", ""),
                 author="SAMA Content Agent"
             )
-            
+
             outcome = {
                 "success": True,
                 "action_type": "blog_generated",
@@ -502,15 +502,15 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
             competitor = action.get("competitor", "")
             if competitor:
                 result = await content_agent.generate_comparison_page(competitor=competitor)
-                
-                # Create comparison page in GitHub
-                from shared.github_helper import create_comparison_page
-                
-                github_result = await create_comparison_page(
+
+                # Create comparison page as PR in GitHub
+                from shared.github_helper import create_comparison_page_pr
+
+                github_result = await create_comparison_page_pr(
                     competitor=competitor,
                     content=result.get("content", "")
                 )
-                
+
                 outcome = {
                     "success": True,
                     "action_type": "comparison_generated",
