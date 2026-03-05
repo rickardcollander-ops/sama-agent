@@ -89,5 +89,5 @@ def is_ads_configured() -> bool:
         settings.GOOGLE_ADS_DEVELOPER_TOKEN
         and settings.GOOGLE_ADS_CUSTOMER_ID
         and (settings.GOOGLE_ADS_CLIENT_ID or settings.GOOGLE_CLIENT_ID)
-        and settings.GOOGLE_ADS_REFRESH_TOKEN
+        and (settings.GOOGLE_ADS_REFRESH_TOKEN or getattr(settings, 'GOOGLE_REFRESH_TOKEN', ''))
     )
