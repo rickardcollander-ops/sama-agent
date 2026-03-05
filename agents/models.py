@@ -18,6 +18,9 @@ COMPETITOR_ANALYSES_TABLE = "competitor_analyses"
 DAILY_METRICS_TABLE = "daily_metrics"
 REVIEWS_TABLE = "reviews"
 AGENT_ACTIONS_TABLE = "agent_actions"
+GTM_ICP_TABLE = "gtm_icp_analyses"
+GTM_STRATEGIES_TABLE = "gtm_strategies"
+GTM_SIGNALS_TABLE = "gtm_signals"
 
 
 class Keyword(BaseModel):
