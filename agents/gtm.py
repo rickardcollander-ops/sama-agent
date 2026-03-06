@@ -68,7 +68,7 @@ Always be data-driven. Cite specific numbers. Provide actionable recommendations
     async def fetch_pipeline_stats(self) -> Dict[str, Any]:
         """Fetch pipeline statistics from Growth Hub bridge API"""
         try:
-            headers = {"x-api-key": settings.GROWTH_HUB_BRIDGE_API_KEY}
+            headers = {"x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY}
             resp = await self.http_client.get(
                 f"{GROWTH_HUB_API}/bridge/stats",
                 headers=headers
@@ -84,7 +84,7 @@ Always be data-driven. Cite specific numbers. Provide actionable recommendations
     async def fetch_prospects(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch prospects from Growth Hub CRM"""
         try:
-            headers = {"x-api-key": settings.GROWTH_HUB_BRIDGE_API_KEY}
+            headers = {"x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY}
             params = {}
             if status:
                 params["status"] = status
@@ -519,7 +519,11 @@ Provide a performance review as JSON:
         return None
 
     async def _publish_signals(self, signals: Dict[str, Any]):
-        """Publish signals to event bus for SAMA agents"""
+        """Publish signals to event bus for SAMA agents + push to Growth Hub"""
+        # Push to Growth Hub Bridge API
+        await self._push_signals_to_growth_hub(signals)
+
+        # Publish to Redis event bus for SAMA agents
         try:
             from shared.event_bus import event_bus
             if settings.LINKEDIN_AGENT_EVENT_BUS_ENABLED:
@@ -530,17 +534,85 @@ Provide a performance review as JSON:
                         target_agent=target,
                         data=agent_signals
                     )
-                # Also send LinkedIn signals to Growth Hub
-                linkedin_signals = signals.get("agents", {}).get("linkedin_agent", {})
-                if linkedin_signals:
-                    await event_bus.publish(
-                        event_type="gtm_signal",
-                        target_agent="linkedin_agent",
-                        data=linkedin_signals
-                    )
                 logger.info("📤 Signals published to event bus")
         except Exception as e:
             logger.warning(f"Event bus not available: {e}")
+
+    async def _push_signals_to_growth_hub(self, signals: Dict[str, Any]):
+        """Push individual signals to Growth Hub Bridge API for review in the UI."""
+        if not settings.GROWTH_HUB_BRIDGE_API_KEY:
+            logger.warning("GROWTH_HUB_BRIDGE_API_KEY not set, skipping signal push")
+            return
+
+        headers = {
+            "x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY,
+            "Content-Type": "application/json",
+        }
+
+        signal_types = {
+            "target_titles": ("target_titles", "Target Titles Update"),
+            "target_industries": ("target_industries", "Target Industries Update"),
+            "outreach_hooks": ("messaging_hooks", "Messaging Hooks Update"),
+            "outreach_queries": ("outreach_query", "Outreach Query Update"),
+            "budget_recommendations": ("budget_allocation", "Budget Allocation Signal"),
+        }
+
+        agents_data = signals.get("agents", {})
+        linkedin_data = agents_data.get("linkedin_agent", {})
+        pushed = 0
+
+        for data_key, (signal_type, title) in signal_types.items():
+            data = linkedin_data.get(data_key)
+            if not data:
+                continue
+
+            payload = {
+                "type": signal_type,
+                "source": "sama_gtm_agent",
+                "title": title,
+                "content": json.dumps(data) if isinstance(data, (list, dict)) else str(data),
+                "data": data if isinstance(data, dict) else {"items": data},
+                "relevanceScore": signals.get("confidence_score", 0.8),
+            }
+
+            try:
+                resp = await self.http_client.post(
+                    f"{GROWTH_HUB_API}/bridge/signals",
+                    json=payload,
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if resp.status_code == 200:
+                    pushed += 1
+                else:
+                    logger.warning(f"Growth Hub signal push failed ({signal_type}): {resp.status_code} {resp.text}")
+            except Exception as e:
+                logger.warning(f"Growth Hub signal push error ({signal_type}): {e}")
+
+        # Push ICP update if available
+        icp_data = signals.get("icp_summary")
+        if icp_data:
+            try:
+                resp = await self.http_client.post(
+                    f"{GROWTH_HUB_API}/bridge/signals",
+                    json={
+                        "type": "icp_update",
+                        "source": "sama_gtm_agent",
+                        "title": "ICP Analysis Update",
+                        "content": json.dumps(icp_data) if isinstance(icp_data, (list, dict)) else str(icp_data),
+                        "data": icp_data if isinstance(icp_data, dict) else {"summary": icp_data},
+                        "relevanceScore": 0.9,
+                    },
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if resp.status_code == 200:
+                    pushed += 1
+            except Exception as e:
+                logger.warning(f"Growth Hub ICP signal push error: {e}")
+
+        if pushed > 0:
+            logger.info(f"📤 Pushed {pushed} signals to Growth Hub Bridge API")
 
 
 # Global instance
