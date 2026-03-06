@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     
     # LinkedIn Agent Integration
     LINKEDIN_AGENT_EVENT_BUS_ENABLED: bool = True
-    LINKEDIN_AGENT_API_URL: str = "http://localhost:3003/api"
+    LINKEDIN_AGENT_API_URL: str = "https://growth.successifier.com/api"
     GROWTH_HUB_BRIDGE_API_KEY: str = ""
     
     # Human-in-the-Loop
