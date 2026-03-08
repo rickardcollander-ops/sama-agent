@@ -142,7 +142,8 @@ async def root():
             "ads": "active",
             "social": "active",
             "reviews": "active",
-            "analytics": "active"
+            "analytics": "active",
+            "gtm": "active"
         }
     }
 
