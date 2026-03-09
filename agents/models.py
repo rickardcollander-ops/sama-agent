@@ -35,6 +35,8 @@ class Keyword(BaseModel):
     current_impressions: int = 0
     current_ctr: float = 0.0
     position_history: List[Any] = []
+    position_change: float = 0.0
+    position_trend: str = "stable"
     added_at: Optional[str] = None
     last_checked_at: Optional[str] = None
     auto_discovered: bool = False

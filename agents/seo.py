@@ -235,8 +235,17 @@ class SEOAgent:
             }
             if current_position is not None:
                 update_data["current_position"] = int(current_position)
-            
-            sb.table(KEYWORDS_TABLE).update(update_data).eq("id", kw["id"]).execute()
+
+            try:
+                sb.table(KEYWORDS_TABLE).update(update_data).eq("id", kw["id"]).execute()
+            except Exception as col_err:
+                if "position_change" in str(col_err) or "position_trend" in str(col_err):
+                    # Columns not yet added to table — update without them
+                    update_data.pop("position_change", None)
+                    update_data.pop("position_trend", None)
+                    sb.table(KEYWORDS_TABLE).update(update_data).eq("id", kw["id"]).execute()
+                else:
+                    raise
             results["updated"] += 1
             
             # Detect changes
