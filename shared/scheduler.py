@@ -116,7 +116,7 @@ async def _run_daily_ads_check():
     logger.info("[scheduler] Running daily ads check...")
     try:
         from agents.ads import ads_agent
-        result = await ads_agent.get_campaign_performance(days=7)
+        result = await ads_agent.get_campaign_performance(date_range=7)
         campaigns = result.get("campaigns", []) if isinstance(result, dict) else []
         # Flag campaigns with 0 conversions or high CPA
         flagged = 0

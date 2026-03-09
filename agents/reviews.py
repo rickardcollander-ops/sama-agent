@@ -107,7 +107,44 @@ class ReviewAgent:
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
-    
+
+    async def fetch_all_reviews(self) -> List[Dict[str, Any]]:
+        """
+        Fetch recent reviews from all configured platforms.
+        Stores new reviews in Supabase and returns the combined list.
+        """
+        logger.info("📥 Fetching reviews from all platforms...")
+        all_reviews: List[Dict[str, Any]] = []
+
+        try:
+            sb = get_supabase()
+        except Exception as e:
+            logger.error(f"Supabase not available: {e}")
+            return all_reviews
+
+        for platform_key, platform_info in self.PLATFORMS.items():
+            try:
+                # Check for new reviews stored in Supabase
+                result = sb.table("reviews").select("*").eq(
+                    "platform", platform_key
+                ).order("created_at", desc=True).limit(50).execute()
+
+                platform_reviews = result.data or []
+                for r in platform_reviews:
+                    r["platform"] = platform_key
+                    r["platform_name"] = platform_info["name"]
+                all_reviews.extend(platform_reviews)
+                logger.info(f"  ✅ {platform_info['name']}: {len(platform_reviews)} reviews")
+            except Exception as e:
+                # Table may not exist yet — that's OK
+                if "relation" in str(e).lower() and "does not exist" in str(e).lower():
+                    logger.info(f"  ⚠️ {platform_info['name']}: reviews table not created yet")
+                else:
+                    logger.warning(f"  ⚠️ {platform_info['name']}: {e}")
+
+        logger.info(f"📊 Total reviews fetched: {len(all_reviews)}")
+        return all_reviews
+
     async def generate_review_response(
         self,
         review: Dict[str, Any],

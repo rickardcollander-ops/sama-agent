@@ -130,7 +130,18 @@ async def init_db():
             # If RPC doesn't exist, try postgrest approach
             logger.warning(f"RPC exec_sql not available, tables must be created via Supabase SQL Editor: {e}")
             break
-    
+
+    # Ensure newer columns exist on seo_keywords
+    alter_sqls = [
+        "ALTER TABLE seo_keywords ADD COLUMN IF NOT EXISTS position_change FLOAT DEFAULT 0",
+        "ALTER TABLE seo_keywords ADD COLUMN IF NOT EXISTS position_trend VARCHAR(20) DEFAULT 'stable'",
+    ]
+    for sql in alter_sqls:
+        try:
+            sb.rpc("exec_sql", {"query": sql}).execute()
+        except Exception as e:
+            logger.warning(f"Could not run ALTER TABLE (run manually if needed): {sql} — {e}")
+
     logger.info("✅ Database initialized via Supabase")
 
 
