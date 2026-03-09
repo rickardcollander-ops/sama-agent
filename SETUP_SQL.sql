@@ -4,8 +4,8 @@
 -- Enable pgvector extension
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Keywords table
-CREATE TABLE IF NOT EXISTS keywords (
+-- Keywords table (code references this as seo_keywords)
+CREATE TABLE IF NOT EXISTS seo_keywords (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     keyword VARCHAR(255) NOT NULL,
     intent VARCHAR(50),
@@ -16,10 +16,16 @@ CREATE TABLE IF NOT EXISTS keywords (
     current_impressions INTEGER DEFAULT 0,
     current_ctr FLOAT DEFAULT 0.0,
     position_history JSONB DEFAULT '[]'::jsonb,
+    position_change FLOAT DEFAULT 0,
+    position_trend VARCHAR(20) DEFAULT 'stable',
     added_at TIMESTAMPTZ DEFAULT NOW(),
     last_checked_at TIMESTAMPTZ,
     auto_discovered BOOLEAN DEFAULT FALSE
 );
+
+-- If table already exists, ensure newer columns are present
+ALTER TABLE seo_keywords ADD COLUMN IF NOT EXISTS position_change FLOAT DEFAULT 0;
+ALTER TABLE seo_keywords ADD COLUMN IF NOT EXISTS position_trend VARCHAR(20) DEFAULT 'stable';
 
 -- SEO Audits table
 CREATE TABLE IF NOT EXISTS seo_audits (
