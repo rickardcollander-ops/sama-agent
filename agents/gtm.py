@@ -101,6 +101,42 @@ Always be data-driven. Cite specific numbers. Provide actionable recommendations
             logger.warning(f"Could not fetch prospects: {e}")
             return []
 
+    async def fetch_deals(self, stage: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch deals from Growth Hub CRM"""
+        try:
+            headers = {"x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY}
+            params = {}
+            if stage:
+                params["stage"] = stage
+            resp = await self.http_client.get(
+                f"{GROWTH_HUB_API}/bridge/deals",
+                headers=headers,
+                params=params
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("deals", data) if isinstance(data, dict) else data
+            return []
+        except Exception as e:
+            logger.warning(f"Could not fetch deals: {e}")
+            return []
+
+    async def fetch_sequences(self) -> List[Dict[str, Any]]:
+        """Fetch sequence performance data from Growth Hub"""
+        try:
+            headers = {"x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY}
+            resp = await self.http_client.get(
+                f"{GROWTH_HUB_API}/bridge/stats",
+                headers=headers
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("sequences", [])
+            return []
+        except Exception as e:
+            logger.warning(f"Could not fetch sequences: {e}")
+            return []
+
     # ── Marketing Data (from SAMA Supabase) ──────────────────────────
 
     async def fetch_marketing_metrics(self) -> Dict[str, Any]:
@@ -145,6 +181,8 @@ Always be data-driven. Cite specific numbers. Provide actionable recommendations
         won_prospects = await self.fetch_prospects(status="won")
         lost_prospects = await self.fetch_prospects(status="lost")
         demo_prospects = await self.fetch_prospects(status="demo_booked")
+        won_deals = await self.fetch_deals(stage="closed_won")
+        lost_deals = await self.fetch_deals(stage="closed_lost")
         marketing = await self.fetch_marketing_metrics()
 
         # Current ICP from brand voice
@@ -157,6 +195,8 @@ Always be data-driven. Cite specific numbers. Provide actionable recommendations
             "won_prospects": won_prospects[:50],
             "lost_prospects": lost_prospects[:50],
             "demo_booked": demo_prospects[:20],
+            "won_deals": won_deals[:30],
+            "lost_deals": lost_deals[:30],
             "marketing_metrics": marketing
         }
 
@@ -177,6 +217,10 @@ Pipeline Data:
 - Won deals ({len(won_prospects)}): {json.dumps(won_prospects[:20], indent=2, default=str)}
 - Lost deals ({len(lost_prospects)}): {json.dumps(lost_prospects[:20], indent=2, default=str)}
 - Demo booked ({len(demo_prospects)}): {json.dumps(demo_prospects[:10], indent=2, default=str)}
+
+Deal Data:
+- Won deals ({len(won_deals)}): {json.dumps(won_deals[:15], indent=2, default=str)}
+- Lost deals ({len(lost_deals)}): {json.dumps(lost_deals[:15], indent=2, default=str)}
 
 Marketing Data:
 - Top keywords: {json.dumps(marketing.get('top_keywords', [])[:10], indent=2, default=str)}
@@ -413,6 +457,8 @@ Generate specific, actionable signals as JSON:
         marketing = await self.fetch_marketing_metrics()
         latest_strategy = await self._get_latest_strategy()
         latest_icp = await self._get_latest_icp()
+        won_deals = await self.fetch_deals(stage="closed_won")
+        lost_deals = await self.fetch_deals(stage="closed_lost")
 
         def _call():
             return self.client.messages.create(
@@ -427,6 +473,8 @@ Current Strategy: {json.dumps(latest_strategy, indent=2, default=str)}
 Current ICP: {json.dumps(latest_icp, indent=2, default=str)}
 Pipeline Stats: {json.dumps(pipeline_stats, indent=2, default=str)}
 Marketing Metrics: {json.dumps(marketing, indent=2, default=str)}
+Won Deals ({len(won_deals)}): {json.dumps(won_deals[:10], indent=2, default=str)}
+Lost Deals ({len(lost_deals)}): {json.dumps(lost_deals[:10], indent=2, default=str)}
 
 Provide a performance review as JSON:
 {{
