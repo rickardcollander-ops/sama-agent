@@ -217,7 +217,7 @@ async def run_review_analysis_legacy():
         })
     
     # 5. Competitor analysis suggestions
-    competitors = ["gainsight", "totango", "churnzero"]
+    competitors = ["gainsight", "totango", "churnzero", "planhat", "vitally", "clientsuccess", "custify"]
     for comp in competitors:
         actions.append({
             "id": f"review-competitor-{comp}",
