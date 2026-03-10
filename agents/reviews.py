@@ -56,6 +56,20 @@ class ReviewAgent:
             "priority": "low",
             "target_reviews": 10,
             "current_rating": 5.0
+        },
+        "trustradius": {
+            "name": "TrustRadius",
+            "url": "https://www.trustradius.com/products/successifier/reviews",
+            "priority": "high",
+            "target_reviews": 25,
+            "current_rating": 0.0
+        },
+        "software_advice": {
+            "name": "Software Advice",
+            "url": "https://www.softwareadvice.com/successifier/reviews/",
+            "priority": "medium",
+            "target_reviews": 20,
+            "current_rating": 0.0
         }
     }
     
