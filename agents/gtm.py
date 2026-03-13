@@ -137,6 +137,63 @@ Always be data-driven. Cite specific numbers. Provide actionable recommendations
             logger.warning(f"Could not fetch sequences: {e}")
             return []
 
+    async def fetch_prospect_detail(self, prospect_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch single prospect with messages, sequences, and account data"""
+        try:
+            headers = {"x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY}
+            resp = await self.http_client.get(
+                f"{GROWTH_HUB_API}/bridge/prospects/{prospect_id}",
+                headers=headers
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("data", data) if isinstance(data, dict) else data
+            logger.warning(f"Prospect detail returned {resp.status_code}")
+            return None
+        except Exception as e:
+            logger.warning(f"Could not fetch prospect detail: {e}")
+            return None
+
+    async def update_prospect(self, prospect_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Update prospect status or fields via Growth Hub bridge API"""
+        try:
+            headers = {
+                "x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY,
+                "Content-Type": "application/json"
+            }
+            resp = await self.http_client.patch(
+                f"{GROWTH_HUB_API}/bridge/prospects/{prospect_id}",
+                headers=headers,
+                json=updates
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning(f"Prospect update returned {resp.status_code}")
+            return {"ok": False, "error": f"Status {resp.status_code}"}
+        except Exception as e:
+            logger.warning(f"Could not update prospect: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def fetch_outreach(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch outreach messages from Growth Hub CRM"""
+        try:
+            headers = {"x-mission-secret": settings.GROWTH_HUB_BRIDGE_API_KEY}
+            params = {}
+            if status:
+                params["status"] = status
+            resp = await self.http_client.get(
+                f"{GROWTH_HUB_API}/bridge/outreach",
+                headers=headers,
+                params=params
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("data", data) if isinstance(data, dict) else data
+            return []
+        except Exception as e:
+            logger.warning(f"Could not fetch outreach: {e}")
+            return []
+
     # ── Marketing Data (from SAMA Supabase) ──────────────────────────
 
     async def fetch_marketing_metrics(self) -> Dict[str, Any]:

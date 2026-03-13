@@ -2,7 +2,7 @@
 GTM (Go-To-Market) Strategy Agent API Routes
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 
@@ -125,6 +125,41 @@ async def get_pipeline_prospects(status: Optional[str] = None):
     try:
         prospects = await gtm_agent.fetch_prospects(status=status)
         return {"success": True, "prospects": prospects, "count": len(prospects)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pipeline/prospects/{prospect_id}")
+async def get_prospect_detail(prospect_id: str):
+    """Get single prospect with messages, sequences, and account data"""
+    try:
+        detail = await gtm_agent.fetch_prospect_detail(prospect_id)
+        if not detail:
+            raise HTTPException(status_code=404, detail="Prospect not found")
+        return {"success": True, "prospect": detail}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/pipeline/prospects/{prospect_id}")
+async def update_prospect(prospect_id: str, request: Request):
+    """Update prospect status or fields"""
+    try:
+        body = await request.json()
+        result = await gtm_agent.update_prospect(prospect_id, body)
+        return {"success": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pipeline/outreach")
+async def get_pipeline_outreach(status: Optional[str] = None):
+    """Get outreach messages from Growth Hub CRM"""
+    try:
+        outreach = await gtm_agent.fetch_outreach(status=status)
+        return {"success": True, "outreach": outreach, "count": len(outreach)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
