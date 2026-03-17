@@ -113,11 +113,6 @@ class Settings(BaseSettings):
     LINKEDIN_AGENT_API_URL: str = "https://growth.successifier.com/api"
     GROWTH_HUB_BRIDGE_API_KEY: str = ""
     
-    # Notifications
-    SLACK_WEBHOOK_URL: str = ""
-    NOTIFICATION_EMAIL: str = ""
-    DAILY_DIGEST_ENABLED: bool = True
-
     # Human-in-the-Loop
     AUTO_PUBLISH_BLOG_POSTS: bool = False
     AUTO_PUBLISH_LANDING_PAGES: bool = False
