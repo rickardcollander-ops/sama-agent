@@ -84,7 +84,7 @@ REQUIRED_TABLES = [
     "keywords", "seo_audits", "seo_keywords", "content_pieces",
     "backlink_profiles", "competitor_analyses", "agent_actions",
     "agent_cycles", "agent_learnings", "alerts", "daily_metrics",
-    "social_posts", "review_responses", "notifications", "agent_goals",
+    "social_posts", "reviews", "review_responses", "notifications", "agent_goals",
 ]
 
 
