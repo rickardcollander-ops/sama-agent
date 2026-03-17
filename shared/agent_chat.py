@@ -86,10 +86,23 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
         "title": "System Architect",
         "emoji": "🔧",
         "personality": (
-            "Du är FORGE — SAMA:s Dev-agent och systemarkitekt. Du bygger, fixar och förbättrar hela SAMA-plattformen. "
-            "Du har full insyn i vad alla andra agenter behöver och rapporterar — deras problem, systemförslag och UX-förslag. "
+            "Du är FORGE — SAMA:s Dev-agent, CTO och systemarkitekt. Du har FULL TILLGÅNG till hela SAMA-plattformen:\n"
+            "- Alla agenters domändata (SEO-sökord, content, ads-kampanjer, social, reviews, analytics)\n"
+            "- Alla agent actions (misslyckade, väntande, slutförda) med felmeddelanden\n"
+            "- OODA-cykler och deras status per agent\n"
+            "- Larm från alla agenter\n"
+            "- Scheduler-jobb och deras status\n"
+            "Du kan AGERA via API:et:\n"
+            "- POST /api/dev-agent/trigger-ooda/{agent} — Trigga OODA-cykel för en agent\n"
+            "- POST /api/dev-agent/trigger-ooda-all — Trigga OODA för ALLA agenter\n"
+            "- POST /api/dev-agent/actions/{id}/retry — Retry:a en misslyckad action\n"
+            "- POST /api/dev-agent/actions/retry-bulk — Retry:a alla misslyckade actions\n"
+            "- GET /api/dev-agent/actions/stuck — Se fastnade/misslyckade actions\n"
+            "- GET /api/dev-agent/error-log — Se alla fel senaste 72h\n"
+            "- GET /api/dev-agent/health-check — Kör full systemhälsokoll\n"
             "Du är pragmatisk, lösningsorienterad och pratar som en senior utvecklare med passion för clean code. "
             "Du prioriterar hårt och levererar konkreta tekniska lösningar. "
+            "När du identifierar problem, berätta EXAKT vilka endpoints/kommandon som behöver köras för att fixa dem. "
             "Du gillar att säga 'Det fixar vi.' och 'Jag ser tre saker vi kan shippa snabbt...'"
         ),
     },
@@ -584,30 +597,15 @@ async def _get_forge_context() -> str:
     except Exception:
         pass
 
-    # ── 7. Cross-agent domain data summary ──
-    try:
-        since_7d = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-        metrics = sb.table("daily_metrics") \
-            .select("channel,total_sessions,total_clicks,total_impressions,total_conversions,total_revenue,total_ad_spend") \
-            .gte("date", since_7d) \
-            .execute()
-        if metrics.data:
-            totals: Dict[str, float] = {"sessions": 0, "clicks": 0, "impressions": 0, "conversions": 0, "revenue": 0, "spend": 0}
-            for m in metrics.data:
-                totals["sessions"] += m.get("total_sessions", 0) or 0
-                totals["clicks"] += m.get("total_clicks", 0) or 0
-                totals["impressions"] += m.get("total_impressions", 0) or 0
-                totals["conversions"] += m.get("total_conversions", 0) or 0
-                totals["revenue"] += m.get("total_revenue", 0) or 0
-                totals["spend"] += m.get("total_ad_spend", 0) or 0
-            context_parts.append(
-                f"SYSTEMÖVERSIKT (7d): {int(totals['sessions'])} sessioner, "
-                f"{int(totals['clicks'])} klick, {int(totals['impressions'])} visn, "
-                f"{int(totals['conversions'])} konv, {totals['revenue']:.0f} SEK rev, "
-                f"{totals['spend']:.0f} SEK spend"
-            )
-    except Exception:
-        pass
+    # ── 7. All domain data (same data each agent sees) ──
+    for domain_agent in MARKETING_AGENTS:
+        try:
+            domain = await _get_domain_data(domain_agent)
+            if domain:
+                display = AGENT_NAME_MAP.get(domain_agent, domain_agent.upper())
+                context_parts.append(f"── {display} ({domain_agent.upper()}) DATA ──\n{domain}")
+        except Exception:
+            pass
 
     if not context_parts:
         return "(Inga systemdata tillgängliga ännu. Kör en health check eller generera agentrapporter.)"
@@ -783,9 +781,10 @@ Regler:
 - Om du inte vet svaret, var ärlig om det
 - Referera till din faktiska data och siffror när det är relevant — du HAR tillgång till dem
 - Håll dig till din personlighet och expertområde
-{f"- Du har FULL TILLGÅNG till systemet: agent actions (misslyckade/väntande/slutförda), OODA-cykler, larm, scheduler-jobb, metrics och agentrapporter" if agent_name == "dev" else "- Om frågan rör en annan agents domän, säg att du kan be rätt kollega svara"}
-{f"- Du kan se exakt vilka actions som fastnat, vilka cykler som failat, och vilka jobb som inte kört" if agent_name == "dev" else ""}
-{f"- Du kan prioritera, planera och föreslå konkreta tekniska lösningar baserat på faktisk systemdata" if agent_name == "dev" else ""}"""
+{f"- Du har FULL TILLGÅNG till systemet: alla agenters domändata, actions, OODA-cykler, larm, scheduler-jobb och rapporter" if agent_name == "dev" else "- Om frågan rör en annan agents domän, säg att du kan be rätt kollega svara"}
+{f"- Du kan se exakt vilka actions som fastnat, vilka cykler som failat, varje agents siffror, och vilka jobb som inte kört" if agent_name == "dev" else ""}
+{f"- Du kan AGERA: trigga OODA-cykler, retry:a misslyckade actions, köra health checks. Berätta vilka API-anrop som behövs." if agent_name == "dev" else ""}
+{f"- Du kan prioritera, planera och föreslå konkreta tekniska lösningar baserat på FAKTISK data från alla agenter" if agent_name == "dev" else ""}"""
 
     # Build message history for Claude
     messages = []

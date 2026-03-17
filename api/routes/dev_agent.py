@@ -1,14 +1,20 @@
 """
-Dev Agent API — system health checks and diagnostics
+Dev Agent API — system health checks, diagnostics, and FORGE operations
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional, List
 import logging
 
 from agents.dev_agent import dev_agent
+from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ── Health Checks ──────────────────────────────────────────────────────────
 
 
 @router.get("/health-check")
@@ -44,3 +50,198 @@ async def test_database_only():
 async def test_scheduler_only():
     """Test only scheduler status."""
     return dev_agent._test_scheduler()
+
+
+# ── OODA Cycle Triggers ───────────────────────────────────────────────────
+
+
+OODA_AGENTS = {
+    "seo": "api.routes.seo_analyze_ooda",
+    "content": "api.routes.content_analyze_ooda",
+    "ads": "api.routes.ads_analyze_ooda",
+    "social": "api.routes.social_analyze_ooda",
+    "reviews": "api.routes.reviews_analyze_ooda",
+}
+
+
+@router.post("/trigger-ooda/{agent_name}")
+async def trigger_ooda_cycle(agent_name: str, background_tasks: BackgroundTasks):
+    """Trigger an OODA cycle for a specific agent. Used by FORGE to kick agents into action."""
+    if agent_name not in OODA_AGENTS:
+        raise HTTPException(status_code=400, detail=f"Unknown agent: {agent_name}. Available: {list(OODA_AGENTS.keys())}")
+
+    module_path = OODA_AGENTS[agent_name]
+    func_name = f"_run_{agent_name}_ooda"
+
+    try:
+        import importlib
+        mod = importlib.import_module(module_path)
+        ooda_func = getattr(mod, func_name, None)
+        if not ooda_func:
+            # Try generic name
+            ooda_func = getattr(mod, "run_analyze", None) or getattr(mod, "analyze", None)
+        if not ooda_func:
+            raise HTTPException(status_code=500, detail=f"Could not find OODA function in {module_path}")
+
+        background_tasks.add_task(ooda_func)
+        logger.info(f"[dev-agent] Triggered OODA cycle for {agent_name}")
+        return {"success": True, "agent": agent_name, "message": f"OODA cycle started for {agent_name}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[dev-agent] Failed to trigger OODA for {agent_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/trigger-ooda-all")
+async def trigger_all_ooda_cycles(background_tasks: BackgroundTasks):
+    """Trigger OODA cycles for ALL agents. Full system analysis."""
+    results = {}
+    for agent_name, module_path in OODA_AGENTS.items():
+        func_name = f"_run_{agent_name}_ooda"
+        try:
+            import importlib
+            mod = importlib.import_module(module_path)
+            ooda_func = getattr(mod, func_name, None) or getattr(mod, "run_analyze", None)
+            if ooda_func:
+                background_tasks.add_task(ooda_func)
+                results[agent_name] = "started"
+            else:
+                results[agent_name] = "no_function_found"
+        except Exception as e:
+            results[agent_name] = f"error: {str(e)[:100]}"
+
+    logger.info(f"[dev-agent] Triggered OODA for all agents: {results}")
+    return {"success": True, "agents": results}
+
+
+# ── Action Management ─────────────────────────────────────────────────────
+
+
+@router.post("/actions/{action_id}/retry")
+async def retry_action(action_id: str):
+    """Reset a failed/stuck action back to pending so it can be retried."""
+    try:
+        sb = get_supabase()
+        result = sb.table("agent_actions") \
+            .update({"status": "pending", "error_message": None, "executed_at": None}) \
+            .eq("action_id", action_id) \
+            .execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+        logger.info(f"[dev-agent] Retried action {action_id}")
+        return {"success": True, "action_id": action_id, "new_status": "pending"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BulkRetryRequest(BaseModel):
+    agent_name: Optional[str] = None
+    status_filter: str = "failed"
+
+
+@router.post("/actions/retry-bulk")
+async def retry_bulk_actions(request: BulkRetryRequest):
+    """Retry all failed (or stuck) actions, optionally filtered by agent."""
+    try:
+        sb = get_supabase()
+        query = sb.table("agent_actions") \
+            .select("action_id,agent_name,title,status") \
+            .eq("status", request.status_filter)
+        if request.agent_name:
+            query = query.eq("agent_name", request.agent_name)
+        result = query.limit(100).execute()
+
+        if not result.data:
+            return {"success": True, "retried": 0, "message": f"No {request.status_filter} actions found"}
+
+        retried = 0
+        for action in result.data:
+            try:
+                sb.table("agent_actions") \
+                    .update({"status": "pending", "error_message": None, "executed_at": None}) \
+                    .eq("action_id", action["action_id"]) \
+                    .execute()
+                retried += 1
+            except Exception:
+                pass
+
+        logger.info(f"[dev-agent] Bulk retry: {retried} actions reset to pending")
+        return {"success": True, "retried": retried, "total_found": len(result.data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/actions/stuck")
+async def get_stuck_actions():
+    """Get actions that are stuck in pending for more than 24h or failed."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        sb = get_supabase()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        # Failed actions
+        failed = sb.table("agent_actions") \
+            .select("action_id,agent_name,title,status,priority,error_message,created_at") \
+            .eq("status", "failed") \
+            .order("created_at", desc=True) \
+            .limit(30) \
+            .execute()
+
+        # Stale pending (older than 24h)
+        stale = sb.table("agent_actions") \
+            .select("action_id,agent_name,title,status,priority,created_at") \
+            .eq("status", "pending") \
+            .lte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(30) \
+            .execute()
+
+        return {
+            "failed": failed.data or [],
+            "stale_pending": stale.data or [],
+            "total_failed": len(failed.data or []),
+            "total_stale": len(stale.data or []),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Error Logs ────────────────────────────────────────────────────────────
+
+
+@router.get("/error-log")
+async def get_error_log():
+    """Get recent errors across all agents — actions with error_message set."""
+    try:
+        sb = get_supabase()
+        from datetime import datetime, timezone, timedelta
+        since = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+
+        result = sb.table("agent_actions") \
+            .select("action_id,agent_name,title,action_type,error_message,status,created_at,executed_at") \
+            .neq("error_message", None) \
+            .gte("created_at", since) \
+            .order("created_at", desc=True) \
+            .limit(50) \
+            .execute()
+
+        # Also get failed OODA cycles
+        cycles = sb.table("agent_cycles") \
+            .select("agent_name,status,error_message,created_at") \
+            .eq("status", "failed") \
+            .gte("created_at", since) \
+            .order("created_at", desc=True) \
+            .limit(20) \
+            .execute()
+
+        return {
+            "action_errors": result.data or [],
+            "cycle_errors": cycles.data or [],
+            "total_action_errors": len(result.data or []),
+            "total_cycle_errors": len(cycles.data or []),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
