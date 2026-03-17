@@ -181,15 +181,18 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
         # Fallback: generate a basic report from stats
         report_data = _fallback_report(agent_name, stats, errors)
 
+    now = datetime.now(timezone.utc).isoformat()
     report = {
         "agent": agent_name,
+        "agent_name": agent_name,
         "stats": stats,
         "summary": report_data.get("summary", ""),
         "highlights": report_data.get("highlights", []),
         "problems": report_data.get("problems", []),
         "improvements": report_data.get("improvements", []),
         "ux_suggestions": report_data.get("ux_suggestions", []),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": now,
+        "created_at": now,
     }
 
     # Persist to Supabase
@@ -258,10 +261,12 @@ async def generate_all_reports() -> List[Dict[str, Any]]:
             logger.warning(f"[agent-report] Failed to generate report for {agent_name}: {e}")
             reports.append({
                 "agent": agent_name,
+                "agent_name": agent_name,
                 "summary": f"Kunde inte generera rapport: {e}",
                 "highlights": [],
                 "problems": [str(e)],
                 "improvements": [],
+                "ux_suggestions": [],
                 "stats": {},
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             })
