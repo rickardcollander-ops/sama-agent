@@ -152,7 +152,8 @@ Svara i JSON-format:
   "summary": "2-3 meningar som sammanfattar vad du gjort",
   "highlights": ["lista med de viktigaste sakerna du gjort (max 5)"],
   "problems": ["lista med problem eller fel som uppstått (max 5)"],
-  "improvements": ["konkreta förslag på vad som behöver förbättras i systemet för att du ska kunna göra ett bättre jobb (max 5). Var specifik — nämn API:er som saknas, data som fattas, funktionalitet som behöver byggas, etc."]
+  "improvements": ["konkreta förslag på vad som behöver förbättras i systemet för att du ska kunna göra ett bättre jobb (max 5). Var specifik — nämn API:er som saknas, data som fattas, funktionalitet som behöver byggas, etc."],
+  "ux_suggestions": ["konkreta UX-förbättringsförslag för dashboarden och användarupplevelsen (max 5). Tänk på: vilken data borde visas bättre? Vilka knappar/vyer saknas? Vad gör det svårt för en människa att förstå vad du gör? Vilka visualiseringar skulle hjälpa?"]
 }}
 
 Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föreslå förbättringar ändå baserat på din roll."""
@@ -174,7 +175,7 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
         if start >= 0 and end > start:
             report_data = json.loads(text[start:end])
         else:
-            report_data = {"summary": text, "highlights": [], "problems": [], "improvements": []}
+            report_data = {"summary": text, "highlights": [], "problems": [], "improvements": [], "ux_suggestions": []}
     except Exception as e:
         logger.warning(f"[agent-report] Claude call failed for {agent_name}: {e}")
         # Fallback: generate a basic report from stats
@@ -187,6 +188,7 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
         "highlights": report_data.get("highlights", []),
         "problems": report_data.get("problems", []),
         "improvements": report_data.get("improvements", []),
+        "ux_suggestions": report_data.get("ux_suggestions", []),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -222,6 +224,7 @@ def _fallback_report(agent_name: str, stats: Dict, errors: List) -> Dict:
         "highlights": highlights,
         "problems": problems,
         "improvements": improvements,
+        "ux_suggestions": [],
     }
 
 
@@ -235,6 +238,7 @@ async def _save_report(report: Dict[str, Any]):
             "highlights": report["highlights"],
             "problems": report["problems"],
             "improvements": report["improvements"],
+            "ux_suggestions": report.get("ux_suggestions", []),
             "stats": report["stats"],
             "created_at": report["generated_at"],
         }).execute()
@@ -293,7 +297,9 @@ async def get_all_improvements() -> List[Dict[str, str]]:
     for r in reports:
         agent = r.get("agent_name", "unknown")
         for item in r.get("improvements", []):
-            improvements.append({"agent": agent, "suggestion": item})
+            improvements.append({"agent": agent, "type": "system", "suggestion": item})
         for item in r.get("problems", []):
-            improvements.append({"agent": agent, "problem": item})
+            improvements.append({"agent": agent, "type": "problem", "problem": item})
+        for item in r.get("ux_suggestions", []):
+            improvements.append({"agent": agent, "type": "ux", "suggestion": item})
     return improvements

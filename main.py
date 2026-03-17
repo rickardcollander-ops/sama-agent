@@ -15,7 +15,7 @@ from api.routes import (
     seo, content, ads, social, reviews, analytics, orchestrator, automation,
     seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts, improvements,
     ai_visibility, dashboard, social_reddit, gtm, goals, notifications, dev_agent,
-    agent_reports
+    agent_reports, agent_chat
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -170,6 +170,7 @@ app.include_router(goals.router, prefix="/api", tags=["goals"])
 app.include_router(notifications.router, prefix="/api", tags=["notifications"])
 app.include_router(dev_agent.router, prefix="/api/dev-agent", tags=["dev-agent"])
 app.include_router(agent_reports.router, prefix="/api/agents", tags=["agent-reports"])
+app.include_router(agent_chat.router, prefix="/api/agents", tags=["agent-chat"])
 
 
 @app.get("/")
