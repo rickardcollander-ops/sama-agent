@@ -29,29 +29,41 @@ class UpdateProgressRequest(BaseModel):
 @router.get("/goals")
 async def list_goals(agent: Optional[str] = None):
     """List all active goals, optionally filtered by agent."""
-    goals = await goal_tracker.get_active_goals(agent)
-    # Enrich with status
-    enriched = []
-    for g in goals:
-        status = await goal_tracker.check_goal_status(g)
-        enriched.append({**g, "progress_status": status})
-    return {"goals": enriched, "total": len(enriched)}
+    try:
+        goals = await goal_tracker.get_active_goals(agent)
+        enriched = []
+        for g in goals:
+            try:
+                status = await goal_tracker.check_goal_status(g)
+                enriched.append({**g, "progress_status": status})
+            except Exception:
+                enriched.append({**g, "progress_status": "unknown"})
+        return {"goals": enriched, "total": len(enriched)}
+    except Exception as e:
+        logger.warning(f"[goals] list_goals failed: {e}")
+        return {"goals": [], "total": 0, "error": str(e)}
 
 
 @router.post("/goals")
 async def create_goal(req: CreateGoalRequest):
     """Create a new goal."""
-    goal = await goal_tracker.create_goal(
-        goal_text=req.goal_text,
-        target_metric=req.target_metric,
-        target_value=req.target_value,
-        baseline_value=req.baseline_value,
-        deadline=req.deadline,
-        owner_agent=req.owner_agent,
-    )
-    if not goal:
-        raise HTTPException(status_code=500, detail="Failed to create goal")
-    return {"success": True, "goal": goal}
+    try:
+        goal = await goal_tracker.create_goal(
+            goal_text=req.goal_text,
+            target_metric=req.target_metric,
+            target_value=req.target_value,
+            baseline_value=req.baseline_value,
+            deadline=req.deadline,
+            owner_agent=req.owner_agent,
+        )
+        if not goal:
+            raise HTTPException(status_code=500, detail="Failed to create goal — check that agent_goals table exists in Supabase")
+        return {"success": True, "goal": goal}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"[goals] create_goal failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create goal: {e}")
 
 
 @router.patch("/goals/{goal_id}/progress")

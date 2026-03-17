@@ -515,6 +515,86 @@ async def _save_message(conversation_id: str, agent_name: str, role: str, conten
         logger.debug(f"[agent-chat] Could not save message: {e}")
 
 
+async def get_conversations(mode: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    List recent conversations grouped by conversation_id.
+    mode: "team" to get team conversations, agent key (e.g. "seo") for 1:1, or None for all.
+    Returns: [{conversation_id, mode, last_message, last_agent, updated_at, message_count}]
+    """
+    try:
+        sb = get_supabase()
+        # Get recent messages grouped by conversation
+        query = sb.table("agent_chat_messages") \
+            .select("conversation_id,agent_name,role,content,created_at") \
+            .order("created_at", desc=True) \
+            .limit(200)
+        result = query.execute()
+
+        if not result.data:
+            return []
+
+        # Group by conversation_id
+        convos: Dict[str, Dict] = {}
+        for msg in result.data:
+            cid = msg["conversation_id"]
+            if cid not in convos:
+                # Determine mode from conversation_id prefix
+                conv_mode = "team" if cid.startswith("team_") else (
+                    "broadcast" if cid.startswith("broadcast_") else "direct"
+                )
+                convos[cid] = {
+                    "conversation_id": cid,
+                    "mode": conv_mode,
+                    "last_message": "",
+                    "last_agent": "",
+                    "updated_at": msg["created_at"],
+                    "message_count": 0,
+                    "agents": set(),
+                }
+            convos[cid]["message_count"] += 1
+            if msg.get("agent_name") and msg["agent_name"] != "team":
+                convos[cid]["agents"].add(msg["agent_name"])
+            # First message in desc order = most recent
+            if not convos[cid]["last_message"]:
+                convos[cid]["last_message"] = msg["content"][:100]
+                convos[cid]["last_agent"] = msg.get("agent_name", "")
+
+        # Filter by mode if requested
+        items = list(convos.values())
+        if mode == "team":
+            items = [c for c in items if c["mode"] == "team"]
+        elif mode and mode != "all":
+            items = [c for c in items if c["mode"] == "direct" and mode in c["agents"]]
+
+        # Convert sets to lists for JSON serialization
+        for item in items:
+            item["agents"] = sorted(item["agents"])
+
+        # Sort by most recent first
+        items.sort(key=lambda x: x["updated_at"], reverse=True)
+        return items[:20]  # Max 20 conversations
+
+    except Exception as e:
+        logger.warning(f"[agent-chat] Could not list conversations: {e}")
+        return []
+
+
+async def get_chat_messages(conversation_id: str) -> List[Dict[str, Any]]:
+    """Get all messages for a conversation (public API)."""
+    try:
+        sb = get_supabase()
+        result = sb.table("agent_chat_messages") \
+            .select("id,conversation_id,agent_name,role,content,created_at") \
+            .eq("conversation_id", conversation_id) \
+            .order("created_at", desc=False) \
+            .limit(100) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        logger.warning(f"[agent-chat] Could not fetch messages: {e}")
+        return []
+
+
 # ── Single Agent Chat ───────────────────────────────────────────────────────
 
 async def chat_with_agent(
