@@ -205,8 +205,7 @@ FORGE_TOOL_LABELS: Dict[str, str] = {
     "get_github_commits": "GitHub commits",
 }
 
-import os as _os
-_FORGE_API_BASE = f"http://localhost:{_os.getenv('PORT', '8000')}"
+_FORGE_API_BASE = settings.SAMA_API_URL
 
 
 async def _execute_forge_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:

@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     SUCCESSIFIER_CMS_API_URL: str = "https://successifier.com/api"
     SUCCESSIFIER_CMS_API_KEY: str = ""
 
+    # SAMA API (self-reference for FORGE tool calls)
+    SAMA_API_URL: str = "https://web-production-5324a.up.railway.app"
+
     # AI Model
     CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
 
