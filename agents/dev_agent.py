@@ -17,67 +17,66 @@ from typing import Dict, Any, List, Optional
 logger = logging.getLogger(__name__)
 
 # All known API endpoints grouped by agent/module
+# IMPORTANT: These must match actual route definitions — no phantom endpoints!
 ENDPOINT_REGISTRY: List[Dict[str, Any]] = [
     # Health
     {"method": "GET", "path": "/", "name": "root_health", "critical": True},
     {"method": "GET", "path": "/health", "name": "health_check", "critical": True},
 
     # Dashboard
-    {"method": "GET", "path": "/api/dashboard/summary", "name": "dashboard_summary", "critical": True},
-    {"method": "GET", "path": "/api/dashboard/events", "name": "dashboard_events"},
-    {"method": "GET", "path": "/api/dashboard/agent-status", "name": "agent_status"},
+    {"method": "GET", "path": "/api/dashboard/status", "name": "dashboard_status", "critical": True},
+    {"method": "GET", "path": "/api/dashboard/pending-actions", "name": "dashboard_pending_actions"},
+    {"method": "GET", "path": "/api/dashboard/recommendations", "name": "dashboard_recommendations"},
 
     # Orchestrator
     {"method": "GET", "path": "/api/orchestrator/status", "name": "orchestrator_status", "critical": True},
 
     # SEO
-    {"method": "GET", "path": "/api/seo/keywords", "name": "seo_keywords", "critical": True},
+    {"method": "GET", "path": "/api/seo/status", "name": "seo_status", "critical": True},
+    {"method": "GET", "path": "/api/seo/keywords", "name": "seo_keywords"},
     {"method": "GET", "path": "/api/seo/audits", "name": "seo_audits"},
-    {"method": "GET", "path": "/api/seo/backlinks", "name": "seo_backlinks"},
-    {"method": "GET", "path": "/api/seo/competitors", "name": "seo_competitors"},
-    {"method": "GET", "path": "/api/seo/serp-features", "name": "seo_serp"},
 
     # Content
-    {"method": "GET", "path": "/api/content/pieces", "name": "content_pieces", "critical": True},
-    {"method": "GET", "path": "/api/content/analytics", "name": "content_analytics"},
+    {"method": "GET", "path": "/api/content/status", "name": "content_status", "critical": True},
+    {"method": "GET", "path": "/api/content/library", "name": "content_library"},
 
     # Ads
+    {"method": "GET", "path": "/api/ads/status", "name": "ads_status"},
     {"method": "GET", "path": "/api/ads/campaigns", "name": "ads_campaigns"},
-    {"method": "GET", "path": "/api/ads/performance", "name": "ads_performance"},
-    {"method": "GET", "path": "/api/ads/budget", "name": "ads_budget"},
 
     # Social
-    {"method": "GET", "path": "/api/social/posts", "name": "social_posts"},
-    {"method": "GET", "path": "/api/social/reddit/posts", "name": "social_reddit"},
+    {"method": "GET", "path": "/api/social/status", "name": "social_status"},
+    {"method": "GET", "path": "/api/social/content-calendar", "name": "social_calendar"},
 
     # Reviews
-    {"method": "GET", "path": "/api/reviews", "name": "reviews_list"},
-    {"method": "GET", "path": "/api/reviews/summary", "name": "reviews_summary"},
+    {"method": "GET", "path": "/api/reviews/status", "name": "reviews_status"},
+    {"method": "GET", "path": "/api/reviews/recent", "name": "reviews_recent"},
 
     # Analytics
-    {"method": "GET", "path": "/api/analytics/daily-metrics", "name": "analytics_daily", "critical": True},
-    {"method": "GET", "path": "/api/analytics/channel-breakdown", "name": "analytics_channels"},
+    {"method": "GET", "path": "/api/analytics/status", "name": "analytics_status", "critical": True},
+    {"method": "GET", "path": "/api/analytics/metrics", "name": "analytics_metrics"},
+    {"method": "GET", "path": "/api/analytics/channels", "name": "analytics_channels"},
 
     # AI Visibility
-    {"method": "GET", "path": "/api/ai-visibility/latest", "name": "ai_visibility"},
+    {"method": "GET", "path": "/api/ai-visibility/status", "name": "ai_visibility_status"},
 
     # Alerts
-    {"method": "GET", "path": "/api/alerts", "name": "alerts_list"},
+    {"method": "GET", "path": "/api/alerts/pending", "name": "alerts_pending"},
 
     # Automation
-    {"method": "GET", "path": "/api/automation/jobs", "name": "automation_jobs"},
+    {"method": "GET", "path": "/api/automation/status", "name": "automation_status"},
 
     # Goals
     {"method": "GET", "path": "/api/goals", "name": "goals_list"},
 
     # Notifications
-    {"method": "GET", "path": "/api/notifications?limit=5&unread_only=false", "name": "notifications_list"},
+    {"method": "GET", "path": "/api/notifications", "name": "notifications_list"},
 
     # GTM
-    {"method": "GET", "path": "/api/gtm/strategy", "name": "gtm_strategy"},
+    {"method": "GET", "path": "/api/gtm/status", "name": "gtm_status"},
 
-    # Improvements
-    {"method": "GET", "path": "/api/improvements", "name": "improvements_list"},
+    # Agent Reports
+    {"method": "GET", "path": "/api/agents/reports", "name": "agent_reports"},
 ]
 
 # Supabase tables that should exist
@@ -95,8 +94,12 @@ class DevAgent:
     Runs daily via scheduler and can be triggered on-demand via API.
     """
 
-    def __init__(self, base_url: str = "http://localhost:8000"):
-        self.base_url = base_url
+    def __init__(self, base_url: str | None = None):
+        if base_url is None:
+            from shared.config import settings
+            self.base_url = settings.SAMA_API_URL
+        else:
+            self.base_url = base_url
         self._last_report: Optional[Dict[str, Any]] = None
 
     async def run_full_health_check(self) -> Dict[str, Any]:
