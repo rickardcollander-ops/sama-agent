@@ -196,7 +196,12 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
     }
 
     # Persist to Supabase
-    await _save_report(report)
+    saved = await _save_report(report)
+    report["saved"] = saved
+    if not saved:
+        report.setdefault("problems", []).append(
+            f"Rapporten kunde inte sparas i databasen: {report.get('_save_error', 'okänt fel')}"
+        )
 
     return report
 
@@ -231,22 +236,29 @@ def _fallback_report(agent_name: str, stats: Dict, errors: List) -> Dict:
     }
 
 
-async def _save_report(report: Dict[str, Any]):
+async def _save_report(report: Dict[str, Any]) -> bool:
     """Save report to Supabase for history and dev agent consumption."""
+    from uuid import uuid4
     try:
         sb = get_supabase()
-        sb.table("agent_reports").insert({
+        row = {
+            "id": str(uuid4()),
             "agent_name": report["agent"],
-            "summary": report["summary"],
-            "highlights": report["highlights"],
-            "problems": report["problems"],
-            "improvements": report["improvements"],
+            "summary": report.get("summary", ""),
+            "highlights": report.get("highlights", []),
+            "problems": report.get("problems", []),
+            "improvements": report.get("improvements", []),
             "ux_suggestions": report.get("ux_suggestions", []),
-            "stats": report["stats"],
-            "created_at": report["generated_at"],
-        }).execute()
+            "stats": report.get("stats", {}),
+        }
+        result = sb.table("agent_reports").insert(row).execute()
+        logger.info(f"[agent-report] Saved report for {report['agent']}")
+        return True
     except Exception as e:
-        logger.debug(f"[agent-report] Could not save report: {e}")
+        logger.warning(f"[agent-report] FAILED to save report for {report.get('agent', '?')}: {e}")
+        # Store the error on the report so frontend can see it
+        report["_save_error"] = str(e)
+        return False
 
 
 async def generate_all_reports() -> List[Dict[str, Any]]:
@@ -288,7 +300,7 @@ async def get_latest_reports() -> List[Dict[str, Any]]:
             if result.data:
                 reports.append(result.data[0])
     except Exception as e:
-        logger.debug(f"[agent-report] Could not fetch reports: {e}")
+        logger.warning(f"[agent-report] Could not fetch reports: {e}")
     return reports
 
 
