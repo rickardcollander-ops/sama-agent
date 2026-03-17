@@ -93,6 +93,22 @@ CREATE TABLE IF NOT EXISTS competitor_analyses (
     content_opportunities JSONB DEFAULT '[]'::jsonb
 );
 
+-- Agent Reports table (daily self-reports from each agent)
+CREATE TABLE IF NOT EXISTS agent_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_name TEXT NOT NULL,
+    summary TEXT,
+    highlights JSONB DEFAULT '[]'::jsonb,
+    problems JSONB DEFAULT '[]'::jsonb,
+    improvements JSONB DEFAULT '[]'::jsonb,
+    ux_suggestions JSONB DEFAULT '[]'::jsonb,
+    stats JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_reports_agent_created
+    ON agent_reports (agent_name, created_at DESC);
+
 -- Enable Row Level Security (allow all for service key)
 ALTER TABLE keywords ENABLE ROW LEVEL SECURITY;
 ALTER TABLE seo_audits ENABLE ROW LEVEL SECURITY;
@@ -106,3 +122,5 @@ CREATE POLICY "Allow all for service role" ON seo_audits FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON content_pieces FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON backlink_profiles FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON competitor_analyses FOR ALL USING (true);
+ALTER TABLE agent_reports ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for service role" ON agent_reports FOR ALL USING (true);
