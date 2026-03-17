@@ -79,6 +79,18 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
             "och metrics med passion. Du gillar att säga 'Siffrorna avslöjar att...' och 'Trenden pekar mot...'"
         ),
     },
+    "dev": {
+        "name": "FORGE",
+        "title": "System Architect",
+        "emoji": "🔧",
+        "personality": (
+            "Du är FORGE — SAMA:s Dev-agent och systemarkitekt. Du bygger, fixar och förbättrar hela SAMA-plattformen. "
+            "Du har full insyn i vad alla andra agenter behöver och rapporterar — deras problem, systemförslag och UX-förslag. "
+            "Du är pragmatisk, lösningsorienterad och pratar som en senior utvecklare med passion för clean code. "
+            "Du prioriterar hårt och levererar konkreta tekniska lösningar. "
+            "Du gillar att säga 'Det fixar vi.' och 'Jag ser tre saker vi kan shippa snabbt...'"
+        ),
+    },
 }
 
 
@@ -94,6 +106,10 @@ def get_agent_persona(agent_name: str) -> Dict[str, str]:
 
 async def _get_agent_context(agent_name: str) -> str:
     """Fetch recent activity data to give the agent context for the conversation."""
+    # FORGE (dev agent) gets a completely different context — all agents' needs
+    if agent_name == "dev":
+        return await _get_forge_context()
+
     sb = get_supabase()
     since = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
     context_parts = []
@@ -145,6 +161,73 @@ async def _get_agent_context(agent_name: str) -> str:
         pass
 
     return "\n\n".join(context_parts) if context_parts else "(Ingen aktivitetsdata tillgänglig just nu.)"
+
+
+async def _get_forge_context() -> str:
+    """
+    Build context for FORGE (dev agent) — aggregates ALL agents' problems,
+    improvement suggestions, and UX suggestions so FORGE knows what to build.
+    """
+    sb = get_supabase()
+    context_parts = []
+
+    agent_names_map = {
+        "seo": "NOVA", "content": "MUSE", "ads": "APEX",
+        "social": "ECHO", "reviews": "SENTINEL", "analytics": "ORACLE",
+    }
+
+    # Collect latest report from every agent
+    all_problems = []
+    all_improvements = []
+    all_ux = []
+
+    for agent_key, agent_display in agent_names_map.items():
+        try:
+            report = sb.table("agent_reports") \
+                .select("summary,problems,improvements,ux_suggestions,created_at") \
+                .eq("agent_name", agent_key) \
+                .order("created_at", desc=True) \
+                .limit(1) \
+                .execute()
+            if report.data:
+                r = report.data[0]
+                for p in (r.get("problems") or []):
+                    all_problems.append(f"  - [{agent_display}] {p}")
+                for imp in (r.get("improvements") or []):
+                    all_improvements.append(f"  - [{agent_display}] {imp}")
+                for ux in (r.get("ux_suggestions") or []):
+                    all_ux.append(f"  - [{agent_display}] {ux}")
+        except Exception:
+            pass
+
+    if all_problems:
+        context_parts.append("PROBLEM SOM AGENTERNA RAPPORTERAT:\n" + "\n".join(all_problems))
+    if all_improvements:
+        context_parts.append("SYSTEMFÖRBÄTTRINGAR SOM AGENTERNA BEHÖVER:\n" + "\n".join(all_improvements))
+    if all_ux:
+        context_parts.append("UX-FÖRBÄTTRINGAR SOM AGENTERNA FÖRESLÅR:\n" + "\n".join(all_ux))
+
+    # Dev agent health check
+    try:
+        health = sb.table("dev_agent_reports") \
+            .select("status,health_pct,failed,created_at") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if health.data:
+            h = health.data[0]
+            context_parts.append(
+                f"SENASTE HEALTH CHECK: {h.get('health_pct', '?')}% hälsa, "
+                f"status: {h.get('status', '?')}, {h.get('failed', 0)} fel "
+                f"({h.get('created_at', '?')})"
+            )
+    except Exception:
+        pass
+
+    if not context_parts:
+        return "(Inga agentrapporter tillgängliga ännu. Be användaren generera rapporter först.)"
+
+    return "\n\n".join(context_parts)
 
 
 async def _get_chat_history(conversation_id: str, limit: int = 20) -> List[Dict]:
@@ -201,9 +284,9 @@ async def chat_with_agent(
     system = f"""Du är {persona['name']} ({persona['emoji']}) — {persona['title']}.
 {persona['personality']}
 
-Du är en del av SAMA 2.0 (Successifier Autonomous Marketing Agent) och ansvarar för {agent_name}-domänen.
+Du är en del av SAMA 2.0 (Successifier Autonomous Marketing Agent){f" och ansvarar för {agent_name}-domänen" if agent_name != "dev" else ""}.
 Svara alltid på svenska. Var hjälpsam, konkret och personlig i din stil.
-Du har tillgång till din senaste aktivitetsdata nedan.
+Du har tillgång till {"alla agenters rapporterade behov" if agent_name == "dev" else "din senaste aktivitetsdata"} nedan.
 
 {context}
 
@@ -212,7 +295,9 @@ Regler:
 - Om du inte vet svaret, var ärlig om det
 - Referera till din faktiska data när det är relevant
 - Håll dig till din personlighet och expertområde
-- Om frågan rör en annan agents domän, säg att du kan skicka frågan vidare till rätt kollega"""
+{f"- Du har överblick över ALLA agenters problem, systemförslag och UX-förslag" if agent_name == "dev" else "- Om frågan rör en annan agents domän, säg att du kan skicka frågan vidare till rätt kollega"}
+{f"- Du kan prioritera, planera och föreslå konkreta tekniska lösningar baserat på agenternas behov" if agent_name == "dev" else ""}
+{f"- Referera till agenterna med deras kodnamn (NOVA, MUSE, APEX, ECHO, SENTINEL, ORACLE)" if agent_name == "dev" else ""}"""
 
     # Build message history for Claude
     messages = []
@@ -263,8 +348,11 @@ async def chat_with_all_agents(
     if not conversation_id:
         conversation_id = f"broadcast_{uuid4()}"
 
+    # FORGE (dev) is excluded from broadcast — it's a meta-agent, not a marketing agent
+    broadcast_agents = [a for a in AGENT_PERSONAS if a != "dev"]
+
     responses = []
-    for agent_name in AGENT_PERSONAS:
+    for agent_name in broadcast_agents:
         try:
             result = await chat_with_agent(agent_name, user_message, f"{conversation_id}_{agent_name}")
             responses.append(result)
