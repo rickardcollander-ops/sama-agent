@@ -424,10 +424,12 @@ async def _get_agent_context(agent_name: str) -> str:
 
 
 async def _get_forge_context() -> str:
-    """Build context for FORGE — aggregates ALL agents' problems and needs."""
+    """Build context for FORGE — full system access across all agents."""
     sb = get_supabase()
     context_parts = []
+    since_72h = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
 
+    # ── 1. Agent reports: problems, improvements, UX suggestions ──
     all_problems = []
     all_improvements = []
     all_ux = []
@@ -460,6 +462,97 @@ async def _get_forge_context() -> str:
     if all_ux:
         context_parts.append("UX-FÖRBÄTTRINGAR SOM AGENTERNA FÖRESLÅR:\n" + "\n".join(all_ux))
 
+    # ── 2. Agent actions: stuck, failed, pending across all agents ──
+    try:
+        actions = sb.table("agent_actions") \
+            .select("agent_name,action_type,title,status,priority,error_message,created_at") \
+            .gte("created_at", since_72h) \
+            .order("created_at", desc=True) \
+            .limit(50) \
+            .execute()
+        if actions.data:
+            by_status: Dict[str, list] = {"failed": [], "pending": [], "completed": []}
+            for a in actions.data:
+                s = a.get("status", "?")
+                bucket = by_status.get(s, by_status.get("pending"))
+                if bucket is not None:
+                    bucket.append(a)
+
+            action_lines = []
+            if by_status["failed"]:
+                action_lines.append(f"  MISSLYCKADE ({len(by_status['failed'])}):")
+                for a in by_status["failed"][:8]:
+                    err = f" — FEL: {a['error_message'][:80]}" if a.get("error_message") else ""
+                    action_lines.append(f"    - [{a.get('agent_name', '?')}] {a.get('title', '?')} ({a.get('priority', '?')}){err}")
+            if by_status["pending"]:
+                action_lines.append(f"  VÄNTANDE ({len(by_status['pending'])}):")
+                for a in by_status["pending"][:8]:
+                    action_lines.append(f"    - [{a.get('agent_name', '?')}] {a.get('title', '?')} ({a.get('priority', '?')})")
+            action_lines.append(f"  SLUTFÖRDA: {len(by_status['completed'])} st")
+
+            context_parts.append("AGENT ACTIONS (senaste 72h):\n" + "\n".join(action_lines))
+    except Exception:
+        pass
+
+    # ── 3. OODA-cykler: status per agent ──
+    try:
+        cycles = sb.table("agent_cycles") \
+            .select("agent_name,status,error_message,created_at,completed_at") \
+            .gte("created_at", since_72h) \
+            .order("created_at", desc=True) \
+            .limit(30) \
+            .execute()
+        if cycles.data:
+            cycle_summary: Dict[str, Dict[str, int]] = {}
+            for c in cycles.data:
+                agent = c.get("agent_name", "?")
+                if agent not in cycle_summary:
+                    cycle_summary[agent] = {"completed": 0, "failed": 0, "running": 0}
+                s = c.get("status", "?")
+                if s == "completed":
+                    cycle_summary[agent]["completed"] += 1
+                elif s == "failed":
+                    cycle_summary[agent]["failed"] += 1
+                else:
+                    cycle_summary[agent]["running"] += 1
+
+            cycle_lines = []
+            for agent, counts in sorted(cycle_summary.items()):
+                display = AGENT_NAME_MAP.get(agent, agent.upper())
+                parts = []
+                if counts["completed"]:
+                    parts.append(f"{counts['completed']} ok")
+                if counts["failed"]:
+                    parts.append(f"{counts['failed']} fel")
+                if counts["running"]:
+                    parts.append(f"{counts['running']} pågår")
+                cycle_lines.append(f"  - {display}: {', '.join(parts)}")
+
+            context_parts.append("OODA-CYKLER (72h):\n" + "\n".join(cycle_lines))
+    except Exception:
+        pass
+
+    # ── 4. Alerts across all agents ──
+    try:
+        alerts = sb.table("alerts") \
+            .select("agent,type,severity,title,message,status,created_at") \
+            .gte("created_at", since_72h) \
+            .order("created_at", desc=True) \
+            .limit(15) \
+            .execute()
+        if alerts.data:
+            alert_lines = []
+            for a in alerts.data:
+                display = AGENT_NAME_MAP.get(a.get("agent", ""), a.get("agent", "?"))
+                alert_lines.append(
+                    f"  - [{a.get('severity', '?')}] [{display}] {a.get('title', '?')}: "
+                    f"{(a.get('message') or '')[:100]}"
+                )
+            context_parts.append("LARM (72h):\n" + "\n".join(alert_lines))
+    except Exception:
+        pass
+
+    # ── 5. Health check ──
     try:
         health = sb.table("dev_agent_reports") \
             .select("status,health_pct,failed,created_at") \
@@ -476,8 +569,48 @@ async def _get_forge_context() -> str:
     except Exception:
         pass
 
+    # ── 6. Scheduler job status ──
+    try:
+        from shared.scheduler import get_job_history
+        history = get_job_history()
+        if history:
+            sched_lines = []
+            for job_id, info in history.items():
+                status = info.get("last_status", "?")
+                last_run = info.get("last_run", "aldrig")
+                err = f" — FEL: {info['last_error'][:60]}" if info.get("last_error") else ""
+                sched_lines.append(f"  - {job_id}: {status} (senast: {last_run}){err}")
+            context_parts.append("SCHEDULER-JOBB:\n" + "\n".join(sched_lines))
+    except Exception:
+        pass
+
+    # ── 7. Cross-agent domain data summary ──
+    try:
+        since_7d = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        metrics = sb.table("daily_metrics") \
+            .select("channel,total_sessions,total_clicks,total_impressions,total_conversions,total_revenue,total_ad_spend") \
+            .gte("date", since_7d) \
+            .execute()
+        if metrics.data:
+            totals: Dict[str, float] = {"sessions": 0, "clicks": 0, "impressions": 0, "conversions": 0, "revenue": 0, "spend": 0}
+            for m in metrics.data:
+                totals["sessions"] += m.get("total_sessions", 0) or 0
+                totals["clicks"] += m.get("total_clicks", 0) or 0
+                totals["impressions"] += m.get("total_impressions", 0) or 0
+                totals["conversions"] += m.get("total_conversions", 0) or 0
+                totals["revenue"] += m.get("total_revenue", 0) or 0
+                totals["spend"] += m.get("total_ad_spend", 0) or 0
+            context_parts.append(
+                f"SYSTEMÖVERSIKT (7d): {int(totals['sessions'])} sessioner, "
+                f"{int(totals['clicks'])} klick, {int(totals['impressions'])} visn, "
+                f"{int(totals['conversions'])} konv, {totals['revenue']:.0f} SEK rev, "
+                f"{totals['spend']:.0f} SEK spend"
+            )
+    except Exception:
+        pass
+
     if not context_parts:
-        return "(Inga agentrapporter tillgängliga ännu. Be användaren generera rapporter först.)"
+        return "(Inga systemdata tillgängliga ännu. Kör en health check eller generera agentrapporter.)"
 
     return "\n\n".join(context_parts)
 
@@ -640,7 +773,7 @@ Regler för teammötet:
 
 Du är en del av SAMA 2.0 (Successifier Autonomous Marketing Agent){f" och ansvarar för {agent_name}-domänen" if agent_name != "dev" else ""}.
 Svara alltid på svenska. Var hjälpsam, konkret och personlig i din stil.
-Du har tillgång till {"alla agenters rapporterade behov" if agent_name == "dev" else "din domändata och senaste aktivitet"} nedan.
+Du har tillgång till {"FULL SYSTEMÖVERSIKT: alla agenters actions, OODA-cykler, larm, schemalagda jobb, domänmetrics och rapporterade behov" if agent_name == "dev" else "din domändata och senaste aktivitet"} nedan.
 
 {context}
 {team_rules}
@@ -650,8 +783,9 @@ Regler:
 - Om du inte vet svaret, var ärlig om det
 - Referera till din faktiska data och siffror när det är relevant — du HAR tillgång till dem
 - Håll dig till din personlighet och expertområde
-{f"- Du har överblick över ALLA agenters problem, systemförslag och UX-förslag" if agent_name == "dev" else "- Om frågan rör en annan agents domän, säg att du kan be rätt kollega svara"}
-{f"- Du kan prioritera, planera och föreslå konkreta tekniska lösningar baserat på agenternas behov" if agent_name == "dev" else ""}"""
+{f"- Du har FULL TILLGÅNG till systemet: agent actions (misslyckade/väntande/slutförda), OODA-cykler, larm, scheduler-jobb, metrics och agentrapporter" if agent_name == "dev" else "- Om frågan rör en annan agents domän, säg att du kan be rätt kollega svara"}
+{f"- Du kan se exakt vilka actions som fastnat, vilka cykler som failat, och vilka jobb som inte kört" if agent_name == "dev" else ""}
+{f"- Du kan prioritera, planera och föreslå konkreta tekniska lösningar baserat på faktisk systemdata" if agent_name == "dev" else ""}"""
 
     # Build message history for Claude
     messages = []
