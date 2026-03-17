@@ -71,17 +71,15 @@ async def trigger_ooda_cycle(agent_name: str, background_tasks: BackgroundTasks)
         raise HTTPException(status_code=400, detail=f"Unknown agent: {agent_name}. Available: {list(OODA_AGENTS.keys())}")
 
     module_path = OODA_AGENTS[agent_name]
-    func_name = f"_run_{agent_name}_ooda"
+    # Actual function names: run_seo_analysis_with_ooda, run_content_analysis_with_ooda, etc.
+    func_name = f"run_{agent_name}_analysis_with_ooda"
 
     try:
         import importlib
         mod = importlib.import_module(module_path)
         ooda_func = getattr(mod, func_name, None)
         if not ooda_func:
-            # Try generic name
-            ooda_func = getattr(mod, "run_analyze", None) or getattr(mod, "analyze", None)
-        if not ooda_func:
-            raise HTTPException(status_code=500, detail=f"Could not find OODA function in {module_path}")
+            raise HTTPException(status_code=500, detail=f"Could not find {func_name} in {module_path}")
 
         background_tasks.add_task(ooda_func)
         logger.info(f"[dev-agent] Triggered OODA cycle for {agent_name}")
@@ -96,13 +94,13 @@ async def trigger_ooda_cycle(agent_name: str, background_tasks: BackgroundTasks)
 @router.post("/trigger-ooda-all")
 async def trigger_all_ooda_cycles(background_tasks: BackgroundTasks):
     """Trigger OODA cycles for ALL agents. Full system analysis."""
+    import importlib
     results = {}
     for agent_name, module_path in OODA_AGENTS.items():
-        func_name = f"_run_{agent_name}_ooda"
+        func_name = f"run_{agent_name}_analysis_with_ooda"
         try:
-            import importlib
             mod = importlib.import_module(module_path)
-            ooda_func = getattr(mod, func_name, None) or getattr(mod, "run_analyze", None)
+            ooda_func = getattr(mod, func_name, None)
             if ooda_func:
                 background_tasks.add_task(ooda_func)
                 results[agent_name] = "started"

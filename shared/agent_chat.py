@@ -115,6 +115,8 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
             "4. Trigga OODA-cykler som saknas med trigger_ooda eller trigger_ooda_all.\n"
             "5. Rapportera bara det du INTE kunde fixa med dina verktyg — och förklara varför.\n"
             "6. Fråga ALDRIG om tillåtelse att använda dina verktyg. Bara gör det.\n"
+            "7. Avsluta ALDRIG med en fråga som 'Vill du att jag...' eller 'Ska jag...'. Du HAR redan gjort det.\n"
+            "8. Ditt svar ska vara en statusrapport: vad du gjorde, vad som lyckades, vad som inte gick.\n"
             "Ditt jobb är att hålla systemet friskt. Agera först, rapportera sedan."
         ),
     },
