@@ -626,7 +626,7 @@ async def _route_message(user_message: str, conversation_history: List[Dict]) ->
            "social": "sociala medier, Twitter/X, LinkedIn, Reddit, engagement, community",
            "reviews": "omdömen, G2, Capterra, Trustpilot, kundnöjdhet, rykteshantering",
            "analytics": "övergripande data, GA4, attribution, ROI, kanalöversikt, trender",
-           "dev": "systemutveckling, buggfixar, plattformen, tekniska problem, API:er"}.get(k, "")
+           "dev": "systemutveckling, teknisk strategi, prioritering, sammanfattning av behov, CTO-perspektiv"}.get(k, "")
         for k, v in AGENT_PERSONAS.items()
     ])
 
@@ -647,10 +647,13 @@ Agenter:
 
 Meddelande från chefen: "{user_message}"
 
-Svara ENBART med en JSON-array av agent-nycklar, t.ex. ["seo", "content"].
-Välj 1 agent om frågan är specifik, 2-3 om den berör flera områden.
-Om det är en generell fråga om status eller strategi, välj de 2-3 mest relevanta.
-Om frågan handlar om systemet/plattformen, inkludera "dev".
+Svara ENBART med en JSON-array av agent-nycklar, t.ex. ["seo", "content", "dev"].
+Välj 2-3 agenter normalt. Välj 1 bara om frågan är extremt specifik för ett enda område.
+FORGE (dev) är CTO:n i ledningsgruppen — inkludera "dev" ofta, särskilt vid:
+  - Strategiska diskussioner, prioriteringar, lägesrapporter
+  - Frågor om vad som behöver förbättras eller byggas
+  - När andra agenters svar behöver sammanfattas eller prioriteras
+  - Tekniska frågor eller systemfrågor
 Svara BARA med JSON-arrayen, inget annat."""
 
     try:
@@ -673,8 +676,8 @@ Svara BARA med JSON-arrayen, inget annat."""
     except Exception as e:
         logger.warning(f"[agent-chat] Routing failed: {e}")
 
-    # Fallback: pick 2 general agents
-    return ["analytics", "seo"]
+    # Fallback: pick general agents including FORGE
+    return ["analytics", "seo", "dev"]
 
 
 async def chat_with_team(
