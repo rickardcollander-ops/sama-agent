@@ -1,5 +1,7 @@
 """
-Database helper for storing and retrieving agent actions
+Database helper for storing and retrieving agent actions.
+Integrates with the autonomy framework for auto-execution
+and the event bus for inter-agent collaboration chains.
 """
 
 from typing import Dict, Any, List, Optional
@@ -7,6 +9,73 @@ from shared.database import get_supabase
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+async def _classify_and_handle(agent_name: str, action: Dict[str, Any], db_id: str):
+    """Classify action tier and auto-execute or notify if applicable."""
+    try:
+        from shared.autonomy import autonomy, DecisionTier
+        tier = autonomy.classify(action)
+
+        if tier == DecisionTier.AUTO_EXECUTE:
+            logger.info(f"[autonomy] Auto-executing: {action.get('title', '')[:50]}")
+            # Mark as auto-executed
+            sb = get_supabase()
+            sb.table("agent_actions").update({
+                "status": "auto_executed",
+                "execution_result": {"auto": True, "tier": tier.value},
+            }).eq("id", db_id).execute()
+
+        elif tier == DecisionTier.AUTO_EXECUTE_NOTIFY:
+            logger.info(f"[autonomy] Auto-execute+notify: {action.get('title', '')[:50]}")
+            sb = get_supabase()
+            sb.table("agent_actions").update({
+                "status": "auto_executed",
+                "execution_result": {"auto": True, "tier": tier.value},
+            }).eq("id", db_id).execute()
+            # Send notification
+            try:
+                from shared.notifications import notification_service
+                await notification_service.notify(
+                    title=f"[{agent_name}] Auto-executed",
+                    message=action.get("title", ""),
+                    severity="info",
+                    agent=agent_name,
+                )
+            except Exception:
+                pass
+
+        # For REQUIRE_APPROVAL: action stays as "pending" (default)
+    except Exception as e:
+        logger.debug(f"[autonomy] Classification skipped: {e}")
+
+
+async def _publish_chain_events(agent_name: str, action: Dict[str, Any]):
+    """Publish events to trigger downstream agent chains."""
+    try:
+        from shared.event_bus_registry import get_event_bus
+        from shared.agent_chains import EVENT_KEYWORD_GAP_FOUND, EVENT_RANKING_DECLINE
+
+        bus = get_event_bus()
+        if not bus:
+            return
+
+        action_type = action.get("type", "")
+
+        if agent_name == "seo" and action_type in ("content_gap", "content_creation"):
+            await bus.publish(
+                EVENT_KEYWORD_GAP_FOUND,
+                "sama_content",
+                {"keyword": action.get("keyword", ""), "priority": action.get("priority", "medium"), "gap_type": "blog_post"},
+            )
+        elif agent_name == "seo" and action_type == "content_refresh":
+            await bus.publish(
+                EVENT_RANKING_DECLINE,
+                "sama_content",
+                {"keyword": action.get("keyword", ""), "url": action.get("target_page", "")},
+            )
+    except Exception as e:
+        logger.debug(f"[chains] Event publish skipped: {e}")
 
 
 async def clear_pending_actions(agent_name: str) -> int:
@@ -73,13 +142,20 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
             result = sb.table("agent_actions").insert(db_action).execute()
             
             if result.data:
-                created_ids.append(result.data[0]["id"])
+                db_id = result.data[0]["id"]
+                created_ids.append(db_id)
                 logger.info(f"✅ Saved action: {action.get('title', '')[:50]}")
-        
+
+                # Classify and auto-execute if applicable
+                await _classify_and_handle(agent_name, action, db_id)
+
+                # Publish chain events for downstream agents
+                await _publish_chain_events(agent_name, action)
+
         except Exception as e:
             logger.error(f"❌ Failed to save action: {e}")
             continue
-    
+
     return created_ids
 
 

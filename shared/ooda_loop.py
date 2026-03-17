@@ -85,8 +85,8 @@ class OODALoop:
                 "status": "orienting",
                 "orient_started_at": datetime.utcnow().isoformat()
             }).eq("id", self.cycle_id).execute()
-        except Exception:
-            pass  # Continue without tracking
+        except Exception as e:
+            logger.warning(f"[ooda] {self.agent_name} OBSERVE tracking failed: {e}")
         
         logger.info(f"👁️ {self.agent_name}: OBSERVE complete - {len(observations)} data sources")
         return observations
@@ -103,9 +103,9 @@ class OODALoop:
                 "status": "deciding",
                 "decide_started_at": datetime.utcnow().isoformat()
             }).eq("id", self.cycle_id).execute()
-        except Exception:
-            pass
-        
+        except Exception as e:
+            logger.warning(f"[ooda] {self.agent_name} ORIENT tracking failed: {e}")
+
         logger.info(f"🧠 {self.agent_name}: ORIENT complete - {analysis.get('insights_count', 0)} insights")
         return analysis
     
@@ -121,9 +121,9 @@ class OODALoop:
                 "status": "acting",
                 "act_started_at": datetime.utcnow().isoformat()
             }).eq("id", self.cycle_id).execute()
-        except Exception:
-            pass
-        
+        except Exception as e:
+            logger.warning(f"[ooda] {self.agent_name} DECIDE tracking failed: {e}")
+
         logger.info(f"🎯 {self.agent_name}: DECIDE complete - {len(decisions)} actions planned")
         return decisions
     
@@ -153,9 +153,9 @@ class OODALoop:
             self.sb.table("agent_cycles").update({
                 "actions_taken": actions_taken
             }).eq("id", self.cycle_id).execute()
-        except Exception:
-            pass
-        
+        except Exception as e:
+            logger.warning(f"[ooda] {self.agent_name} ACT recording failed: {e}")
+
         logger.info(f"⚡ {self.agent_name}: ACT - Recorded action {action_id}")
     
     async def complete_act_phase(self):

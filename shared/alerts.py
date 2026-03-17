@@ -92,11 +92,19 @@ class AlertSystem:
                 f"[{alert.agent}] {alert.title}: {alert.message}"
             )
             
-            # TODO: Send to external notification channels
-            # - Email via SendGrid
-            # - Slack webhook
-            # - Discord webhook
-            
+            # Send to external notification channels
+            try:
+                from shared.notifications import notification_service
+                await notification_service.notify(
+                    title=alert.title,
+                    message=alert.message,
+                    severity=alert.severity.value,
+                    agent=alert.agent,
+                    fields={"Type": alert.type.value, "Requires Approval": str(alert.requires_approval)},
+                )
+            except Exception as notify_err:
+                logger.debug(f"Notification delivery failed: {notify_err}")
+
             return {
                 "success": True,
                 "alert_id": result.data[0]["id"] if result.data else None,

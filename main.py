@@ -14,11 +14,13 @@ from typing import AsyncGenerator
 from api.routes import (
     seo, content, ads, social, reviews, analytics, orchestrator, automation,
     seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts, improvements,
-    ai_visibility, dashboard, social_reddit, gtm
+    ai_visibility, dashboard, social_reddit, gtm, goals, notifications, dev_agent,
+    agent_reports, agent_chat
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
 from shared import scheduler as job_scheduler
+from shared.event_bus_registry import set_event_bus, get_event_bus
 
 # Configure logging
 logging.basicConfig(
@@ -40,12 +42,46 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:
         logger.warning(f"⚠️ Supabase not configured: {e}")
     
-    # Initialize event bus (optional) - skip for now to ensure startup
+    # Initialize event bus (Redis with local fallback)
     event_bus = None
-    logger.info("⚠️ Event bus skipped (optional)")
+    try:
+        if settings.REDIS_URL and settings.REDIS_URL != "redis://localhost:6379/0":
+            from shared.event_bus import EventBus
+            event_bus = EventBus()
+            await event_bus.connect()
+            logger.info("✅ Event bus connected (Redis)")
+        else:
+            raise ConnectionError("No remote Redis configured")
+    except Exception as e:
+        logger.info(f"ℹ️ Redis unavailable ({e}), using local event bus")
+        from shared.event_bus_local import LocalEventBus
+        event_bus = LocalEventBus()
+        await event_bus.connect()
 
-    # Setup monitoring (optional) - skip for now to ensure startup
-    logger.info("⚠️ Monitoring skipped (optional)")
+    set_event_bus(event_bus)
+
+    # Register inter-agent collaboration chains
+    try:
+        from shared.agent_chains import register_all_chains
+        await register_all_chains(event_bus)
+        logger.info("✅ Agent collaboration chains registered")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to register chains: {e}")
+
+    # Start event bus consumer (for local bus)
+    if hasattr(event_bus, "start_consumer"):
+        await event_bus.start_consumer()
+
+    # Start proactive agent monitor loop
+    monitor = None
+    try:
+        from shared.agent_monitor import AgentMonitorLoop, register_default_watchers
+        monitor = AgentMonitorLoop()
+        register_default_watchers(monitor)
+        await monitor.start()
+        logger.info("✅ Agent monitor loop started")
+    except Exception as e:
+        logger.warning(f"⚠️ Monitor loop failed to start: {e}")
 
     # Start job scheduler
     try:
@@ -59,8 +95,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     yield
 
     # Cleanup
+    if monitor:
+        await monitor.stop()
     if event_bus:
         await event_bus.disconnect()
+    set_event_bus(None)
     job_scheduler.stop()
     logger.info("👋 SAMA 2.0 shutting down")
 
@@ -127,6 +166,11 @@ app.include_router(improvements.router, prefix="/api", tags=["improvements"])
 app.include_router(ai_visibility.router, prefix="/api/ai-visibility", tags=["ai-visibility"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(gtm.router, prefix="/api/gtm", tags=["gtm"])
+app.include_router(goals.router, prefix="/api", tags=["goals"])
+app.include_router(notifications.router, prefix="/api", tags=["notifications"])
+app.include_router(dev_agent.router, prefix="/api/dev-agent", tags=["dev-agent"])
+app.include_router(agent_reports.router, prefix="/api/agents", tags=["agent-reports"])
+app.include_router(agent_chat.router, prefix="/api/agents", tags=["agent-chat"])
 
 
 @app.get("/")
@@ -151,11 +195,12 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Detailed health check"""
+    bus = get_event_bus()
     return {
         "status": "healthy",
         "database": "connected",
-        "event_bus": "connected",
-        "monitoring": "active"
+        "event_bus": type(bus).__name__ if bus else "disconnected",
+        "monitoring": "active",
     }
 
 

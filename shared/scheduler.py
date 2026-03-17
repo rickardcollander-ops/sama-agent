@@ -22,6 +22,11 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "weekly_content_analysis": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_ai_visibility":   {"last_run": None, "last_status": None, "last_error": None},
     "midday_review_check":    {"last_run": None, "last_status": None, "last_error": None},
+    "daily_reflection":       {"last_run": None, "last_status": None, "last_error": None},
+    "daily_digest":           {"last_run": None, "last_status": None, "last_error": None},
+    "weekly_goal_review":     {"last_run": None, "last_status": None, "last_error": None},
+    "daily_dev_health_check": {"last_run": None, "last_status": None, "last_error": None},
+    "daily_agent_reports":    {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -173,6 +178,105 @@ async def _run_midday_review_check():
         _record("midday_review_check", "error", str(e))
 
 
+async def _run_daily_reflection():
+    """Run reflection on completed actions across all agents."""
+    logger.info("[scheduler] Running daily reflection...")
+    try:
+        from shared.memory import AgentMemory
+        total = 0
+        for agent_name in ["seo", "content", "ads", "social", "reviews", "analytics"]:
+            memory = AgentMemory(agent_name)
+            count = await memory.run_reflection_for_completed_actions()
+            total += count
+        logger.info(f"[scheduler] Reflection done — {total} actions reflected on")
+        _record("daily_reflection", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Daily reflection failed: {e}")
+        _record("daily_reflection", "error", str(e))
+
+
+async def _run_daily_digest():
+    """Send daily activity digest notification."""
+    logger.info("[scheduler] Running daily digest...")
+    try:
+        from shared.notifications import notification_service
+        from shared.database import get_supabase
+        sb = get_supabase()
+
+        # Count today's activity
+        from datetime import datetime, timedelta
+        today = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+
+        executed = sb.table("agent_actions") \
+            .select("id", count="exact") \
+            .in_("status", ["completed", "auto_executed"]) \
+            .gte("executed_at", today) \
+            .limit(0).execute()
+
+        pending = sb.table("agent_actions") \
+            .select("id", count="exact") \
+            .eq("status", "pending") \
+            .limit(0).execute()
+
+        summary = {
+            "actions_executed": executed.count or 0,
+            "pending_actions": pending.count or 0,
+            "alerts": 0,
+            "wins": [],
+        }
+        await notification_service.send_daily_digest(summary)
+        logger.info("[scheduler] Daily digest sent")
+        _record("daily_digest", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Daily digest failed: {e}")
+        _record("daily_digest", "error", str(e))
+
+
+async def _run_daily_agent_reports():
+    """Generate daily self-reports for all agents."""
+    logger.info("[scheduler] Running daily agent reports...")
+    try:
+        from shared.agent_report import generate_all_reports
+        reports = await generate_all_reports()
+        logger.info(f"[scheduler] Agent reports done — {len(reports)} reports generated")
+        _record("daily_agent_reports", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Agent reports failed: {e}")
+        _record("daily_agent_reports", "error", str(e))
+
+
+async def _run_daily_dev_health_check():
+    """Run the dev agent's full system health check."""
+    logger.info("[scheduler] Running daily dev health check...")
+    try:
+        from agents.dev_agent import dev_agent
+        report = await dev_agent.run_full_health_check()
+        await dev_agent.save_report(report)
+        status = report["summary"]["status"]
+        pct = report["summary"]["health_pct"]
+        logger.info(f"[scheduler] Dev health check done — {pct}% healthy ({status})")
+        _record("daily_dev_health_check", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Dev health check failed: {e}")
+        _record("daily_dev_health_check", "error", str(e))
+
+
+async def _run_weekly_goal_review():
+    """Review progress on all active goals."""
+    logger.info("[scheduler] Running weekly goal review...")
+    try:
+        from shared.goals import goal_tracker
+        goals = await goal_tracker.get_active_goals()
+        for goal in goals:
+            status = await goal_tracker.check_goal_status(goal)
+            logger.info(f"[scheduler] Goal '{goal.get('goal_text', '')[:40]}': {status}")
+        logger.info(f"[scheduler] Goal review done — {len(goals)} goals reviewed")
+        _record("weekly_goal_review", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Weekly goal review failed: {e}")
+        _record("weekly_goal_review", "error", str(e))
+
+
 def start():
     """Register all jobs and start the scheduler."""
     # Daily keyword tracking — 02:00 UTC every day
@@ -239,12 +343,53 @@ def start():
         replace_existing=True,
     )
 
+    # Daily reflection — 22:00 UTC (review completed actions)
+    scheduler.add_job(
+        _run_daily_reflection,
+        CronTrigger(hour=22, minute=0),
+        id="daily_reflection",
+        replace_existing=True,
+    )
+
+    # Daily digest notification — 17:00 UTC
+    scheduler.add_job(
+        _run_daily_digest,
+        CronTrigger(hour=17, minute=0),
+        id="daily_digest",
+        replace_existing=True,
+    )
+
+    # Weekly goal review — Fridays 09:00 UTC
+    scheduler.add_job(
+        _run_weekly_goal_review,
+        CronTrigger(day_of_week="fri", hour=9, minute=0),
+        id="weekly_goal_review",
+        replace_existing=True,
+    )
+
+    # Daily agent self-reports — 05:00 UTC (before dev health check)
+    scheduler.add_job(
+        _run_daily_agent_reports,
+        CronTrigger(hour=5, minute=0),
+        id="daily_agent_reports",
+        replace_existing=True,
+    )
+
+    # Daily dev health check — 05:30 UTC (after reports, before main agent jobs)
+    scheduler.add_job(
+        _run_daily_dev_health_check,
+        CronTrigger(hour=5, minute=30),
+        id="daily_dev_health_check",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "[scheduler] Started — "
         "keywords 02:00, metrics 04:00, SEO audit Mon 03:00, "
-        "workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
-        "reviews 14:00, content Wed 05:00 (UTC)"
+        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
+        "reviews 14:00, content Wed 05:00, "
+        "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
 
 
