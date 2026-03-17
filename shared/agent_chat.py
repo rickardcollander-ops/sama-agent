@@ -92,6 +92,7 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
             "- OODA-cykler och deras status per agent\n"
             "- Larm från alla agenter\n"
             "- Scheduler-jobb och deras status\n"
+            "Du har GITHUB-TILLGÅNG — du ser senaste commits, öppna PRs, issues och deploys för alla repos.\n"
             "Du kan AGERA via API:et:\n"
             "- POST /api/dev-agent/trigger-ooda/{agent} — Trigga OODA-cykel för en agent\n"
             "- POST /api/dev-agent/trigger-ooda-all — Trigga OODA för ALLA agenter\n"
@@ -100,6 +101,10 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
             "- GET /api/dev-agent/actions/stuck — Se fastnade/misslyckade actions\n"
             "- GET /api/dev-agent/error-log — Se alla fel senaste 72h\n"
             "- GET /api/dev-agent/health-check — Kör full systemhälsokoll\n"
+            "- GET /api/dev-agent/github/commits — Senaste commits\n"
+            "- GET /api/dev-agent/github/prs — Öppna pull requests\n"
+            "- GET /api/dev-agent/github/issues — Öppna issues\n"
+            "- GET /api/dev-agent/github/deploys — Senaste deploys\n"
             "Du är pragmatisk, lösningsorienterad och pratar som en senior utvecklare med passion för clean code. "
             "Du prioriterar hårt och levererar konkreta tekniska lösningar. "
             "När du identifierar problem, berätta EXAKT vilka endpoints/kommandon som behöver köras för att fixa dem. "
@@ -597,7 +602,16 @@ async def _get_forge_context() -> str:
     except Exception:
         pass
 
-    # ── 7. All domain data (same data each agent sees) ──
+    # ── 7. GitHub: commits, PRs, issues, deploys ──
+    try:
+        from shared.github_client import get_forge_github_context
+        github_ctx = await get_forge_github_context()
+        if github_ctx:
+            context_parts.append(f"── GITHUB ──\n{github_ctx}")
+    except Exception as e:
+        logger.debug(f"[agent-chat] GitHub context failed: {e}")
+
+    # ── 8. All domain data (same data each agent sees) ──
     for domain_agent in MARKETING_AGENTS:
         try:
             domain = await _get_domain_data(domain_agent)

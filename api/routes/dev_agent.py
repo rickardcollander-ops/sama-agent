@@ -245,3 +245,59 @@ async def get_error_log():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── GitHub ────────────────────────────────────────────────────────────────
+
+
+@router.get("/github/commits")
+async def github_recent_commits(repo: Optional[str] = None, limit: int = 15):
+    """Get recent commits across repos."""
+    from shared.github_client import get_recent_commits
+    try:
+        return {"commits": await get_recent_commits(repo=repo, limit=limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/github/prs")
+async def github_open_prs(repo: Optional[str] = None):
+    """Get open pull requests."""
+    from shared.github_client import get_open_prs
+    try:
+        prs = await get_open_prs(repo=repo)
+        return {"pull_requests": prs, "total": len(prs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/github/issues")
+async def github_open_issues(repo: Optional[str] = None, limit: int = 15):
+    """Get open issues."""
+    from shared.github_client import get_open_issues
+    try:
+        issues = await get_open_issues(repo=repo, limit=limit)
+        return {"issues": issues, "total": len(issues)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/github/deploys")
+async def github_recent_deploys(repo: Optional[str] = None, limit: int = 5):
+    """Get recent deployments."""
+    from shared.github_client import get_recent_deployments
+    try:
+        deploys = await get_recent_deployments(repo=repo, limit=limit)
+        return {"deployments": deploys, "total": len(deploys)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/github/summary")
+async def github_repo_summary():
+    """Get a summary of all repos."""
+    from shared.github_client import get_repo_summary
+    try:
+        return await get_repo_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

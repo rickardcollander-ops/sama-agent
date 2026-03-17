@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     
     # GitHub
     GITHUB_TOKEN: str = ""
+    GITHUB_OWNER: str = "successifier"
+    GITHUB_REPOS: str = "sama-agent,sama-dashboard"  # comma-separated
+
+    # Deployment
+    RAILWAY_API_TOKEN: str = ""
+    RAILWAY_PROJECT_ID: str = ""
     
     # Application
     SUCCESSIFIER_DOMAIN: str = "successifier.com"
