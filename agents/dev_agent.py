@@ -111,6 +111,7 @@ class DevAgent:
             "scheduler": self._test_scheduler(),
             "event_bus": await self._test_event_bus(),
             "agents": await self._test_agent_imports(),
+            "agent_improvements": await self._collect_agent_improvements(),
         }
 
         # Calculate summary
@@ -343,6 +344,35 @@ class DevAgent:
             "errors": errors,
             "details": details,
         }
+
+    async def _collect_agent_improvements(self) -> Dict[str, Any]:
+        """
+        Collect improvement suggestions from agent self-reports.
+        These are things agents say they need to do a better job.
+        """
+        try:
+            from shared.agent_report import get_all_improvements, get_latest_reports
+            reports = await get_latest_reports()
+            improvements = await get_all_improvements()
+
+            agent_summaries = []
+            for r in reports:
+                agent_summaries.append({
+                    "agent": r.get("agent_name", "?"),
+                    "summary": r.get("summary", ""),
+                    "problems": r.get("problems", []),
+                    "improvements": r.get("improvements", []),
+                    "generated_at": r.get("created_at", ""),
+                })
+
+            return {
+                "total_suggestions": len(improvements),
+                "agent_summaries": agent_summaries,
+                "all_improvements": improvements,
+            }
+        except Exception as e:
+            logger.debug(f"[dev-agent] Could not collect improvements: {e}")
+            return {"total_suggestions": 0, "agent_summaries": [], "all_improvements": []}
 
     async def _notify_results(self, results: Dict[str, Any]):
         """Send a notification with the health check results."""

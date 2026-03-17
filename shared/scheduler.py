@@ -26,6 +26,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_digest":           {"last_run": None, "last_status": None, "last_error": None},
     "weekly_goal_review":     {"last_run": None, "last_status": None, "last_error": None},
     "daily_dev_health_check": {"last_run": None, "last_status": None, "last_error": None},
+    "daily_agent_reports":    {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -231,6 +232,19 @@ async def _run_daily_digest():
         _record("daily_digest", "error", str(e))
 
 
+async def _run_daily_agent_reports():
+    """Generate daily self-reports for all agents."""
+    logger.info("[scheduler] Running daily agent reports...")
+    try:
+        from shared.agent_report import generate_all_reports
+        reports = await generate_all_reports()
+        logger.info(f"[scheduler] Agent reports done — {len(reports)} reports generated")
+        _record("daily_agent_reports", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Agent reports failed: {e}")
+        _record("daily_agent_reports", "error", str(e))
+
+
 async def _run_daily_dev_health_check():
     """Run the dev agent's full system health check."""
     logger.info("[scheduler] Running daily dev health check...")
@@ -353,7 +367,15 @@ def start():
         replace_existing=True,
     )
 
-    # Daily dev health check — 05:30 UTC (before main agent jobs)
+    # Daily agent self-reports — 05:00 UTC (before dev health check)
+    scheduler.add_job(
+        _run_daily_agent_reports,
+        CronTrigger(hour=5, minute=0),
+        id="daily_agent_reports",
+        replace_existing=True,
+    )
+
+    # Daily dev health check — 05:30 UTC (after reports, before main agent jobs)
     scheduler.add_job(
         _run_daily_dev_health_check,
         CronTrigger(hour=5, minute=30),
@@ -365,7 +387,7 @@ def start():
     logger.info(
         "[scheduler] Started — "
         "keywords 02:00, metrics 04:00, SEO audit Mon 03:00, "
-        "dev-health 05:30, workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
+        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
         "reviews 14:00, content Wed 05:00, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
