@@ -1,5 +1,5 @@
 """
-Agent Chat API — chat with individual agents or broadcast to all
+Agent Chat API — chat with individual agents, team discussions, or broadcast
 """
 
 from fastapi import APIRouter
@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 import logging
 
-from shared.agent_chat import chat_with_agent, chat_with_all_agents, list_agents
+from shared.agent_chat import chat_with_agent, chat_with_all_agents, chat_with_team, list_agents
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -22,6 +22,17 @@ class ChatRequest(BaseModel):
 async def get_available_agents():
     """List all agents with their names and personas."""
     return {"agents": list_agents()}
+
+
+@router.post("/chat/team")
+async def team_chat(req: ChatRequest):
+    """
+    Intelligent team chat — routes the message to the most relevant 1-3 agents.
+    Agents respond in sequence, each seeing what the previous ones said.
+    This creates a natural leadership team discussion.
+    """
+    result = await chat_with_team(req.message, req.conversation_id)
+    return result
 
 
 @router.post("/chat/broadcast")
