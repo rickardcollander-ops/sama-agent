@@ -8,8 +8,9 @@ agent(s) respond based on the topic.
 
 import logging
 import json
+import httpx
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from uuid import uuid4
 
 from shared.database import get_supabase
@@ -115,6 +116,238 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
 
 AGENT_NAME_MAP = {k: v["name"] for k, v in AGENT_PERSONAS.items()}
 MARKETING_AGENTS = [k for k in AGENT_PERSONAS if k != "dev"]
+
+# ── FORGE Tool Definitions ───────────────────────────────────────────────────
+
+FORGE_TOOLS = [
+    {
+        "name": "health_check",
+        "description": "Kör en full systemhälsokoll av alla endpoints, databastabeller och scheduler-jobb.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_stuck_actions",
+        "description": "Hämta actions som fastnat (pending > 24h) eller misslyckats (failed) för alla agenter.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "retry_action",
+        "description": "Återstarta en specifik misslyckad action (sätt status till pending).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action_id": {"type": "string", "description": "ID för den action som ska köras om."},
+            },
+            "required": ["action_id"],
+        },
+    },
+    {
+        "name": "retry_bulk_actions",
+        "description": "Återstarta alla misslyckade actions, valfritt filtrerat på agentnamn.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_name": {"type": "string", "description": "Filtrera på agentnamn (seo, content, ads, social, reviews). Utelämna för alla."},
+                "status_filter": {"type": "string", "enum": ["failed", "pending"], "description": "Status att filtrera: 'failed' (standard) eller 'pending'."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "trigger_ooda",
+        "description": "Trigga en OODA-analyscykel för en specifik agent.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_name": {"type": "string", "enum": ["seo", "content", "ads", "social", "reviews"], "description": "Agenten att trigga."},
+            },
+            "required": ["agent_name"],
+        },
+    },
+    {
+        "name": "trigger_ooda_all",
+        "description": "Trigga OODA-analyscykler för ALLA agenter samtidigt.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_error_log",
+        "description": "Hämta alla fel och felmeddelanden från de senaste 72 timmarna.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_github_prs",
+        "description": "Hämta öppna pull requests från GitHub-repos.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_github_issues",
+        "description": "Hämta öppna issues från GitHub-repos.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_github_commits",
+        "description": "Hämta senaste commits från GitHub-repos.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+# Human-readable display names for tool calls
+FORGE_TOOL_LABELS: Dict[str, str] = {
+    "health_check": "Systemhälsokoll",
+    "get_stuck_actions": "Hämtar fastnade actions",
+    "retry_action": "Återstartar action",
+    "retry_bulk_actions": "Bulk-retry actions",
+    "trigger_ooda": "Triggar OODA-cykel",
+    "trigger_ooda_all": "Triggar alla OODA-cykler",
+    "get_error_log": "Fellog 72h",
+    "get_github_prs": "GitHub pull requests",
+    "get_github_issues": "GitHub issues",
+    "get_github_commits": "GitHub commits",
+}
+
+_FORGE_API_BASE = "http://localhost:8000"
+
+
+async def _execute_forge_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:
+    """Execute a FORGE tool by calling the internal dev-agent API."""
+    try:
+        async with httpx.AsyncClient(base_url=_FORGE_API_BASE, timeout=30.0) as client:
+            if tool_name == "health_check":
+                resp = await client.get("/api/dev-agent/health-check")
+                data = resp.json()
+                s = data.get("summary", {})
+                ep = data.get("endpoints", {})
+                db = data.get("database", {})
+                sched = data.get("scheduler", {})
+                lines = [
+                    f"Hälsa: {s.get('health_pct', '?')}% — {s.get('status', '?')} "
+                    f"({s.get('passed', 0)}/{s.get('total_checks', 0)} OK, {s.get('failed', 0)} fel)",
+                    f"Endpoints: {ep.get('passed', 0)}/{ep.get('total', 0)} OK",
+                    f"Databas: {db.get('passed', 0)}/{db.get('total', 0)} tabeller OK",
+                    f"Scheduler: körs={sched.get('scheduler_running', False)}, "
+                    f"{sched.get('passed', 0)} jobb OK, {sched.get('failed', 0)} fel",
+                ]
+                if ep.get("errors"):
+                    for e in ep["errors"][:3]:
+                        lines.append(f"  ⚠ Endpoint {e.get('name')}: {e.get('status_code', e.get('error', '?'))}")
+                if db.get("errors"):
+                    for e in db["errors"][:3]:
+                        lines.append(f"  ⚠ Tabell {e.get('table')}: saknas")
+                return "\n".join(lines)
+
+            elif tool_name == "get_stuck_actions":
+                resp = await client.get("/api/dev-agent/actions/stuck")
+                data = resp.json()
+                failed = data.get("failed", [])
+                stale = data.get("stale_pending", [])
+                lines = [
+                    f"Misslyckade: {data.get('total_failed', 0)} st, "
+                    f"Stale pending (>24h): {data.get('total_stale', 0)} st",
+                ]
+                for a in failed[:8]:
+                    err = f" — {a.get('error_message', '')[:60]}" if a.get("error_message") else ""
+                    lines.append(f"  [failed] [{a.get('agent_name')}] {a.get('title')} (id: {a.get('action_id')}){err}")
+                for a in stale[:5]:
+                    lines.append(f"  [stale]  [{a.get('agent_name')}] {a.get('title')} (id: {a.get('action_id')})")
+                return "\n".join(lines)
+
+            elif tool_name == "retry_action":
+                action_id = tool_input.get("action_id")
+                resp = await client.post(f"/api/dev-agent/actions/{action_id}/retry")
+                data = resp.json()
+                if data.get("success"):
+                    return f"Action {action_id} återstartad — status: pending."
+                return f"Misslyckades: {data}"
+
+            elif tool_name == "retry_bulk_actions":
+                body: Dict[str, Any] = {}
+                if tool_input.get("agent_name"):
+                    body["agent_name"] = tool_input["agent_name"]
+                if tool_input.get("status_filter"):
+                    body["status_filter"] = tool_input["status_filter"]
+                resp = await client.post("/api/dev-agent/actions/retry-bulk", json=body)
+                data = resp.json()
+                return (
+                    f"Bulk retry klar: {data.get('retried', 0)} av "
+                    f"{data.get('total_found', 0)} actions återstartade."
+                )
+
+            elif tool_name == "trigger_ooda":
+                agent = tool_input.get("agent_name")
+                resp = await client.post(f"/api/dev-agent/trigger-ooda/{agent}")
+                data = resp.json()
+                if data.get("success"):
+                    return f"OODA-cykel startad för {agent}."
+                return f"Fel vid start av OODA för {agent}: {data}"
+
+            elif tool_name == "trigger_ooda_all":
+                resp = await client.post("/api/dev-agent/trigger-ooda-all")
+                data = resp.json()
+                agents_status = data.get("agents", {})
+                started = [k for k, v in agents_status.items() if v == "started"]
+                errors = {k: v for k, v in agents_status.items() if v != "started"}
+                result = f"OODA-cykler startade för: {', '.join(started)}."
+                if errors:
+                    result += f" Fel: {errors}"
+                return result
+
+            elif tool_name == "get_error_log":
+                resp = await client.get("/api/dev-agent/error-log")
+                data = resp.json()
+                action_errs = data.get("action_errors", [])
+                cycle_errs = data.get("cycle_errors", [])
+                lines = [
+                    f"Fellog (72h): {data.get('total_action_errors', 0)} action-fel, "
+                    f"{data.get('total_cycle_errors', 0)} cykel-fel"
+                ]
+                for e in action_errs[:6]:
+                    lines.append(
+                        f"  [{e.get('agent_name')}] {e.get('title')}: "
+                        f"{(e.get('error_message') or '')[:80]}"
+                    )
+                for e in cycle_errs[:3]:
+                    lines.append(f"  [{e.get('agent_name')}] cykel-fel: {(e.get('error_message') or '')[:80]}")
+                return "\n".join(lines)
+
+            elif tool_name == "get_github_prs":
+                resp = await client.get("/api/dev-agent/github/prs")
+                data = resp.json()
+                prs = data.get("pull_requests", [])
+                if not prs:
+                    return "Inga öppna pull requests."
+                lines = [f"Öppna PRs ({data.get('total', 0)}):"]
+                for pr in prs[:10]:
+                    lines.append(f"  #{pr.get('number')} {pr.get('title')} [{pr.get('state', 'open')}]")
+                return "\n".join(lines)
+
+            elif tool_name == "get_github_issues":
+                resp = await client.get("/api/dev-agent/github/issues")
+                data = resp.json()
+                issues = data.get("issues", [])
+                if not issues:
+                    return "Inga öppna issues."
+                lines = [f"Öppna issues ({data.get('total', 0)}):"]
+                for issue in issues[:10]:
+                    lines.append(f"  #{issue.get('number')} {issue.get('title')}")
+                return "\n".join(lines)
+
+            elif tool_name == "get_github_commits":
+                resp = await client.get("/api/dev-agent/github/commits")
+                data = resp.json()
+                commits = data.get("commits", [])
+                if not commits:
+                    return "Inga commits hittades."
+                lines = [f"Senaste commits ({len(commits)}):"]
+                for c in commits[:10]:
+                    lines.append(f"  {c.get('sha', '')[:7]} {c.get('message', '')[:80]} — {c.get('author', '')}")
+                return "\n".join(lines)
+
+            else:
+                return f"Okänt tool: {tool_name}"
+
+    except Exception as e:
+        logger.error(f"[forge-tool] {tool_name} failed: {e}")
+        return f"Fel vid körning av {tool_name}: {str(e)[:200]}"
 
 
 def get_agent_persona(agent_name: str) -> Dict[str, str]:
@@ -809,20 +1042,77 @@ Regler:
         })
     messages.append({"role": "user", "content": user_message})
 
-    # Call Claude
+    # Call Claude — FORGE uses an agentic tool-use loop, others use a single call
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model=settings.CLAUDE_MODEL,
-            max_tokens=800,
-            system=system,
-            messages=messages,
-        )
-        reply = response.content[0].text
+
+        if agent_name == "dev":
+            # ── Agentic loop for FORGE ────────────────────────────────────────
+            tool_calls_log: List[Dict[str, str]] = []
+            loop_messages = list(messages)  # copy so we can extend
+            reply = ""
+
+            for _ in range(8):  # max 8 tool-call rounds
+                response = client.messages.create(
+                    model=settings.CLAUDE_MODEL,
+                    max_tokens=1500,
+                    system=system,
+                    messages=loop_messages,
+                    tools=FORGE_TOOLS,
+                )
+
+                if response.stop_reason == "tool_use":
+                    # Extract tool-use blocks
+                    tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+
+                    # Execute all tool calls
+                    tool_results = []
+                    for block in tool_use_blocks:
+                        label = FORGE_TOOL_LABELS.get(block.name, block.name)
+                        logger.info(f"[forge] Executing tool: {block.name} {block.input}")
+                        result = await _execute_forge_tool(block.name, block.input)
+                        tool_calls_log.append({
+                            "name": block.name,
+                            "label": label,
+                            "input": json.dumps(block.input, ensure_ascii=False),
+                            "result": result,
+                        })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+
+                    # Extend messages with assistant response + tool results
+                    loop_messages.append({"role": "assistant", "content": response.content})
+                    loop_messages.append({"role": "user", "content": tool_results})
+
+                else:
+                    # stop_reason == "end_turn" — extract final text
+                    for block in response.content:
+                        if hasattr(block, "text"):
+                            reply = block.text
+                            break
+                    break
+            else:
+                reply = "Jag körde alla verktyg men nådde max antal rundor."
+
+        else:
+            # ── Single call for all other agents ─────────────────────────────
+            tool_calls_log = []
+            response = client.messages.create(
+                model=settings.CLAUDE_MODEL,
+                max_tokens=800,
+                system=system,
+                messages=messages,
+            )
+            reply = response.content[0].text
+
     except Exception as e:
         logger.warning(f"[agent-chat] Claude call failed for {agent_name}: {e}")
         reply = f"Ursäkta, jag ({persona['name']}) har tekniska problem just nu. Försök igen om en stund. Fel: {str(e)[:100]}"
+        tool_calls_log = []
 
     # Save agent reply
     await _save_message(conversation_id, agent_name, "assistant", reply)
@@ -834,6 +1124,7 @@ Regler:
         "agent_title": persona["title"],
         "agent_emoji": persona["emoji"],
         "reply": reply,
+        "tool_calls": tool_calls_log,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
