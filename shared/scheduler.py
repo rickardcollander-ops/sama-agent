@@ -25,6 +25,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_reflection":       {"last_run": None, "last_status": None, "last_error": None},
     "daily_digest":           {"last_run": None, "last_status": None, "last_error": None},
     "weekly_goal_review":     {"last_run": None, "last_status": None, "last_error": None},
+    "daily_dev_health_check": {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -230,6 +231,22 @@ async def _run_daily_digest():
         _record("daily_digest", "error", str(e))
 
 
+async def _run_daily_dev_health_check():
+    """Run the dev agent's full system health check."""
+    logger.info("[scheduler] Running daily dev health check...")
+    try:
+        from agents.dev_agent import dev_agent
+        report = await dev_agent.run_full_health_check()
+        await dev_agent.save_report(report)
+        status = report["summary"]["status"]
+        pct = report["summary"]["health_pct"]
+        logger.info(f"[scheduler] Dev health check done — {pct}% healthy ({status})")
+        _record("daily_dev_health_check", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Dev health check failed: {e}")
+        _record("daily_dev_health_check", "error", str(e))
+
+
 async def _run_weekly_goal_review():
     """Review progress on all active goals."""
     logger.info("[scheduler] Running weekly goal review...")
@@ -336,11 +353,19 @@ def start():
         replace_existing=True,
     )
 
+    # Daily dev health check — 05:30 UTC (before main agent jobs)
+    scheduler.add_job(
+        _run_daily_dev_health_check,
+        CronTrigger(hour=5, minute=30),
+        id="daily_dev_health_check",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "[scheduler] Started — "
         "keywords 02:00, metrics 04:00, SEO audit Mon 03:00, "
-        "workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
+        "dev-health 05:30, workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
         "reviews 14:00, content Wed 05:00, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
