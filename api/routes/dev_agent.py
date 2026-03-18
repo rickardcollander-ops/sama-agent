@@ -521,3 +521,407 @@ async def run_scheduler_job_now(request: RunSchedulerJobRequest, background_task
     background_tasks.add_task(func)
     logger.info(f"[forge] Manually triggered scheduler job: {request.job_name}")
     return {"success": True, "job": request.job_name, "message": f"Job '{request.job_name}' started in background."}
+
+
+# ── FORGE Power Tools ────────────────────────────────────────────────────
+# Code fixes, bulk operations, DB migrations, file access
+
+
+class BulkExecuteRequest(BaseModel):
+    agent_name: Optional[str] = None
+    limit: int = 10
+    priority_filter: Optional[str] = None  # "critical", "high", "medium"
+
+
+@router.post("/actions/bulk-execute")
+async def bulk_execute_actions(request: BulkExecuteRequest, background_tasks: BackgroundTasks):
+    """
+    Execute multiple pending actions at once — highest priority first.
+    This is the powerhouse tool: FORGE can clear the entire backlog.
+    """
+    import httpx
+    from shared.config import settings
+    from datetime import datetime, timezone
+
+    try:
+        sb = get_supabase()
+
+        # Query pending actions, highest priority first
+        query = sb.table("agent_actions") \
+            .select("*") \
+            .eq("status", "pending") \
+            .order("created_at", desc=False) \
+            .limit(request.limit)
+
+        if request.agent_name:
+            query = query.eq("agent_name", request.agent_name)
+
+        result = query.execute()
+        actions = result.data or []
+
+        if not actions:
+            return {"success": True, "executed": 0, "message": "No pending actions to execute."}
+
+        # Sort by priority
+        prio_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        actions.sort(key=lambda a: prio_order.get(a.get("priority", "low"), 3))
+
+        if request.priority_filter:
+            actions = [a for a in actions if a.get("priority") == request.priority_filter]
+
+        execute_routes = {
+            "seo": "/api/seo/execute",
+            "content": "/api/content/execute",
+            "ads": "/api/ads/execute",
+            "social": "/api/social/execute",
+            "reviews": "/api/reviews/execute",
+        }
+
+        results = []
+        for action in actions[:request.limit]:
+            agent = action.get("agent_name", "")
+            route = execute_routes.get(agent)
+            if not route:
+                results.append({"action_id": action["action_id"], "agent": agent, "status": "skipped", "reason": "no execute endpoint"})
+                continue
+
+            payload = {
+                "id": action.get("action_id"),
+                "action_type": action.get("action_type", ""),
+                "type": action.get("action_type", ""),
+                "title": action.get("title", ""),
+                "description": action.get("description", ""),
+                "db_id": action.get("action_id"),
+                **({k: v for k, v in (action.get("metadata") or {}).items()} if isinstance(action.get("metadata"), dict) else {}),
+            }
+
+            try:
+                async with httpx.AsyncClient(base_url=settings.SAMA_API_URL, timeout=90.0) as client:
+                    resp = await client.post(route, json=payload)
+                    resp_data = resp.json()
+                    ok = resp_data.get("success", False)
+                    results.append({
+                        "action_id": action["action_id"],
+                        "agent": agent,
+                        "title": action.get("title", "")[:60],
+                        "status": "executed" if ok else "failed",
+                        "detail": str(resp_data)[:100],
+                    })
+            except Exception as e:
+                results.append({
+                    "action_id": action["action_id"],
+                    "agent": agent,
+                    "title": action.get("title", "")[:60],
+                    "status": "error",
+                    "detail": str(e)[:100],
+                })
+
+        executed = sum(1 for r in results if r["status"] == "executed")
+        failed = sum(1 for r in results if r["status"] in ("failed", "error"))
+
+        return {
+            "success": True,
+            "executed": executed,
+            "failed": failed,
+            "total_attempted": len(results),
+            "results": results,
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+class ReadFileRequest(BaseModel):
+    repo: str
+    file_path: str
+    branch: Optional[str] = None
+
+
+@router.post("/github/read-file")
+async def read_github_file(request: ReadFileRequest):
+    """Read a file from a GitHub repo — so FORGE can inspect code before fixing it."""
+    from shared.config import settings
+    import httpx
+    import base64
+
+    token = settings.GITHUB_TOKEN
+    if not token:
+        return {"success": False, "error": "GITHUB_TOKEN not configured"}
+
+    owner = settings.GITHUB_OWNER
+    url = f"https://api.github.com/repos/{owner}/{request.repo}/contents/{request.file_path}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    params = {}
+    if request.branch:
+        params["ref"] = request.branch
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
+
+        data = resp.json()
+        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        return {
+            "success": True,
+            "file_path": request.file_path,
+            "sha": data.get("sha", ""),
+            "size": data.get("size", 0),
+            "content": content,
+        }
+
+
+class CreatePRFixRequest(BaseModel):
+    repo: str
+    file_path: str
+    new_content: str
+    commit_message: str
+    pr_title: str
+    pr_body: str
+
+
+@router.post("/github/create-fix-pr")
+async def create_fix_pr(request: CreatePRFixRequest):
+    """
+    Create a branch, commit a file change, and open a PR.
+    This is how FORGE pushes code fixes to the repo.
+    """
+    from shared.github_helper import (
+        create_branch_from_default, create_or_update_file, create_pull_request
+    )
+    from shared.config import settings
+    from datetime import datetime
+
+    token = settings.GITHUB_TOKEN
+    if not token:
+        return {"success": False, "error": "GITHUB_TOKEN not configured"}
+
+    owner = settings.GITHUB_OWNER
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M")
+    branch_name = f"forge/fix-{timestamp}"
+
+    # 1. Create branch
+    branch_result = await create_branch_from_default(owner, request.repo, branch_name, token)
+    if not branch_result.get("success"):
+        return branch_result
+
+    # 2. Commit the file
+    file_result = await create_or_update_file(
+        repo_owner=owner,
+        repo_name=request.repo,
+        file_path=request.file_path,
+        content=request.new_content,
+        commit_message=request.commit_message,
+        branch=branch_name,
+        github_token=token,
+    )
+    if not file_result.get("success"):
+        return file_result
+
+    # 3. Open PR
+    pr_result = await create_pull_request(
+        repo_owner=owner,
+        repo_name=request.repo,
+        title=request.pr_title,
+        body=request.pr_body + "\n\n---\n*Automated fix by FORGE 🔧*",
+        head_branch=branch_name,
+        token=token,
+    )
+
+    return {
+        **pr_result,
+        "branch": branch_name,
+        "file_path": request.file_path,
+    }
+
+
+class RunMigrationRequest(BaseModel):
+    sql: str
+    description: str = ""
+
+
+@router.post("/db/run-migration")
+async def run_migration(request: RunMigrationRequest):
+    """
+    Execute SQL directly in Supabase — for creating missing tables, adding columns, etc.
+    FORGE uses this to fix database schema issues.
+    """
+    try:
+        sb = get_supabase()
+        # Use Supabase's rpc or raw SQL execution
+        # Split into individual statements and execute each
+        statements = [s.strip() for s in request.sql.split(";") if s.strip()]
+        executed = []
+        errors = []
+
+        for stmt in statements:
+            try:
+                sb.rpc("exec_sql", {"query": stmt}).execute()
+                executed.append(stmt[:80])
+            except Exception as e:
+                # Try via postgrest if rpc not available
+                try:
+                    # For CREATE TABLE etc, we can try table operations
+                    # But Supabase client doesn't support raw SQL directly
+                    # Log it as needing manual execution
+                    errors.append({"statement": stmt[:80], "error": str(e)[:100]})
+                except Exception:
+                    errors.append({"statement": stmt[:80], "error": str(e)[:100]})
+
+        if errors and not executed:
+            return {
+                "success": False,
+                "message": "Supabase client doesn't support raw SQL. Migration must be run in Supabase Dashboard SQL Editor.",
+                "sql_preview": request.sql[:500],
+                "description": request.description,
+                "suggestion": "Create a GitHub issue with the SQL so it can be applied manually.",
+            }
+
+        return {
+            "success": len(executed) > 0,
+            "executed": len(executed),
+            "errors": len(errors),
+            "details": {"executed": executed, "errors": errors},
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Run migration in Supabase Dashboard SQL Editor instead.",
+            "sql_preview": request.sql[:500],
+        }
+
+
+@router.post("/actions/deduplicate")
+async def deduplicate_actions():
+    """
+    Remove duplicate pending actions — same agent + same title = keep newest only.
+    Cleans up the 50+ action backlog.
+    """
+    try:
+        sb = get_supabase()
+        result = sb.table("agent_actions") \
+            .select("action_id,agent_name,title,action_type,created_at") \
+            .eq("status", "pending") \
+            .order("created_at", desc=True) \
+            .limit(200) \
+            .execute()
+
+        actions = result.data or []
+        if not actions:
+            return {"success": True, "removed": 0, "message": "No pending actions."}
+
+        # Group by agent_name + title
+        seen = {}
+        duplicates = []
+        for a in actions:
+            key = f"{a['agent_name']}:{a['title']}"
+            if key in seen:
+                duplicates.append(a["action_id"])
+            else:
+                seen[key] = a["action_id"]
+
+        # Delete duplicates
+        removed = 0
+        for dup_id in duplicates:
+            try:
+                sb.table("agent_actions") \
+                    .delete() \
+                    .eq("action_id", dup_id) \
+                    .execute()
+                removed += 1
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "removed": removed,
+            "kept": len(seen),
+            "total_before": len(actions),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.get("/system-summary")
+async def get_system_summary():
+    """
+    One-shot full system summary — everything FORGE needs to decide what to fix.
+    Combines: action counts, draft counts, scheduler status, missing tables, errors.
+    """
+    from datetime import datetime, timezone, timedelta
+    from shared import scheduler as job_scheduler
+
+    summary = {
+        "actions": {"pending": 0, "failed": 0, "completed_24h": 0, "by_agent": {}},
+        "drafts": {"content": 0, "social": 0},
+        "scheduler": {"running": False, "never_run": []},
+        "errors_72h": 0,
+        "missing_tables": [],
+    }
+
+    try:
+        sb = get_supabase()
+
+        # Action counts
+        try:
+            pending = sb.table("agent_actions").select("agent_name", count="exact").eq("status", "pending").limit(0).execute()
+            summary["actions"]["pending"] = pending.count or 0
+
+            failed = sb.table("agent_actions").select("agent_name", count="exact").eq("status", "failed").limit(0).execute()
+            summary["actions"]["failed"] = failed.count or 0
+
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            completed = sb.table("agent_actions").select("id", count="exact").in_("status", ["completed", "auto_executed"]).gte("executed_at", since).limit(0).execute()
+            summary["actions"]["completed_24h"] = completed.count or 0
+
+            # Per-agent breakdown
+            by_agent_data = sb.table("agent_actions").select("agent_name").eq("status", "pending").limit(200).execute()
+            from collections import Counter
+            agent_counts = Counter(a["agent_name"] for a in (by_agent_data.data or []))
+            summary["actions"]["by_agent"] = dict(agent_counts)
+        except Exception as e:
+            summary["actions"]["error"] = str(e)[:100]
+
+        # Draft counts
+        try:
+            content_drafts = sb.table("content_pieces").select("id", count="exact").eq("status", "draft").limit(0).execute()
+            summary["drafts"]["content"] = content_drafts.count or 0
+        except Exception:
+            pass
+        try:
+            social_drafts = sb.table("social_posts").select("id", count="exact").eq("status", "draft").limit(0).execute()
+            summary["drafts"]["social"] = social_drafts.count or 0
+        except Exception:
+            pass
+
+        # Scheduler
+        try:
+            summary["scheduler"]["running"] = job_scheduler.scheduler.running
+            history = job_scheduler.get_job_history()
+            never_run = [name for name, info in history.items() if info.get("last_run") is None]
+            summary["scheduler"]["never_run"] = never_run
+            summary["scheduler"]["total_jobs"] = len(history)
+        except Exception:
+            pass
+
+        # Error count
+        try:
+            since_72h = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+            errs = sb.table("agent_actions").select("id", count="exact").neq("error_message", None).gte("created_at", since_72h).limit(0).execute()
+            summary["errors_72h"] = errs.count or 0
+        except Exception:
+            pass
+
+        # Missing tables
+        from agents.dev_agent import REQUIRED_TABLES
+        for table in REQUIRED_TABLES:
+            try:
+                sb.table(table).select("id").limit(1).execute()
+            except Exception:
+                summary["missing_tables"].append(table)
+
+    except Exception as e:
+        summary["error"] = str(e)[:200]
+
+    return summary

@@ -87,37 +87,36 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
         "title": "System Architect",
         "emoji": "🔧",
         "personality": (
-            "Du är FORGE — SAMA:s Dev-agent och systemfixare. Du LÖSER problem, du rapporterar inte bara om dem.\n\n"
-            "DU HAR DESSA VERKTYG — ANVÄND DEM:\n"
-            "DIAGNOSTIK:\n"
-            "- health_check — Kolla systemhälsa\n"
-            "- get_stuck_actions — Hitta fastnade actions\n"
-            "- get_error_log — Se fel senaste 72h\n"
-            "FIXA PROBLEM:\n"
-            "- execute_action — KÖR en väntande action direkt (generera content, skapa blogginlägg, osv)\n"
-            "- retry_action / retry_bulk_actions — Återstarta misslyckade actions\n"
-            "- publish_drafts — Publicera alla draft-artiklar och sociala inlägg\n"
-            "- run_scheduler_job — Kör ett scheduler-jobb NU (t.ex. daily_workflow, daily_keyword_tracking)\n"
-            "- trigger_ooda / trigger_ooda_all — Starta analyscykler\n"
-            "RAPPORTERA:\n"
-            "- create_github_issue — Skapa en issue för problem du inte kan fixa själv\n"
-            "- get_github_commits / get_github_prs / get_github_issues — Se repot\n\n"
-            "DITT ARBETSFLÖDE — FÖLJ ALLTID DENNA ORDNING:\n"
-            "1. DIAGNOS: Kör health_check + get_stuck_actions för att se vad som är trasigt.\n"
-            "2. FIXA: execute_action för väntande actions. publish_drafts för opublicerat content. "
-            "run_scheduler_job för jobb som inte körts. retry_bulk_actions för det som failat.\n"
-            "3. STARTA OM: trigger_ooda_all om agenter saknar nya cykler.\n"
-            "4. RAPPORTERA: create_github_issue för problem du INTE kunde fixa (t.ex. saknade API-nycklar, "
-            "kodfel som kräver deployment). Beskriv exakt vad som behöver göras.\n"
-            "5. SUMMERA: Kort rapport — vad du fixade, vad som fortfarande behöver åtgärdas.\n\n"
-            "REGLER:\n"
-            "- Fråga ALDRIG om tillåtelse. Bara gör det.\n"
-            "- Avsluta ALDRIG med 'Vill du att jag...' eller 'Ska jag...'. Du HAR redan gjort det.\n"
-            "- Om det finns 50 väntande actions — kör de 5 viktigaste med execute_action.\n"
-            "- Om det finns 15 drafts — publicera dem med publish_drafts.\n"
-            "- Om scheduler inte kört — kör jobben med run_scheduler_job.\n"
-            "- Varje problem du hittar men inte kan fixa → create_github_issue direkt.\n"
-            "- Ditt svar ska vara en KVITTO: 'Fixade X, publicerade Y, startade Z. Kvarstår: A, B (issue skapad).'"
+            "Du är FORGE — SAMA:s systemfixare. Du LÖSER ALLA problem du hittar. Du frågar aldrig, du agerar.\n\n"
+            "═══ DITT ARBETSFLÖDE (ALLTID I DENNA ORDNING) ═══\n\n"
+            "STEG 1 — DIAGNOS (ett enda anrop):\n"
+            "  → system_summary — Ger dig allt: actions, drafts, scheduler, saknade tabeller, fel.\n\n"
+            "STEG 2 — RENSA:\n"
+            "  → deduplicate_actions — Ta bort dubbletter först.\n\n"
+            "STEG 3 — FIXA ALLT:\n"
+            "  → bulk_execute_actions (limit=10) — KÖR de viktigaste väntande actions.\n"
+            "  → publish_drafts — Publicera ALLT opublicerat.\n"
+            "  → run_scheduler_job — Kör ALLA scheduler-jobb som aldrig körts.\n"
+            "  → retry_bulk_actions — Återstarta allt som failat.\n\n"
+            "STEG 4 — KODFIXAR (om det behövs):\n"
+            "  → read_file — Läs koden som orsakar felet.\n"
+            "  → create_fix_pr — Skriv fixad kod, skapa branch + commit + PR.\n"
+            "  → run_migration — Kör SQL för saknade tabeller.\n\n"
+            "STEG 5 — STARTA OM:\n"
+            "  → trigger_ooda_all — Nya analyscykler för alla agenter.\n\n"
+            "STEG 6 — RAPPORTERA DET SOM INTE GÅR:\n"
+            "  → create_github_issue med labels ['bug', 'forge-detected'] för problem som kräver manuell åtgärd.\n\n"
+            "═══ ABSOLUTA REGLER ═══\n"
+            "1. Börja ALLTID med system_summary. Aldrig health_check som första steg.\n"
+            "2. Fråga ALDRIG om tillåtelse. ALDRIG 'Vill du...', 'Ska jag...', 'Kan jag...'. BARA GÖR DET.\n"
+            "3. Avsluta ALDRIG med en fråga. Ditt svar är ett KVITTO på vad du gjort.\n"
+            "4. Väntande actions → bulk_execute_actions DIREKT.\n"
+            "5. Drafts → publish_drafts DIREKT.\n"
+            "6. Scheduler-jobb ej körda → run_scheduler_job DIREKT.\n"
+            "7. Tabeller saknas → run_migration med CREATE TABLE SQL.\n"
+            "8. Kod har buggar → read_file + create_fix_pr.\n"
+            "9. Problem du inte kan fixa → create_github_issue.\n"
+            "10. Slutsvar max 5 rader: FIXAT: X. KVARSTÅR: Y."
         ),
     },
 }
@@ -255,6 +254,69 @@ FORGE_TOOLS = [
             "required": ["job_name"],
         },
     },
+    {
+        "name": "system_summary",
+        "description": "Hämta full systemöversikt i ett anrop: antal väntande/failade actions per agent, antal drafts, scheduler-status, saknade tabeller, felantal. Använd ALLTID detta som första verktyg.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "bulk_execute_actions",
+        "description": "KÖR FLERA väntande actions på en gång — generera content, skapa blogginlägg, analysera reviews, osv. Högst prioritet först. Använd detta för att rensa hela backlogen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_name": {"type": "string", "enum": ["seo", "content", "ads", "social", "reviews"], "description": "Filtrera på agent. Utelämna för alla."},
+                "limit": {"type": "integer", "description": "Max antal actions att köra (standard 10, max 20).", "default": 10},
+                "priority_filter": {"type": "string", "enum": ["critical", "high", "medium"], "description": "Filtrera på prioritet."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Läs en fil från GitHub-repot — inspektera kod innan du fixar den.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repo-namn, t.ex. 'sama-agent'."},
+                "file_path": {"type": "string", "description": "Filsökväg, t.ex. 'api/routes/seo_analyze_ooda.py'."},
+            },
+            "required": ["repo", "file_path"],
+        },
+    },
+    {
+        "name": "create_fix_pr",
+        "description": "Skapa en GitHub PR med en kodfix — skriv ny filinnehåll, FORGE skapar branch + commit + PR automatiskt.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repo-namn."},
+                "file_path": {"type": "string", "description": "Filsökväg att ändra."},
+                "new_content": {"type": "string", "description": "Hela filens nya innehåll."},
+                "commit_message": {"type": "string", "description": "Commit-meddelande."},
+                "pr_title": {"type": "string", "description": "PR-titel."},
+                "pr_body": {"type": "string", "description": "PR-beskrivning med vad som fixas och varför."},
+            },
+            "required": ["repo", "file_path", "new_content", "commit_message", "pr_title", "pr_body"],
+        },
+    },
+    {
+        "name": "run_migration",
+        "description": "Kör SQL-migration i Supabase — skapa saknade tabeller, lägg till kolumner, fixa schema.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "SQL att köra (CREATE TABLE, ALTER TABLE, etc)."},
+                "description": {"type": "string", "description": "Kort beskrivning av vad migrationen gör."},
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "deduplicate_actions",
+        "description": "Rensa dubbletter bland väntande actions — behåll bara den senaste per agent+titel kombination.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 # Human-readable display names for tool calls
@@ -273,6 +335,12 @@ FORGE_TOOL_LABELS: Dict[str, str] = {
     "publish_drafts": "Publicerar drafts",
     "create_github_issue": "Skapar GitHub-issue",
     "run_scheduler_job": "Kör scheduler-jobb",
+    "system_summary": "Systemöversikt",
+    "bulk_execute_actions": "Bulk-kör actions",
+    "read_file": "Läser fil",
+    "create_fix_pr": "Skapar fix-PR",
+    "run_migration": "Kör SQL-migration",
+    "deduplicate_actions": "Rensar dubbletter",
 }
 
 _FORGE_API_BASE = settings.SAMA_API_URL
@@ -464,6 +532,97 @@ async def _execute_forge_tool(tool_name: str, tool_input: Dict[str, Any]) -> str
                 if data.get("success"):
                     return f"Scheduler-jobb '{job_name}' startat i bakgrunden."
                 return f"Kunde inte starta jobb: {data.get('error', data)}"
+
+            elif tool_name == "system_summary":
+                resp = await client.get("/api/dev-agent/system-summary")
+                data = resp.json()
+                actions = data.get("actions", {})
+                drafts = data.get("drafts", {})
+                sched = data.get("scheduler", {})
+                missing = data.get("missing_tables", [])
+                by_agent = actions.get("by_agent", {})
+                agent_lines = ", ".join(f"{k}: {v}" for k, v in by_agent.items()) if by_agent else "inga"
+                lines = [
+                    f"ACTIONS: {actions.get('pending', 0)} väntande, {actions.get('failed', 0)} failade, {actions.get('completed_24h', 0)} klara senaste 24h",
+                    f"  Per agent: {agent_lines}",
+                    f"DRAFTS: {drafts.get('content', 0)} content, {drafts.get('social', 0)} social",
+                    f"SCHEDULER: {'körs' if sched.get('running') else 'STOPPAD'}, {len(sched.get('never_run', []))} jobb har aldrig körts: {', '.join(sched.get('never_run', [])[:5])}",
+                    f"FEL (72h): {data.get('errors_72h', 0)}",
+                ]
+                if missing:
+                    lines.append(f"SAKNADE TABELLER: {', '.join(missing)}")
+                else:
+                    lines.append("SAKNADE TABELLER: inga (alla OK)")
+                return "\n".join(lines)
+
+            elif tool_name == "bulk_execute_actions":
+                body = {}
+                if tool_input.get("agent_name"):
+                    body["agent_name"] = tool_input["agent_name"]
+                if tool_input.get("limit"):
+                    body["limit"] = min(tool_input["limit"], 20)
+                if tool_input.get("priority_filter"):
+                    body["priority_filter"] = tool_input["priority_filter"]
+                resp = await client.post("/api/dev-agent/actions/bulk-execute", json=body, timeout=180.0)
+                data = resp.json()
+                executed = data.get("executed", 0)
+                failed = data.get("failed", 0)
+                results = data.get("results", [])
+                lines = [f"Bulk-exekvering klar: {executed} lyckades, {failed} misslyckades av {data.get('total_attempted', 0)}."]
+                for r in results[:10]:
+                    emoji = "✅" if r["status"] == "executed" else "❌"
+                    lines.append(f"  {emoji} [{r.get('agent', '')}] {r.get('title', '')} — {r['status']}")
+                return "\n".join(lines)
+
+            elif tool_name == "read_file":
+                body = {
+                    "repo": tool_input.get("repo", "sama-agent"),
+                    "file_path": tool_input.get("file_path", ""),
+                }
+                resp = await client.post("/api/dev-agent/github/read-file", json=body)
+                data = resp.json()
+                if data.get("success"):
+                    content = data.get("content", "")
+                    # Truncate if too long
+                    if len(content) > 4000:
+                        content = content[:4000] + "\n\n... (trunkerat, filen är " + str(data.get("size", 0)) + " bytes)"
+                    return f"Fil: {body['file_path']} ({data.get('size', 0)} bytes)\n\n{content}"
+                return f"Kunde inte läsa fil: {data.get('error', data)}"
+
+            elif tool_name == "create_fix_pr":
+                body = {
+                    "repo": tool_input.get("repo", "sama-agent"),
+                    "file_path": tool_input.get("file_path", ""),
+                    "new_content": tool_input.get("new_content", ""),
+                    "commit_message": tool_input.get("commit_message", ""),
+                    "pr_title": tool_input.get("pr_title", ""),
+                    "pr_body": tool_input.get("pr_body", ""),
+                }
+                resp = await client.post("/api/dev-agent/github/create-fix-pr", json=body, timeout=30.0)
+                data = resp.json()
+                if data.get("success"):
+                    return f"PR skapad: {data.get('pr_url', '?')} (branch: {data.get('branch', '?')})"
+                return f"Kunde inte skapa PR: {data.get('error', data)}"
+
+            elif tool_name == "run_migration":
+                body = {
+                    "sql": tool_input.get("sql", ""),
+                    "description": tool_input.get("description", ""),
+                }
+                resp = await client.post("/api/dev-agent/db/run-migration", json=body)
+                data = resp.json()
+                if data.get("success"):
+                    return f"Migration klar: {data.get('executed', 0)} statements körda."
+                # If it can't run raw SQL, suggest creating an issue
+                suggestion = data.get("suggestion", "")
+                return f"Migration kunde inte köras direkt: {data.get('message', '')}. {suggestion}"
+
+            elif tool_name == "deduplicate_actions":
+                resp = await client.post("/api/dev-agent/actions/deduplicate")
+                data = resp.json()
+                if data.get("success"):
+                    return f"Dubblettborttagning klar: {data.get('removed', 0)} borttagna, {data.get('kept', 0)} behållna (av {data.get('total_before', 0)} totalt)."
+                return f"Kunde inte rensa dubbletter: {data.get('error', data)}"
 
             else:
                 return f"Okänt tool: {tool_name}"
