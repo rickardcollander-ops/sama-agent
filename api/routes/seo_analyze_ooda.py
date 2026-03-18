@@ -130,13 +130,24 @@ Return ONLY valid JSON (no markdown, no explanation):
     )
 
     text = response.content[0].text.strip()
-    match = re.search(r'\{[\s\S]*\}', text)
-    strategy = json.loads(match.group()) if match else {
+    # Strip markdown code fences if present (```json ... ```)
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+
+    default_strategy = {
         "headline": "Build topical authority in customer success",
         "quick_wins": [], "month1": [], "month2": [], "month3": [],
         "content_gaps": [], "technical_priorities": [],
         "kpi_targets": {"top10_keywords": 5, "monthly_clicks": 200, "avg_position": 15}
     }
+    strategy = default_strategy
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            strategy = json.loads(match.group())
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"[seo-ooda] JSON parse failed, using default strategy: {e}")
+            strategy = default_strategy
 
     tasks = _strategy_to_tasks(strategy)
 

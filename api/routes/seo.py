@@ -503,11 +503,17 @@ Be specific to successifier.com and the customer success SaaS space. Focus on re
         )
 
         text = response.content[0].text.strip()
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        fallback = {"headline": text[:200], "quick_wins": [], "month1": [], "month2": [], "month3": [], "content_gaps": [], "technical_priorities": [], "kpi_targets": {}}
         match = re.search(r'\{[\s\S]*\}', text)
         if match:
-            strategy = json.loads(match.group())
+            try:
+                strategy = json.loads(match.group())
+            except (json.JSONDecodeError, ValueError):
+                strategy = fallback
         else:
-            strategy = {"headline": text, "quick_wins": [], "month1": [], "month2": [], "month3": [], "content_gaps": [], "technical_priorities": [], "kpi_targets": {}}
+            strategy = fallback
 
         tasks = _strategy_to_tasks(strategy)
 

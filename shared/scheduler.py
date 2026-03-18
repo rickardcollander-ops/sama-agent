@@ -33,7 +33,21 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 def get_job_history() -> Dict[str, Dict[str, Any]]:
-    return _job_history
+    """Return job history enriched with next_run from APScheduler."""
+    result = {}
+    for job_id, info in _job_history.items():
+        entry = dict(info)
+        # Add next_run from APScheduler if available
+        try:
+            job = scheduler.get_job(job_id)
+            if job and job.next_run_time:
+                entry["next_run"] = job.next_run_time.isoformat()
+            else:
+                entry["next_run"] = None
+        except Exception:
+            entry["next_run"] = None
+        result[job_id] = entry
+    return result
 
 
 def _record(job_id: str, status: str, error: Optional[str] = None):

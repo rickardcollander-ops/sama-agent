@@ -227,14 +227,29 @@ Requirements:
         response_text = response.content[0].text.strip()
 
         logger.info(f"✅ Response generated for {sentiment} review")
-        
-        return {
+
+        # Persist response in review_responses table
+        result_row = {
             "platform": platform,
             "review_id": review.get("id"),
             "sentiment": sentiment,
             "response": response_text,
             "status": "draft"
         }
+        try:
+            sb = get_supabase()
+            sb.table("review_responses").insert({
+                "review_id": review.get("id"),
+                "platform": platform,
+                "sentiment": sentiment,
+                "response_text": response_text,
+                "status": "draft",
+            }).execute()
+            logger.info(f"💾 Response saved to review_responses table")
+        except Exception as e:
+            logger.debug(f"Could not save to review_responses: {e}")
+
+        return result_row
     
     async def generate_review_request(
         self,
