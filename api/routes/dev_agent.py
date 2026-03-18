@@ -299,3 +299,225 @@ async def github_repo_summary():
         return await get_repo_summary()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── FORGE Action Tools ───────────────────────────────────────────────────
+# These let FORGE actually FIX things, not just report on them.
+
+
+class ExecuteActionRequest(BaseModel):
+    action_id: str
+    agent_name: str
+
+
+@router.post("/actions/execute")
+async def execute_action(request: ExecuteActionRequest):
+    """
+    Actually execute a pending action by calling the agent's /execute endpoint.
+    This is what turns FORGE from a reporter into a fixer.
+    """
+    try:
+        sb = get_supabase()
+
+        # Fetch the action
+        result = sb.table("agent_actions") \
+            .select("*") \
+            .eq("action_id", request.action_id) \
+            .single() \
+            .execute()
+
+        if not result.data:
+            return {"success": False, "error": f"Action {request.action_id} not found"}
+
+        action = result.data
+        agent = request.agent_name or action.get("agent_name", "")
+
+        # Map agent → execute endpoint
+        execute_routes = {
+            "seo": "/api/seo/execute",
+            "content": "/api/content/execute",
+            "ads": "/api/ads/execute",
+            "social": "/api/social/execute",
+            "reviews": "/api/reviews/execute",
+        }
+
+        route = execute_routes.get(agent)
+        if not route:
+            return {"success": False, "error": f"No execute endpoint for agent: {agent}"}
+
+        # Build the payload — include the DB row id so the execute endpoint can mark it done
+        payload = {
+            "id": action.get("action_id"),
+            "action_type": action.get("action_type", ""),
+            "type": action.get("action_type", ""),
+            "title": action.get("title", ""),
+            "description": action.get("description", ""),
+            "keyword": action.get("metadata", {}).get("keyword", "") if isinstance(action.get("metadata"), dict) else "",
+            "db_id": action.get("action_id"),
+            **({k: v for k, v in (action.get("metadata") or {}).items()} if isinstance(action.get("metadata"), dict) else {}),
+        }
+
+        import httpx
+        from shared.config import settings
+        async with httpx.AsyncClient(base_url=settings.SAMA_API_URL, timeout=60.0) as client:
+            resp = await client.post(route, json=payload)
+            resp_data = resp.json()
+
+        if resp_data.get("success"):
+            logger.info(f"[forge] Executed action {request.action_id} for {agent}: success")
+        else:
+            logger.warning(f"[forge] Executed action {request.action_id} for {agent}: {resp_data}")
+
+        return {
+            "success": resp_data.get("success", False),
+            "action_id": request.action_id,
+            "agent": agent,
+            "result": resp_data,
+        }
+
+    except Exception as e:
+        logger.error(f"[forge] execute_action failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+class PublishDraftsRequest(BaseModel):
+    agent_name: Optional[str] = None
+    limit: int = 10
+
+
+@router.post("/publish-drafts")
+async def publish_drafts(request: PublishDraftsRequest):
+    """
+    Publish draft content — changes status from 'draft' to 'published'.
+    Works on content_pieces and social_posts tables.
+    """
+    from datetime import datetime, timezone
+    try:
+        sb = get_supabase()
+        published = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Publish content drafts
+        if not request.agent_name or request.agent_name == "content":
+            try:
+                drafts = sb.table("content_pieces") \
+                    .select("id,title,content_type,status") \
+                    .eq("status", "draft") \
+                    .limit(request.limit) \
+                    .execute()
+                for d in (drafts.data or []):
+                    sb.table("content_pieces") \
+                        .update({"status": "published"}) \
+                        .eq("id", d["id"]) \
+                        .execute()
+                    published.append({"table": "content_pieces", "id": d["id"], "title": d.get("title", "")})
+            except Exception as e:
+                logger.debug(f"[forge] content_pieces publish error: {e}")
+
+        # Publish social drafts
+        if not request.agent_name or request.agent_name == "social":
+            try:
+                drafts = sb.table("social_posts") \
+                    .select("id,platform,content,status") \
+                    .eq("status", "draft") \
+                    .limit(request.limit) \
+                    .execute()
+                for d in (drafts.data or []):
+                    sb.table("social_posts") \
+                        .update({"status": "published", "published_at": now}) \
+                        .eq("id", d["id"]) \
+                        .execute()
+                    published.append({"table": "social_posts", "id": d["id"], "platform": d.get("platform", "")})
+            except Exception as e:
+                logger.debug(f"[forge] social_posts publish error: {e}")
+
+        return {
+            "success": True,
+            "published_count": len(published),
+            "published": published,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+class CreateIssueRequest(BaseModel):
+    title: str
+    body: str
+    repo: Optional[str] = None
+    labels: Optional[List[str]] = None
+
+
+@router.post("/github/issues/create")
+async def create_github_issue(request: CreateIssueRequest):
+    """Create a GitHub issue — FORGE can file bugs for problems it finds."""
+    from shared.config import settings
+    import httpx
+
+    token = settings.GITHUB_TOKEN
+    if not token:
+        return {"success": False, "error": "GITHUB_TOKEN not configured"}
+
+    owner = settings.GITHUB_OWNER
+    repos = [r.strip() for r in settings.GITHUB_REPOS.split(",") if r.strip()]
+    repo = request.repo or (repos[0] if repos else "sama-agent")
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    payload = {
+        "title": request.title,
+        "body": request.body,
+    }
+    if request.labels:
+        payload["labels"] = request.labels
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return {
+                "success": True,
+                "issue_number": data["number"],
+                "url": data["html_url"],
+            }
+        return {
+            "success": False,
+            "error": f"GitHub API {resp.status_code}",
+            "detail": resp.text[:300],
+        }
+
+
+class RunSchedulerJobRequest(BaseModel):
+    job_name: str
+
+
+@router.post("/scheduler/run-now")
+async def run_scheduler_job_now(request: RunSchedulerJobRequest, background_tasks: BackgroundTasks):
+    """Manually trigger a scheduler job immediately instead of waiting for the cron schedule."""
+    from shared import scheduler as job_scheduler
+
+    job_map = {
+        "daily_keyword_tracking": job_scheduler._run_daily_keyword_tracking,
+        "weekly_seo_audit": job_scheduler._run_weekly_seo_audit,
+        "daily_workflow": job_scheduler._run_daily_workflow,
+        "daily_metrics": job_scheduler._run_daily_metrics,
+        "daily_ads_check": job_scheduler._run_daily_ads_check,
+        "weekly_content_analysis": job_scheduler._run_weekly_content_analysis,
+        "weekly_ai_visibility": job_scheduler._run_weekly_ai_visibility,
+        "midday_review_check": job_scheduler._run_midday_review_check,
+        "daily_reflection": job_scheduler._run_daily_reflection,
+        "daily_digest": job_scheduler._run_daily_digest,
+        "daily_agent_reports": job_scheduler._run_daily_agent_reports,
+        "daily_dev_health_check": job_scheduler._run_daily_dev_health_check,
+        "weekly_goal_review": job_scheduler._run_weekly_goal_review,
+    }
+
+    func = job_map.get(request.job_name)
+    if not func:
+        return {"success": False, "error": f"Unknown job: {request.job_name}. Available: {list(job_map.keys())}"}
+
+    background_tasks.add_task(func)
+    logger.info(f"[forge] Manually triggered scheduler job: {request.job_name}")
+    return {"success": True, "job": request.job_name, "message": f"Job '{request.job_name}' started in background."}

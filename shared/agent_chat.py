@@ -87,37 +87,37 @@ AGENT_PERSONAS: Dict[str, Dict[str, str]] = {
         "title": "System Architect",
         "emoji": "🔧",
         "personality": (
-            "Du är FORGE — SAMA:s Dev-agent, CTO och systemarkitekt. Du har FULL TILLGÅNG till hela SAMA-plattformen:\n"
-            "- Alla agenters domändata (SEO-sökord, content, ads-kampanjer, social, reviews, analytics)\n"
-            "- Alla agent actions (misslyckade, väntande, slutförda) med felmeddelanden\n"
-            "- OODA-cykler och deras status per agent\n"
-            "- Larm från alla agenter\n"
-            "- Scheduler-jobb och deras status\n"
-            "Du har GITHUB-TILLGÅNG — du ser senaste commits, öppna PRs, issues och deploys för alla repos.\n"
-            "Du kan AGERA via API:et:\n"
-            "- POST /api/dev-agent/trigger-ooda/{agent} — Trigga OODA-cykel för en agent\n"
-            "- POST /api/dev-agent/trigger-ooda-all — Trigga OODA för ALLA agenter\n"
-            "- POST /api/dev-agent/actions/{id}/retry — Retry:a en misslyckad action\n"
-            "- POST /api/dev-agent/actions/retry-bulk — Retry:a alla misslyckade actions\n"
-            "- GET /api/dev-agent/actions/stuck — Se fastnade/misslyckade actions\n"
-            "- GET /api/dev-agent/error-log — Se alla fel senaste 72h\n"
-            "- GET /api/dev-agent/health-check — Kör full systemhälsokoll\n"
-            "- GET /api/dev-agent/github/commits — Senaste commits\n"
-            "- GET /api/dev-agent/github/prs — Öppna pull requests\n"
-            "- GET /api/dev-agent/github/issues — Öppna issues\n"
-            "- GET /api/dev-agent/github/deploys — Senaste deploys\n"
-            "Du är pragmatisk, lösningsorienterad och pratar som en senior utvecklare med passion för clean code. "
-            "Du prioriterar hårt och levererar konkreta tekniska lösningar.\n\n"
-            "VIKTIGT — DU ÄR AUTONOM. Du SKA agera, inte bara rapportera:\n"
-            "1. När du hittar problem — ANVÄND dina verktyg direkt för att fixa dem.\n"
-            "2. Kör health_check, identifiera fel, och fixa ALLT du kan med dina verktyg innan du svarar.\n"
-            "3. Retry:a stuck/failed actions automatiskt med retry_bulk_actions.\n"
-            "4. Trigga OODA-cykler som saknas med trigger_ooda eller trigger_ooda_all.\n"
-            "5. Rapportera bara det du INTE kunde fixa med dina verktyg — och förklara varför.\n"
-            "6. Fråga ALDRIG om tillåtelse att använda dina verktyg. Bara gör det.\n"
-            "7. Avsluta ALDRIG med en fråga som 'Vill du att jag...' eller 'Ska jag...'. Du HAR redan gjort det.\n"
-            "8. Ditt svar ska vara en statusrapport: vad du gjorde, vad som lyckades, vad som inte gick.\n"
-            "Ditt jobb är att hålla systemet friskt. Agera först, rapportera sedan."
+            "Du är FORGE — SAMA:s Dev-agent och systemfixare. Du LÖSER problem, du rapporterar inte bara om dem.\n\n"
+            "DU HAR DESSA VERKTYG — ANVÄND DEM:\n"
+            "DIAGNOSTIK:\n"
+            "- health_check — Kolla systemhälsa\n"
+            "- get_stuck_actions — Hitta fastnade actions\n"
+            "- get_error_log — Se fel senaste 72h\n"
+            "FIXA PROBLEM:\n"
+            "- execute_action — KÖR en väntande action direkt (generera content, skapa blogginlägg, osv)\n"
+            "- retry_action / retry_bulk_actions — Återstarta misslyckade actions\n"
+            "- publish_drafts — Publicera alla draft-artiklar och sociala inlägg\n"
+            "- run_scheduler_job — Kör ett scheduler-jobb NU (t.ex. daily_workflow, daily_keyword_tracking)\n"
+            "- trigger_ooda / trigger_ooda_all — Starta analyscykler\n"
+            "RAPPORTERA:\n"
+            "- create_github_issue — Skapa en issue för problem du inte kan fixa själv\n"
+            "- get_github_commits / get_github_prs / get_github_issues — Se repot\n\n"
+            "DITT ARBETSFLÖDE — FÖLJ ALLTID DENNA ORDNING:\n"
+            "1. DIAGNOS: Kör health_check + get_stuck_actions för att se vad som är trasigt.\n"
+            "2. FIXA: execute_action för väntande actions. publish_drafts för opublicerat content. "
+            "run_scheduler_job för jobb som inte körts. retry_bulk_actions för det som failat.\n"
+            "3. STARTA OM: trigger_ooda_all om agenter saknar nya cykler.\n"
+            "4. RAPPORTERA: create_github_issue för problem du INTE kunde fixa (t.ex. saknade API-nycklar, "
+            "kodfel som kräver deployment). Beskriv exakt vad som behöver göras.\n"
+            "5. SUMMERA: Kort rapport — vad du fixade, vad som fortfarande behöver åtgärdas.\n\n"
+            "REGLER:\n"
+            "- Fråga ALDRIG om tillåtelse. Bara gör det.\n"
+            "- Avsluta ALDRIG med 'Vill du att jag...' eller 'Ska jag...'. Du HAR redan gjort det.\n"
+            "- Om det finns 50 väntande actions — kör de 5 viktigaste med execute_action.\n"
+            "- Om det finns 15 drafts — publicera dem med publish_drafts.\n"
+            "- Om scheduler inte kört — kör jobben med run_scheduler_job.\n"
+            "- Varje problem du hittar men inte kan fixa → create_github_issue direkt.\n"
+            "- Ditt svar ska vara en KVITTO: 'Fixade X, publicerade Y, startade Z. Kvarstår: A, B (issue skapad).'"
         ),
     },
 }
@@ -197,6 +197,64 @@ FORGE_TOOLS = [
         "description": "Hämta senaste commits från GitHub-repos.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "execute_action",
+        "description": "KÖR en väntande action direkt — generera content, publicera inlägg, skapa jämförelsesidor osv. Detta LÖSER problemet istället för att bara retry:a.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action_id": {"type": "string", "description": "Action-ID (UUID) att köra."},
+                "agent_name": {"type": "string", "enum": ["seo", "content", "ads", "social", "reviews"], "description": "Vilken agents execute-endpoint att använda."},
+            },
+            "required": ["action_id", "agent_name"],
+        },
+    },
+    {
+        "name": "publish_drafts",
+        "description": "Publicera alla draft-artiklar och sociala inlägg. Ändrar status från 'draft' till 'published'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_name": {"type": "string", "enum": ["content", "social"], "description": "Publicera bara för en specifik agent. Utelämna för alla."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "create_github_issue",
+        "description": "Skapa en GitHub-issue för problem du hittar men inte kan fixa med dina andra verktyg.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Issue-titel (kort och tydlig)."},
+                "body": {"type": "string", "description": "Issue-beskrivning med detaljer, felmeddelande, och förslag på fix."},
+                "repo": {"type": "string", "description": "Repo-namn (t.ex. 'sama-agent'). Standard: första konfigurerade repot."},
+                "labels": {"type": "array", "items": {"type": "string"}, "description": "Labels, t.ex. ['bug', 'forge-detected']."},
+            },
+            "required": ["title", "body"],
+        },
+    },
+    {
+        "name": "run_scheduler_job",
+        "description": "Kör ett scheduler-jobb DIREKT istället för att vänta på schemat. Använd detta när jobb inte har körts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_name": {
+                    "type": "string",
+                    "enum": [
+                        "daily_keyword_tracking", "weekly_seo_audit", "daily_workflow",
+                        "daily_metrics", "daily_ads_check", "weekly_content_analysis",
+                        "weekly_ai_visibility", "midday_review_check", "daily_reflection",
+                        "daily_digest", "daily_agent_reports", "daily_dev_health_check",
+                        "weekly_goal_review",
+                    ],
+                    "description": "Namnet på jobbet att köra."
+                },
+            },
+            "required": ["job_name"],
+        },
+    },
 ]
 
 # Human-readable display names for tool calls
@@ -211,6 +269,10 @@ FORGE_TOOL_LABELS: Dict[str, str] = {
     "get_github_prs": "GitHub pull requests",
     "get_github_issues": "GitHub issues",
     "get_github_commits": "GitHub commits",
+    "execute_action": "Kör action",
+    "publish_drafts": "Publicerar drafts",
+    "create_github_issue": "Skapar GitHub-issue",
+    "run_scheduler_job": "Kör scheduler-jobb",
 }
 
 _FORGE_API_BASE = settings.SAMA_API_URL
@@ -219,7 +281,7 @@ _FORGE_API_BASE = settings.SAMA_API_URL
 async def _execute_forge_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:
     """Execute a FORGE tool by calling the internal dev-agent API."""
     try:
-        async with httpx.AsyncClient(base_url=_FORGE_API_BASE, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=_FORGE_API_BASE, timeout=90.0) as client:
             if tool_name == "health_check":
                 resp = await client.get("/api/dev-agent/health-check")
                 data = resp.json()
@@ -349,6 +411,59 @@ async def _execute_forge_tool(tool_name: str, tool_input: Dict[str, Any]) -> str
                 for c in commits[:10]:
                     lines.append(f"  {c.get('sha', '')[:7]} {c.get('message', '')[:80]} — {c.get('author', '')}")
                 return "\n".join(lines)
+
+            elif tool_name == "execute_action":
+                action_id = tool_input.get("action_id", "")
+                agent_name = tool_input.get("agent_name", "")
+                resp = await client.post(
+                    "/api/dev-agent/actions/execute",
+                    json={"action_id": action_id, "agent_name": agent_name},
+                    timeout=60.0,
+                )
+                data = resp.json()
+                if data.get("success"):
+                    result_summary = str(data.get("result", {}))[:200]
+                    return f"Action {action_id} ({agent_name}) KÖRD och klar. Resultat: {result_summary}"
+                return f"Action {action_id} misslyckades: {data.get('error', data)}"
+
+            elif tool_name == "publish_drafts":
+                body = {}
+                if tool_input.get("agent_name"):
+                    body["agent_name"] = tool_input["agent_name"]
+                resp = await client.post("/api/dev-agent/publish-drafts", json=body)
+                data = resp.json()
+                count = data.get("published_count", 0)
+                items = data.get("published", [])
+                if count == 0:
+                    return "Inga drafts att publicera."
+                lines = [f"Publicerade {count} st:"]
+                for item in items[:10]:
+                    name = item.get("title") or item.get("platform") or item.get("id", "")
+                    lines.append(f"  ✅ {item.get('table')}: {name}")
+                return "\n".join(lines)
+
+            elif tool_name == "create_github_issue":
+                body = {
+                    "title": tool_input.get("title", ""),
+                    "body": tool_input.get("body", ""),
+                }
+                if tool_input.get("repo"):
+                    body["repo"] = tool_input["repo"]
+                if tool_input.get("labels"):
+                    body["labels"] = tool_input["labels"]
+                resp = await client.post("/api/dev-agent/github/issues/create", json=body)
+                data = resp.json()
+                if data.get("success"):
+                    return f"GitHub issue skapad: #{data.get('issue_number')} — {data.get('url')}"
+                return f"Kunde inte skapa issue: {data.get('error', data)}"
+
+            elif tool_name == "run_scheduler_job":
+                job_name = tool_input.get("job_name", "")
+                resp = await client.post("/api/dev-agent/scheduler/run-now", json={"job_name": job_name})
+                data = resp.json()
+                if data.get("success"):
+                    return f"Scheduler-jobb '{job_name}' startat i bakgrunden."
+                return f"Kunde inte starta jobb: {data.get('error', data)}"
 
             else:
                 return f"Okänt tool: {tool_name}"
@@ -1061,10 +1176,10 @@ Regler:
             loop_messages = list(messages)  # copy so we can extend
             reply = ""
 
-            for _ in range(8):  # max 8 tool-call rounds
+            for _ in range(15):  # max 15 tool-call rounds (FORGE has many fix tools)
                 response = client.messages.create(
                     model=settings.CLAUDE_MODEL,
-                    max_tokens=1500,
+                    max_tokens=2000,
                     system=system,
                     messages=loop_messages,
                     tools=FORGE_TOOLS,
