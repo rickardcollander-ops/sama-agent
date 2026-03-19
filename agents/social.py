@@ -149,7 +149,7 @@ class SocialAgent:
     
     def __init__(self):
         self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
-        self.model = "claude-sonnet-4-5-20250929"
+        self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
     
