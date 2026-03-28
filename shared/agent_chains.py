@@ -142,6 +142,73 @@ async def handle_anomaly_detected(data: Dict[str, Any]):
         logger.error(f"[chain] Failed to create anomaly action: {e}")
 
 
+async def handle_negative_review(data: Dict[str, Any]):
+    """
+    Reviews -> Orchestrator chain.
+    When a negative review is detected, create an urgent response action
+    and notify the team.
+    """
+    platform = data.get("platform", "unknown")
+    rating = data.get("rating", 0)
+    logger.info(f"[chain] negative_review_detected: {rating}-star on {platform}")
+
+    try:
+        from shared.actions_db import save_actions
+        actions = [{
+            "id": f"chain-review-respond-{platform}-{rating}",
+            "type": "review_response_negative",
+            "priority": "critical",
+            "title": f"Respond to {rating}-star review on {platform}",
+            "description": (
+                f"Negative review detected on {platform}. "
+                f"Requires a thoughtful, empathetic response within 24 hours."
+            ),
+            "platform": platform,
+            "action": "Draft and queue a professional response to this negative review",
+        }]
+        await save_actions("reviews", actions)
+
+        # Also send a notification
+        from shared.notifications import notification_service
+        await notification_service.notify(
+            title=f"Negative review on {platform}",
+            message=f"{rating}-star review needs a response",
+            severity="critical",
+            agent="reviews",
+        )
+    except Exception as e:
+        logger.error(f"[chain] Failed to handle negative review: {e}")
+
+
+async def handle_budget_exhausted(data: Dict[str, Any]):
+    """
+    Ads -> Analytics chain.
+    When a campaign exhausts its budget, trigger an attribution analysis
+    to evaluate if the spend was worthwhile.
+    """
+    campaign = data.get("campaign", "unknown")
+    spend = data.get("spend", 0)
+    logger.info(f"[chain] budget_exhausted: '{campaign}' spent ${spend}")
+
+    try:
+        from shared.actions_db import save_actions
+        actions = [{
+            "id": f"chain-attribution-{campaign[:30].replace(' ', '-')}",
+            "type": "investigation",
+            "priority": "high",
+            "title": f"Attribution analysis for '{campaign}'",
+            "description": (
+                f"Campaign '{campaign}' exhausted its budget (${spend}). "
+                f"Analyze ROI and determine if budget should be reallocated."
+            ),
+            "campaign": campaign,
+            "action": "Run cross-channel attribution analysis for this campaign",
+        }]
+        await save_actions("analytics", actions)
+    except Exception as e:
+        logger.error(f"[chain] Failed to create attribution action: {e}")
+
+
 # ── Registration ─────────────────────────────────────────────────────────────
 
 async def register_all_chains(event_bus):
@@ -150,4 +217,6 @@ async def register_all_chains(event_bus):
     await event_bus.subscribe(EVENT_CONTENT_PUBLISHED, handle_content_published)
     await event_bus.subscribe(EVENT_RANKING_DECLINE, handle_ranking_decline)
     await event_bus.subscribe(EVENT_ANOMALY_DETECTED, handle_anomaly_detected)
-    logger.info("[chains] All inter-agent collaboration chains registered")
+    await event_bus.subscribe(EVENT_NEGATIVE_REVIEW, handle_negative_review)
+    await event_bus.subscribe(EVENT_BUDGET_EXHAUSTED, handle_budget_exhausted)
+    logger.info("[chains] All 6 inter-agent collaboration chains registered")
