@@ -42,6 +42,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_dev_health_check": {"last_run": None, "last_status": None, "last_error": None},
     "daily_agent_reports":    {"last_run": None, "last_status": None, "last_error": None},
     "weekly_social_analysis": {"last_run": None, "last_status": None, "last_error": None},
+    "daily_lead_scoring":     {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -330,6 +331,28 @@ async def _run_weekly_goal_review():
         await _notify_failure("weekly_goal_review", str(e))
 
 
+async def _run_daily_lead_scoring():
+    """Re-score all active leads to catch behavioral changes."""
+    try:
+        from shared.database import get_supabase
+        from shared.lead_scoring import score_lead, check_and_escalate
+        sb = get_supabase()
+        leads = sb.table("leads").select("id,score").in_("status", ["new", "contacted"]).limit(200).execute()
+        updated = 0
+        for lead in (leads.data or []):
+            new_score = await score_lead(lead["id"])
+            if new_score != (lead.get("score") or 0):
+                sb.table("leads").update({"score": new_score}).eq("id", lead["id"]).execute()
+                await check_and_escalate(lead["id"], new_score)
+                updated += 1
+        logger.info(f"[scheduler] Lead re-scoring done — {updated}/{len(leads.data or [])} scores updated")
+        _record("daily_lead_scoring", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Lead scoring failed: {e}")
+        _record("daily_lead_scoring", "error", str(e))
+        await _notify_failure("daily_lead_scoring", str(e))
+
+
 def start():
     """Register all jobs and start the scheduler."""
     # Daily keyword tracking — 02:00 UTC every day
@@ -441,6 +464,13 @@ def start():
         _run_weekly_social_analysis,
         CronTrigger(day_of_week="tue", hour=11, minute=0),
         id="weekly_social_analysis",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        _run_daily_lead_scoring,
+        CronTrigger(hour=7, minute=0),
+        id="daily_lead_scoring",
         replace_existing=True,
     )
 

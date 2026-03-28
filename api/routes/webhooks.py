@@ -59,7 +59,7 @@ async def calcom_webhook(request: Request):
                         "email": email,
                         "name": name,
                         "status": "meeting_booked",
-                        "source_url": "cal.com",
+                        "source_url": "https://cal.com",
                         "utm_source": "calcom",
                         "score": 80,  # Booking = high intent
                         "created_at": datetime.utcnow().isoformat(),
