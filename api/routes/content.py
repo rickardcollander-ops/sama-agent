@@ -496,6 +496,23 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                 }
             }
             _mark_status("completed", outcome)
+
+            # Publish content_published event for social promotion
+            if github_result.get("success"):
+                try:
+                    from shared.event_bus_registry import get_event_bus
+                    bus = get_event_bus()
+                    if bus:
+                        await bus.publish("content_published", {
+                            "title": result.get("title", ""),
+                            "url": f"https://successifier.com/blog/{slug}",
+                            "type": "blog_post",
+                            "keyword": keyword,
+                            "pr_url": github_result.get("pr_url", ""),
+                        })
+                except Exception:
+                    pass
+
             return outcome
         
         elif action_type == "comparison":
@@ -522,6 +539,23 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                     }
                 }
                 _mark_status("completed", outcome)
+
+                # Publish content_published event for social promotion
+                if github_result.get("success"):
+                    try:
+                        from shared.event_bus_registry import get_event_bus
+                        bus = get_event_bus()
+                        if bus:
+                            await bus.publish("content_published", {
+                                "title": result.get("title", f"Successifier vs {competitor.title()}"),
+                                "url": f"https://successifier.com/vs/{competitor.lower().replace(' ', '-')}",
+                                "type": "comparison",
+                                "competitor": competitor,
+                                "pr_url": github_result.get("pr_url", ""),
+                            })
+                    except Exception:
+                        pass
+
                 return outcome
             return {"success": False, "message": "No competitor specified"}
         

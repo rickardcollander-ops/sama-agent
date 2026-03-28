@@ -18,6 +18,8 @@ EVENT_RANKING_DECLINE = "ranking_decline"
 EVENT_BUDGET_EXHAUSTED = "budget_exhausted"
 EVENT_ANOMALY_DETECTED = "anomaly_detected"
 EVENT_CONTENT_DRAFTED = "content_drafted"
+EVENT_LEAD_CAPTURED = "lead_captured"
+EVENT_MEETING_BOOKED = "meeting_booked"
 
 
 # ── Chain Handlers ───────────────────────────────────────────────────────────
@@ -55,11 +57,17 @@ async def handle_keyword_gap_found(data: Dict[str, Any]):
 async def handle_content_published(data: Dict[str, Any]):
     """
     Content -> Social chain.
-    When content is published, queue social promotion posts.
+    When content is published, queue social promotion posts with UTM tracking.
     """
     title = data.get("title", "")
     url = data.get("url", "")
+    content_type = data.get("type", "blog_post")
     logger.info(f"[chain] content_published: '{title}' — queuing social posts")
+
+    # Add UTM parameters for attribution tracking
+    utm_base = f"utm_source=sama&utm_campaign={content_type}"
+    url_twitter = f"{url}?{utm_base}&utm_medium=twitter" if url else ""
+    url_linkedin = f"{url}?{utm_base}&utm_medium=linkedin" if url else ""
 
     try:
         from shared.actions_db import save_actions
@@ -69,18 +77,20 @@ async def handle_content_published(data: Dict[str, Any]):
                 "type": "social_post",
                 "priority": "medium",
                 "title": f"Promote on X/Twitter: '{title[:50]}'",
-                "description": f"Auto-generated social post for new content: {url}",
-                "action": "Generate and queue tweet thread promoting this content",
+                "description": f"Auto-generated social post for new content. Include link: {url_twitter}",
+                "action": f"Generate and queue tweet thread promoting this content. MUST include this link: {url_twitter}",
                 "platform": "twitter",
+                "content_url": url_twitter,
             },
             {
                 "id": f"chain-social-li-{title[:20].replace(' ', '-')}",
                 "type": "social_post",
                 "priority": "medium",
                 "title": f"Promote on LinkedIn: '{title[:50]}'",
-                "description": f"Auto-generated LinkedIn post for new content: {url}",
-                "action": "Generate LinkedIn post promoting this content",
+                "description": f"Auto-generated LinkedIn post for new content. Include link: {url_linkedin}",
+                "action": f"Generate LinkedIn post promoting this content. MUST include this link: {url_linkedin}",
                 "platform": "linkedin",
+                "content_url": url_linkedin,
             },
         ]
         await save_actions("social", actions)
@@ -209,6 +219,77 @@ async def handle_budget_exhausted(data: Dict[str, Any]):
         logger.error(f"[chain] Failed to create attribution action: {e}")
 
 
+async def handle_lead_captured(data: Dict[str, Any]):
+    """
+    Lead Pipeline chain.
+    When a lead is captured, score it, add to email nurture, and escalate if qualified.
+    """
+    lead_id = data.get("lead_id", "")
+    email = data.get("email", "")
+    logger.info(f"[chain] lead_captured: {email}")
+
+    try:
+        from shared.lead_scoring import score_lead, check_and_escalate
+        score = await score_lead(lead_id)
+        await check_and_escalate(lead_id, score)
+
+        # Add to Brevo email nurture if configured
+        try:
+            from shared.brevo_client import add_contact_and_trigger
+            await add_contact_and_trigger(
+                email=email,
+                company=data.get("company", ""),
+                source=data.get("utm_source", ""),
+                source_url=data.get("source_url", ""),
+            )
+        except ImportError:
+            pass  # Brevo not yet configured
+        except Exception as e:
+            logger.warning(f"[chain] Brevo integration failed: {e}")
+
+    except Exception as e:
+        logger.error(f"[chain] Failed to handle lead_captured: {e}")
+
+
+async def handle_meeting_booked(data: Dict[str, Any]):
+    """
+    Meeting chain.
+    When a meeting is booked via Cal.com, update lead status and notify.
+    """
+    email = data.get("email", "")
+    logger.info(f"[chain] meeting_booked: {email}")
+
+    try:
+        from shared.database import get_supabase
+        from datetime import datetime
+        sb = get_supabase()
+
+        result = sb.table("leads").select("id").eq("email", email).execute()
+        if result.data:
+            lead_id = result.data[0]["id"]
+            sb.table("leads").update({
+                "status": "meeting_booked",
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("id", lead_id).execute()
+
+            sb.table("lead_touchpoints").insert({
+                "lead_id": lead_id,
+                "touchpoint_type": "meeting_booked",
+                "url": data.get("booking_url", ""),
+                "created_at": datetime.utcnow().isoformat(),
+            }).execute()
+
+        from shared.notifications import notification_service
+        await notification_service.notify(
+            title="Meeting booked!",
+            message=f"{email} booked a {data.get('event_type', 'demo')} for {data.get('start_time', 'TBD')}",
+            severity="critical",
+            agent="leads",
+        )
+    except Exception as e:
+        logger.error(f"[chain] Failed to handle meeting_booked: {e}")
+
+
 # ── Registration ─────────────────────────────────────────────────────────────
 
 async def register_all_chains(event_bus):
@@ -219,4 +300,6 @@ async def register_all_chains(event_bus):
     await event_bus.subscribe(EVENT_ANOMALY_DETECTED, handle_anomaly_detected)
     await event_bus.subscribe(EVENT_NEGATIVE_REVIEW, handle_negative_review)
     await event_bus.subscribe(EVENT_BUDGET_EXHAUSTED, handle_budget_exhausted)
-    logger.info("[chains] All 6 inter-agent collaboration chains registered")
+    await event_bus.subscribe(EVENT_LEAD_CAPTURED, handle_lead_captured)
+    await event_bus.subscribe(EVENT_MEETING_BOOKED, handle_meeting_booked)
+    logger.info("[chains] All 8 inter-agent collaboration chains registered")

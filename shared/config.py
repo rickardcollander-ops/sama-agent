@@ -122,6 +122,12 @@ class Settings(BaseSettings):
     LINKEDIN_AGENT_API_URL: str = "https://growth.successifier.com/api"
     GROWTH_HUB_BRIDGE_API_KEY: str = ""
     
+    # Lead Generation
+    CALCOM_BOOKING_URL: str = ""  # e.g. https://cal.com/successifier/demo
+    CALCOM_WEBHOOK_SECRET: str = ""
+    BREVO_API_KEY: str = ""
+    LEAD_CAPTURE_FORM_URL: str = ""  # URL to hosted lead capture form
+
     # Human-in-the-Loop
     AUTO_PUBLISH_BLOG_POSTS: bool = False
     AUTO_PUBLISH_LANDING_PAGES: bool = False

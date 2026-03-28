@@ -14,6 +14,49 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 
+# ── CTA Block Templates ────────────────────────────────────────────────────
+
+def _get_blog_cta_markdown() -> str:
+    """CTA block appended to every blog post (markdown)."""
+    booking_url = getattr(settings, 'CALCOM_BOOKING_URL', '') or 'https://successifier.com/demo'
+    return f"""
+
+---
+
+## Ready to Improve Your Customer Success?
+
+Successifier helps SaaS teams reduce churn by 40% and boost NRR by 25% — autonomously.
+
+**[Book a Free Demo]({booking_url})** | **[Start Free Trial](https://successifier.com/pricing)**
+
+Or tell us about your challenges:
+
+<form action="https://web-production-5324a.up.railway.app/api/leads/capture" method="POST" style="max-width:480px">
+  <input type="hidden" name="source_url" value="{{{{page_url}}}}" />
+  <input type="email" name="email" placeholder="your@email.com" required style="width:100%;padding:8px;margin:4px 0" />
+  <input type="text" name="company" placeholder="Company name" style="width:100%;padding:8px;margin:4px 0" />
+  <button type="submit" style="background:#2563eb;color:#fff;padding:10px 24px;border:none;border-radius:6px;cursor:pointer;margin-top:4px">Get in Touch</button>
+</form>
+"""
+
+
+def _get_comparison_cta_jsx(competitor: str) -> str:
+    """CTA JSX block for comparison pages."""
+    booking_url = getattr(settings, 'CALCOM_BOOKING_URL', '') or 'https://successifier.com/demo'
+    return f"""
+        <div className="mt-16 rounded-2xl bg-blue-600 p-8 text-center text-white">
+          <h2 className="text-2xl font-bold">Ready to switch from {competitor.title()}?</h2>
+          <p className="mt-2 text-blue-100">Successifier reduces churn by 40% and boosts NRR by 25%. See for yourself.</p>
+          <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-4">
+            <a href="{booking_url}" className="inline-block rounded-lg bg-white px-8 py-3 font-semibold text-blue-600 hover:bg-blue-50 transition-colors">
+              Book a Free Demo
+            </a>
+            <a href="https://successifier.com/pricing" className="inline-block rounded-lg border-2 border-white px-8 py-3 font-semibold text-white hover:bg-blue-700 transition-colors">
+              Start Free Trial
+            </a>
+          </div>
+        </div>"""
+
 
 def _markdown_to_jsx_sections(markdown: str, competitor: str) -> str:
     """Convert markdown content to JSX-safe HTML sections"""
@@ -236,10 +279,11 @@ readingTime: {max(1, len(content.split()) // 200)}
 
 """
     
-    full_content = frontmatter + content
+    cta = _get_blog_cta_markdown().replace("{{page_url}}", f"https://successifier.com/blog/{slug}")
+    full_content = frontmatter + content + cta
     file_path = f"content/blog/{slug}.md"
     commit_message = f"Add blog post: {title}"
-    
+
     return await create_or_update_file(
         repo_owner=repo_owner,
         repo_name=repo_name,
@@ -298,19 +342,13 @@ export default function {competitor.title().replace(' ', '')}ComparisonPage() {{
 {sections}
         </article>
 
-        <div className="mt-16 rounded-2xl bg-blue-600 p-8 text-center text-white">
-          <h2 className="text-2xl font-bold">Ready to try Successifier?</h2>
-          <p className="mt-2 text-blue-100">Start your free trial today. No credit card required.</p>
-          <a href="https://successifier.com/pricing" className="mt-6 inline-block rounded-lg bg-white px-8 py-3 font-semibold text-blue-600 hover:bg-blue-50 transition-colors">
-            Get Started Free
-          </a>
-        </div>
+{_get_comparison_cta_jsx(competitor)}
       </div>
     </div>
   );
 }}
 """
-    
+
     commit_message = f"Add comparison page: Successifier vs {competitor.title()}"
 
     return await create_or_update_file(
@@ -373,13 +411,7 @@ export default function {competitor.title().replace(' ', '')}ComparisonPage() {{
 {sections}
         </article>
 
-        <div className="mt-16 rounded-2xl bg-blue-600 p-8 text-center text-white">
-          <h2 className="text-2xl font-bold">Ready to try Successifier?</h2>
-          <p className="mt-2 text-blue-100">Start your free trial today. No credit card required.</p>
-          <a href="https://successifier.com/pricing" className="mt-6 inline-block rounded-lg bg-white px-8 py-3 font-semibold text-blue-600 hover:bg-blue-50 transition-colors">
-            Get Started Free
-          </a>
-        </div>
+{_get_comparison_cta_jsx(competitor)}
       </div>
     </div>
   );
@@ -567,7 +599,8 @@ readingTime: {max(1, len(content.split()) // 200)}
 ---
 
 """
-    full_content = frontmatter + content
+    cta = _get_blog_cta_markdown().replace("{{page_url}}", f"https://successifier.com/blog/{slug}")
+    full_content = frontmatter + content + cta
     file_path = f"content/blog/{slug}.md"
 
     # 3. Create file on branch
