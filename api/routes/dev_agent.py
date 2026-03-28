@@ -163,8 +163,8 @@ async def retry_bulk_actions(request: BulkRetryRequest):
                     .eq("action_id", action["action_id"]) \
                     .execute()
                 retried += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[dev-agent] Failed to retry action {action.get('action_id')}: {e}")
 
         logger.info(f"[dev-agent] Bulk retry: {retried} actions reset to pending")
         return {"success": True, "retried": retried, "total_found": len(result.data)}
@@ -830,8 +830,8 @@ async def deduplicate_actions():
                     .eq("action_id", dup_id) \
                     .execute()
                 removed += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[dev-agent] Failed to remove duplicate action {dup_id}: {e}")
 
         return {
             "success": True,

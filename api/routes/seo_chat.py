@@ -368,8 +368,8 @@ EXPLANATION: [one sentence]"""
                         f"{gsc.get('total_impressions')} impressions, "
                         f"avg pos {gsc.get('avg_position')}"
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to fetch GSC data for strategy context: {e}")
 
             _strategy_prompt = f"""You are the SEO Agent for Successifier (successifier.com — AI customer success platform targeting SMB SaaS companies).
 {conversation_context}

@@ -91,8 +91,8 @@ Latest Audit:
             for c in content_rows[:15]:
                 content_info += f"  - [{c.get('content_type', '?')}] {c.get('title', '?')} → {c.get('url_path', 'no url')} ({c.get('status', '?')})\n"
             content_info += "\nDo NOT suggest creating content that already exists above."
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to fetch existing content for SEO analysis: {e}")
 
     prompt = f"""You are an expert SEO strategist for successifier.com (AI customer success platform).
 

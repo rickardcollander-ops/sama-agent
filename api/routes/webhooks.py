@@ -72,7 +72,7 @@ async def calcom_webhook(request: Request):
                 from shared.event_bus_registry import get_event_bus
                 bus = get_event_bus()
                 if bus:
-                    await bus.publish("meeting_booked", {
+                    await bus.publish("meeting_booked", "sama_leads", {
                         "email": email,
                         "name": name,
                         "start_time": start_time,
@@ -96,8 +96,8 @@ async def calcom_webhook(request: Request):
                     "status": "contacted",
                     "updated_at": datetime.utcnow().isoformat(),
                 }).eq("email", email).eq("status", "meeting_booked").execute()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to update lead status on meeting cancellation: {e}")
 
             try:
                 from shared.notifications import notification_service
@@ -107,8 +107,8 @@ async def calcom_webhook(request: Request):
                     severity="warning",
                     agent="leads",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to send cancellation notification: {e}")
 
         return {"status": "ok", "trigger": trigger}
 

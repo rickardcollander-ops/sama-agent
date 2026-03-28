@@ -1,8 +1,11 @@
+import logging
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 
 from agents.content import content_agent
+
+logger = logging.getLogger(__name__)
 from agents.brand_voice import brand_voice
 from api.routes.content_chat import router as chat_router
 
@@ -244,18 +247,18 @@ async def run_content_analysis_legacy():
     try:
         from agents.seo import seo_agent as _seo
         await _seo.track_keyword_rankings()
-    except Exception:
-        pass
-    
+    except Exception as e:
+        logger.debug(f"Failed to update keyword rankings from GSC: {e}")
+
     # 2b. Fetch SEO keywords (now with fresh GSC data)
     seo_keywords = []
     try:
         sb = get_supabase()
         kw_result = sb.table("seo_keywords").select("*").execute()
         seo_keywords = kw_result.data or []
-    except Exception:
-        pass
-    
+    except Exception as e:
+        logger.debug(f"Failed to fetch SEO keywords: {e}")
+
     # 3. Analyze content gaps - keywords without content
     existing_keywords = set()
     for cp in content_pieces:
@@ -352,7 +355,8 @@ async def run_content_analysis_legacy():
             })
     
     # 6. Competitor comparison pages
-    competitors = ["gainsight", "totango", "churnzero"]
+    from shared.config import settings
+    competitors = [c.split('.')[0] for c in settings.SEO_COMPETITORS]
     existing_comparisons = [cp for cp in content_pieces if cp.get("content_type") == "comparison"]
     existing_comp_names = [cp.get("title", "").lower() for cp in existing_comparisons]
     for comp in competitors:
@@ -372,8 +376,8 @@ async def run_content_analysis_legacy():
     competitor_gap_result = {}
     try:
         competitor_gap_result = await content_agent.analyze_competitor_content_gaps()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to analyze competitor content gaps: {e}")
 
     existing_action_keywords = {a.get("keyword", "").lower() for a in actions if a.get("keyword")}
     for gap in competitor_gap_result.get("gaps", []):
@@ -456,9 +460,9 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
             if error:
                 update["error_message"] = error
             sb.table("agent_actions").update(update).eq("id", db_row_id).execute()
-        except Exception:
-            pass
-    
+        except Exception as e:
+            logger.debug(f"Failed to update action status in DB: {e}")
+
     try:
         if action_type == "blog_post":
             # Generate blog post
@@ -503,18 +507,18 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                     from shared.event_bus_registry import get_event_bus
                     bus = get_event_bus()
                     if bus:
-                        await bus.publish("content_published", {
+                        await bus.publish("content_published", "sama_social", {
                             "title": result.get("title", ""),
                             "url": f"https://successifier.com/blog/{slug}",
                             "type": "blog_post",
                             "keyword": keyword,
                             "pr_url": github_result.get("pr_url", ""),
                         })
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to publish content_published event for blog: {e}")
 
             return outcome
-        
+
         elif action_type == "comparison":
             competitor = action.get("competitor", "")
             if competitor:
@@ -546,15 +550,15 @@ async def execute_content_action(action: Dict[str, Any] = Body(...)):
                         from shared.event_bus_registry import get_event_bus
                         bus = get_event_bus()
                         if bus:
-                            await bus.publish("content_published", {
+                            await bus.publish("content_published", "sama_social", {
                                 "title": result.get("title", f"Successifier vs {competitor.title()}"),
                                 "url": f"https://successifier.com/vs/{competitor.lower().replace(' ', '-')}",
                                 "type": "comparison",
                                 "competitor": competitor,
                                 "pr_url": github_result.get("pr_url", ""),
                             })
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to publish content_published event for comparison: {e}")
 
                 return outcome
             return {"success": False, "message": "No competitor specified"}
