@@ -14,55 +14,81 @@ async def run_agent_ooda_cycle(
     decide_fn: Callable
 ) -> Dict[str, Any]:
     """
-    Generic OODA cycle runner for any agent
-    
+    Generic OODA cycle runner for any agent.
+    Automatically injects past learnings into the DECIDE phase
+    and sends a notification when the cycle completes.
+
     Args:
         agent_name: Name of the agent (seo, ads, content, social, reviews)
         observe_fn: Async function that returns observations dict
         orient_fn: Async function that takes observations and returns analysis dict
         decide_fn: Async function that takes analysis and returns list of actions
-    
+
     Returns:
         Full OODA cycle results with cycle_id, observations, analysis, actions
     """
     ooda = OODALoop(agent_name=agent_name)
-    
+
     try:
         # Start cycle
         cycle_id = await ooda.start_cycle()
-        
+
         # OBSERVE
         observations = await observe_fn()
         await ooda.observe(observations)
-        
-        # ORIENT
+
+        # ORIENT — inject past learnings into analysis for the DECIDE phase
         analysis = await orient_fn(observations)
+        try:
+            from shared.memory import AgentMemory
+            memory = AgentMemory(agent_name)
+            learnings_context = await memory.get_prompt_context()
+            if learnings_context:
+                analysis["learnings_context"] = learnings_context
+                analysis["learnings_injected"] = True
+        except Exception:
+            pass  # learnings table may not exist yet
         await ooda.orient(analysis)
-        
+
         # DECIDE
         actions = await decide_fn(analysis, observations)
         await ooda.decide(actions)
-        
+
+        summary = {
+            "total_actions": len(actions),
+            "critical": sum(1 for a in actions if a.get("priority") == "critical"),
+            "high": sum(1 for a in actions if a.get("priority") == "high"),
+            "medium": sum(1 for a in actions if a.get("priority") == "medium"),
+            "insights_discovered": analysis.get("insights_count", 0),
+            "patterns_found": len(analysis.get("patterns", [])),
+            "anomalies_detected": len(analysis.get("anomalies", [])),
+            "learnings_used": analysis.get("learnings_injected", False),
+        }
+
+        # Notify on cycle completion
+        try:
+            from shared.notifications import notification_service
+            await notification_service.notify(
+                title=f"{agent_name.upper()} OODA cycle #{ooda.cycle_number} complete",
+                message=f"{summary['total_actions']} actions generated ({summary['critical']} critical, {summary['high']} high)",
+                severity="success" if summary["total_actions"] > 0 else "info",
+                agent=agent_name,
+            )
+        except Exception:
+            pass
+
         # Return results (ACT happens via /execute, REFLECT happens after actions complete)
         return {
             "success": True,
             "cycle_id": cycle_id,
             "cycle_number": ooda.cycle_number,
             "ooda_status": "decided",
-            "summary": {
-                "total_actions": len(actions),
-                "critical": sum(1 for a in actions if a.get("priority") == "critical"),
-                "high": sum(1 for a in actions if a.get("priority") == "high"),
-                "medium": sum(1 for a in actions if a.get("priority") == "medium"),
-                "insights_discovered": analysis.get("insights_count", 0),
-                "patterns_found": len(analysis.get("patterns", [])),
-                "anomalies_detected": len(analysis.get("anomalies", []))
-            },
+            "summary": summary,
             "observations": observations,
             "analysis": analysis,
             "actions": actions
         }
-    
+
     except Exception as e:
         await ooda.fail_cycle(str(e))
         raise

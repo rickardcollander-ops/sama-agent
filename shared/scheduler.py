@@ -12,6 +12,20 @@ from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
+
+async def _notify_failure(job_id: str, error: str):
+    """Send a dashboard notification when a scheduled job fails."""
+    try:
+        from shared.notifications import notification_service
+        await notification_service.notify(
+            title=f"Scheduled job failed: {job_id}",
+            message=error[:200],
+            severity="warning",
+            agent="scheduler",
+        )
+    except Exception:
+        pass  # notification table may not exist
+
 # In-memory tracking of job runs
 _job_history: Dict[str, Dict[str, Any]] = {
     "daily_keyword_tracking": {"last_run": None, "last_status": None, "last_error": None},
@@ -27,6 +41,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "weekly_goal_review":     {"last_run": None, "last_status": None, "last_error": None},
     "daily_dev_health_check": {"last_run": None, "last_status": None, "last_error": None},
     "daily_agent_reports":    {"last_run": None, "last_status": None, "last_error": None},
+    "weekly_social_analysis": {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -68,19 +83,22 @@ async def _run_daily_keyword_tracking():
     except Exception as e:
         logger.error(f"[scheduler] Keyword tracking failed: {e}")
         _record("daily_keyword_tracking", "error", str(e))
+        await _notify_failure("daily_keyword_tracking", str(e))
 
 
 async def _run_weekly_seo_audit():
-    """Run full SEO audit — technical checks + GSC summary + Claude recommendations."""
-    logger.info("[scheduler] Running weekly SEO audit...")
+    """Run full SEO OODA cycle — observe data, orient analysis, decide actions."""
+    logger.info("[scheduler] Running weekly SEO OODA analysis...")
     try:
-        from agents.seo import seo_agent
-        await seo_agent.run_weekly_audit()
-        logger.info("[scheduler] Weekly SEO audit done")
+        from api.routes.seo_analyze_ooda import run_seo_analysis_with_ooda
+        result = await run_seo_analysis_with_ooda()
+        total = result.get("summary", {}).get("total_actions", 0)
+        logger.info(f"[scheduler] SEO OODA done — {total} actions generated")
         _record("weekly_seo_audit", "success")
     except Exception as e:
-        logger.error(f"[scheduler] Weekly SEO audit failed: {e}")
+        logger.error(f"[scheduler] Weekly SEO OODA failed: {e}")
         _record("weekly_seo_audit", "error", str(e))
+        await _notify_failure("weekly_seo_audit", str(e))
 
 
 async def _run_daily_workflow():
@@ -113,6 +131,8 @@ async def _run_daily_workflow():
 
     status = "error" if errors else "success"
     _record("daily_workflow", status, "; ".join(errors) if errors else None)
+    if errors:
+        await _notify_failure("daily_workflow", "; ".join(errors))
     logger.info(f"[scheduler] Daily workflow finished with status: {status}")
 
 
@@ -128,41 +148,37 @@ async def _run_daily_metrics():
     except Exception as e:
         logger.error(f"[scheduler] Daily metrics collection failed: {e}")
         _record("daily_metrics", "error", str(e))
+        await _notify_failure("daily_metrics", str(e))
 
 
 async def _run_daily_ads_check():
-    """Check Google Ads campaigns and flag underperformers."""
-    logger.info("[scheduler] Running daily ads check...")
+    """Run ads OODA cycle — observe campaigns, orient analysis, decide actions."""
+    logger.info("[scheduler] Running daily ads OODA analysis...")
     try:
-        from agents.ads import ads_agent
-        result = await ads_agent.get_campaign_performance(date_range=7)
-        campaigns = result.get("campaigns", []) if isinstance(result, dict) else []
-        # Flag campaigns with 0 conversions or high CPA
-        flagged = 0
-        for c in campaigns:
-            if c.get("conversions", 0) == 0 and c.get("cost", 0) > 50:
-                flagged += 1
-            elif c.get("cpa", 0) > 100:
-                flagged += 1
-        logger.info(f"[scheduler] Ads check done — {len(campaigns)} campaigns, {flagged} flagged")
+        from api.routes.ads_analyze_ooda import run_ads_analysis_with_ooda
+        result = await run_ads_analysis_with_ooda()
+        total = result.get("summary", {}).get("total_actions", 0)
+        logger.info(f"[scheduler] Ads OODA done — {total} actions generated")
         _record("daily_ads_check", "success")
     except Exception as e:
-        logger.error(f"[scheduler] Daily ads check failed: {e}")
+        logger.error(f"[scheduler] Daily ads OODA failed: {e}")
         _record("daily_ads_check", "error", str(e))
+        await _notify_failure("daily_ads_check", str(e))
 
 
 async def _run_weekly_content_analysis():
-    """Run content gap analysis and generate actions."""
-    logger.info("[scheduler] Running weekly content analysis...")
+    """Run content OODA cycle — observe gaps, orient analysis, decide actions."""
+    logger.info("[scheduler] Running weekly content OODA analysis...")
     try:
-        from api.routes.content_analyze_ooda import _run_content_ooda
-        result = await _run_content_ooda()
-        actions = result.get("total_actions", 0) if isinstance(result, dict) else 0
-        logger.info(f"[scheduler] Content analysis done — {actions} actions generated")
+        from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
+        result = await run_content_analysis_with_ooda()
+        total = result.get("summary", {}).get("total_actions", 0)
+        logger.info(f"[scheduler] Content OODA done — {total} actions generated")
         _record("weekly_content_analysis", "success")
     except Exception as e:
-        logger.error(f"[scheduler] Weekly content analysis failed: {e}")
+        logger.error(f"[scheduler] Weekly content OODA failed: {e}")
         _record("weekly_content_analysis", "error", str(e))
+        await _notify_failure("weekly_content_analysis", str(e))
 
 
 async def _run_weekly_ai_visibility():
@@ -177,19 +193,37 @@ async def _run_weekly_ai_visibility():
     except Exception as e:
         logger.error(f"[scheduler] AI visibility check failed: {e}")
         _record("weekly_ai_visibility", "error", str(e))
+        await _notify_failure("weekly_ai_visibility", str(e))
 
 
 async def _run_midday_review_check():
-    """Second daily review check — catch reviews posted during the day."""
-    logger.info("[scheduler] Running midday review check...")
+    """Run reviews OODA cycle — fetch reviews, analyze sentiment, decide responses."""
+    logger.info("[scheduler] Running midday reviews OODA analysis...")
     try:
-        from agents.reviews import review_agent
-        await review_agent.fetch_all_reviews()
-        logger.info("[scheduler] Midday review check done")
+        from api.routes.reviews_analyze_ooda import run_reviews_analysis_with_ooda
+        result = await run_reviews_analysis_with_ooda()
+        total = result.get("summary", {}).get("total_actions", 0)
+        logger.info(f"[scheduler] Reviews OODA done — {total} actions generated")
         _record("midday_review_check", "success")
     except Exception as e:
-        logger.error(f"[scheduler] Midday review check failed: {e}")
+        logger.error(f"[scheduler] Reviews OODA failed: {e}")
         _record("midday_review_check", "error", str(e))
+        await _notify_failure("midday_review_check", str(e))
+
+
+async def _run_weekly_social_analysis():
+    """Run social OODA cycle — observe engagement, orient trends, decide posts."""
+    logger.info("[scheduler] Running weekly social OODA analysis...")
+    try:
+        from api.routes.social_analyze_ooda import run_social_analysis_with_ooda
+        result = await run_social_analysis_with_ooda()
+        total = result.get("summary", {}).get("total_actions", 0)
+        logger.info(f"[scheduler] Social OODA done — {total} actions generated")
+        _record("weekly_social_analysis", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] Social OODA failed: {e}")
+        _record("weekly_social_analysis", "error", str(e))
+        await _notify_failure("weekly_social_analysis", str(e))
 
 
 async def _run_daily_reflection():
@@ -207,6 +241,7 @@ async def _run_daily_reflection():
     except Exception as e:
         logger.error(f"[scheduler] Daily reflection failed: {e}")
         _record("daily_reflection", "error", str(e))
+        await _notify_failure("daily_reflection", str(e))
 
 
 async def _run_daily_digest():
@@ -244,6 +279,7 @@ async def _run_daily_digest():
     except Exception as e:
         logger.error(f"[scheduler] Daily digest failed: {e}")
         _record("daily_digest", "error", str(e))
+        await _notify_failure("daily_digest", str(e))
 
 
 async def _run_daily_agent_reports():
@@ -257,6 +293,7 @@ async def _run_daily_agent_reports():
     except Exception as e:
         logger.error(f"[scheduler] Agent reports failed: {e}")
         _record("daily_agent_reports", "error", str(e))
+        await _notify_failure("daily_agent_reports", str(e))
 
 
 async def _run_daily_dev_health_check():
@@ -273,6 +310,7 @@ async def _run_daily_dev_health_check():
     except Exception as e:
         logger.error(f"[scheduler] Dev health check failed: {e}")
         _record("daily_dev_health_check", "error", str(e))
+        await _notify_failure("daily_dev_health_check", str(e))
 
 
 async def _run_weekly_goal_review():
@@ -289,6 +327,7 @@ async def _run_weekly_goal_review():
     except Exception as e:
         logger.error(f"[scheduler] Weekly goal review failed: {e}")
         _record("weekly_goal_review", "error", str(e))
+        await _notify_failure("weekly_goal_review", str(e))
 
 
 def start():
@@ -397,12 +436,21 @@ def start():
         replace_existing=True,
     )
 
+    # Weekly social analysis — Tuesdays 11:00 UTC
+    scheduler.add_job(
+        _run_weekly_social_analysis,
+        CronTrigger(day_of_week="tue", hour=11, minute=0),
+        id="weekly_social_analysis",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "[scheduler] Started — "
-        "keywords 02:00, metrics 04:00, SEO audit Mon 03:00, "
-        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, AI visibility Thu 10:00, "
-        "reviews 14:00, content Wed 05:00, "
+        "keywords 02:00, SEO OODA Mon 03:00, metrics 04:00, "
+        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads OODA 08:00, "
+        "social OODA Tue 11:00, AI visibility Thu 10:00, "
+        "reviews OODA 14:00, content OODA Wed 05:00, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
 
