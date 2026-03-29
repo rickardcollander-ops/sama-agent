@@ -887,13 +887,13 @@ async def get_system_summary():
         try:
             content_drafts = sb.table("content_pieces").select("id", count="exact").eq("status", "draft").limit(0).execute()
             summary["drafts"]["content"] = content_drafts.count or 0
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[dev-agent] Failed to fetch content draft count: {e}")
         try:
             social_drafts = sb.table("social_posts").select("id", count="exact").eq("status", "draft").limit(0).execute()
             summary["drafts"]["social"] = social_drafts.count or 0
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[dev-agent] Failed to fetch social draft count: {e}")
 
         # Scheduler
         try:
@@ -902,16 +902,16 @@ async def get_system_summary():
             never_run = [name for name, info in history.items() if info.get("last_run") is None]
             summary["scheduler"]["never_run"] = never_run
             summary["scheduler"]["total_jobs"] = len(history)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[dev-agent] Failed to fetch scheduler info: {e}")
 
         # Error count
         try:
             since_72h = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
             errs = sb.table("agent_actions").select("id", count="exact").neq("error_message", None).gte("created_at", since_72h).limit(0).execute()
             summary["errors_72h"] = errs.count or 0
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[dev-agent] Failed to fetch error count: {e}")
 
         # Missing tables
         from agents.dev_agent import REQUIRED_TABLES

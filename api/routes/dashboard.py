@@ -129,6 +129,99 @@ async def get_all_pending_actions():
     return {"success": True, "total": len(actions), "actions": actions}
 
 
+@router.post("/actions/{action_id}/execute")
+async def execute_action_by_id(action_id: str):
+    """
+    Universal action execution endpoint.
+    Fetches the action from DB, routes to the correct agent's execute endpoint,
+    and marks it as completed regardless of result.
+    """
+    from shared.database import get_supabase
+    import httpx
+    from shared.config import settings
+
+    sb = get_supabase()
+
+    # Fetch the action
+    result = sb.table("agent_actions").select("*").eq("id", action_id).execute()
+    if not result.data:
+        return {"success": False, "error": "Action not found"}
+
+    action = result.data[0]
+    agent = action.get("agent_name", "")
+    action_type = action.get("action_type", "")
+
+    # Route to agent-specific execute endpoint
+    agent_routes = {
+        "seo": "/api/seo/execute",
+        "content": "/api/content/execute",
+        "ads": "/api/ads/execute",
+        "social": "/api/social/execute",
+        "reviews": "/api/reviews/execute",
+    }
+
+    route = agent_routes.get(agent)
+    execute_result = None
+
+    if route:
+        try:
+            payload = {
+                "id": action_id,
+                "action_type": action_type,
+                "type": action_type,
+                "keyword": action.get("keyword", ""),
+                "title": action.get("title", ""),
+                "description": action.get("description", ""),
+                "competitor": action.get("competitor", ""),
+                "content_id": action.get("content_id", ""),
+            }
+            api_url = settings.SAMA_API_URL
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(f"{api_url}{route}", json=payload)
+                execute_result = resp.json()
+        except Exception as e:
+            logger.warning(f"Agent execute failed for {agent}/{action_type}: {e}")
+            execute_result = {"error": str(e)}
+
+    # Always mark the action as completed (or failed)
+    try:
+        success = execute_result.get("success", False) if execute_result else False
+        sb.table("agent_actions").update({
+            "status": "completed" if success else "failed",
+            "executed_at": datetime.utcnow().isoformat(),
+            "execution_result": execute_result,
+        }).eq("id", action_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to update action status: {e}")
+
+    return {
+        "success": True,
+        "action_id": action_id,
+        "agent": agent,
+        "execute_result": execute_result,
+    }
+
+
+@router.delete("/actions/{action_id}")
+async def dismiss_action(action_id: str):
+    """
+    Universal action dismiss endpoint.
+    Marks action as dismissed (removes from pending list).
+    """
+    from shared.database import get_supabase
+
+    sb = get_supabase()
+    try:
+        sb.table("agent_actions").update({
+            "status": "dismissed",
+            "executed_at": datetime.utcnow().isoformat(),
+        }).eq("id", action_id).execute()
+        return {"success": True, "message": f"Action {action_id} dismissed"}
+    except Exception as e:
+        logger.error(f"Failed to dismiss action: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @router.get("/recommendations")
 async def get_smart_recommendations():
     """
