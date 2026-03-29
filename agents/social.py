@@ -477,7 +477,8 @@ Format as plain text.
         if thread:
             try:
                 tweets = json.loads(content)
-            except:
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug(f"Failed to parse thread as JSON, falling back to line split: {e}")
                 tweets = [t.strip() for t in content.split('\n') if t.strip()]
         else:
             tweets = [content]

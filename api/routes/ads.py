@@ -1,8 +1,11 @@
+import logging
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from agents.ads import ads_agent
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -123,8 +126,8 @@ async def get_status():
     if configured:
         try:
             live_campaigns = await ads_agent.get_campaign_performance(date_range=30)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to fetch live campaign performance: {e}")
 
     return {
         "agent": "ads",
@@ -150,8 +153,8 @@ async def get_campaigns():
     if is_ads_configured():
         try:
             live_campaigns = await ads_agent.get_campaign_performance(date_range=30)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to fetch campaign performance: {e}")
 
     return {
         "campaigns": live_campaigns,
@@ -490,8 +493,8 @@ async def execute_ads_action(action: Dict[str, Any] = Body(...)):
             if error:
                 update["error_message"] = error
             sb.table("agent_actions").update(update).eq("id", db_row_id).execute()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to update action status in DB: {e}")
 
     try:
         if action_type == "ad_copy":

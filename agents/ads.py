@@ -393,7 +393,8 @@ Format as JSON:
         
         try:
             rsa_data = json.loads(response.content[0].text)
-        except:
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.debug(f"Failed to parse RSA data from Claude response: {e}")
             rsa_data = {
                 "headlines": self.RSA_HEADLINE_BANK[:15],
                 "descriptions": self.RSA_DESCRIPTION_BANK

@@ -400,7 +400,8 @@ Format as JSON:
 
             import json
             themes = json.loads(response.content[0].text)
-        except:
+        except (json.JSONDecodeError, KeyError, IndexError, Exception) as e:
+            logger.debug(f"Failed to analyze review themes: {e}")
             themes = {
                 "positive_features": [],
                 "pain_points": [],

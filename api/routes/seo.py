@@ -1,9 +1,12 @@
 import asyncio
+import logging
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from agents.seo import seo_agent
+
+logger = logging.getLogger(__name__)
 from api.routes.seo_chat import router as chat_router
 
 router = APIRouter()
@@ -674,8 +677,8 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
                     "executed_at": datetime.utcnow().isoformat(),
                     "error_message": error
                 }).eq("id", db_row_id).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to mark action as failed in DB: {e}")
 
     try:
         if action_type == "content":

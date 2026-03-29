@@ -18,7 +18,8 @@ GITHUB_API = "https://api.github.com"
 
 def _get_blog_cta_markdown() -> str:
     """CTA block appended to every blog post (markdown)."""
-    booking_url = getattr(settings, 'CALCOM_BOOKING_URL', '') or 'https://successifier.com/demo'
+    booking_url = settings.CALCOM_BOOKING_URL or 'https://successifier.com/demo'
+    api_url = settings.SAMA_API_URL
     return f"""
 
 ---
@@ -31,7 +32,7 @@ Successifier helps SaaS teams reduce churn by 40% and boost NRR by 25% — auton
 
 Or tell us about your challenges:
 
-<form action="https://web-production-5324a.up.railway.app/api/leads/capture" method="POST" style="max-width:480px">
+<form action="{api_url}/api/leads/capture" method="POST" style="max-width:480px">
   <input type="hidden" name="source_url" value="{{{{page_url}}}}" />
   <input type="email" name="email" placeholder="your@email.com" required style="width:100%;padding:8px;margin:4px 0" />
   <input type="text" name="company" placeholder="Company name" style="width:100%;padding:8px;margin:4px 0" />
@@ -42,7 +43,7 @@ Or tell us about your challenges:
 
 def _get_comparison_cta_jsx(competitor: str) -> str:
     """CTA JSX block for comparison pages."""
-    booking_url = getattr(settings, 'CALCOM_BOOKING_URL', '') or 'https://successifier.com/demo'
+    booking_url = settings.CALCOM_BOOKING_URL or 'https://successifier.com/demo'
     return f"""
         <div className="mt-16 rounded-2xl bg-blue-600 p-8 text-center text-white">
           <h2 className="text-2xl font-bold">Ready to switch from {competitor.title()}?</h2>

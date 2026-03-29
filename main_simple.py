@@ -261,7 +261,8 @@ Format as JSON:
         import json
         try:
             rsa_data = json.loads(response.content[0].text)
-        except:
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.debug(f"Failed to parse RSA data from Claude response: {e}")
             # Fallback
             rsa_data = {
                 "headlines": [

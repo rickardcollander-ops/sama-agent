@@ -2,10 +2,13 @@
 Content Agent /analyze endpoint with OODA loop implementation
 """
 
+import logging
 from typing import Dict, Any
 from shared.ooda_templates import run_agent_ooda_cycle, create_analysis_structure, add_pattern, add_anomaly, create_action
 from shared.database import get_supabase
 from agents.brand_voice import brand_voice
+
+logger = logging.getLogger(__name__)
 
 
 async def run_content_analysis_with_ooda() -> Dict[str, Any]:
@@ -27,8 +30,8 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
         try:
             from agents.seo import seo_agent
             await seo_agent.track_keyword_rankings()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to update keyword rankings from GSC: {e}")
 
         # Fetch SEO keywords
         try:

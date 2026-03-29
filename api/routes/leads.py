@@ -111,7 +111,7 @@ async def capture_lead(request: Request):
             from shared.event_bus_registry import get_event_bus
             bus = get_event_bus()
             if bus:
-                await bus.publish("lead_captured", {
+                await bus.publish("lead_captured", "sama_leads", {
                     "lead_id": lead_id,
                     "email": email,
                     "company": data.get("company", ""),

@@ -4,8 +4,11 @@ Creates tables in Supabase and initializes data
 """
 
 import sys
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load env first
 load_dotenv('.env.local', override=True)
@@ -125,8 +128,8 @@ def setup():
             if stmt and not stmt.startswith('--'):
                 try:
                     sb.rpc("exec_sql", {"query": stmt + ";"}).execute()
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"SQL statement failed (may already exist): {e}")
         print("✅ Tables created (or already exist)\n")
         print("   ⚠️  If tables weren't created automatically, run the SQL")
         print("   in Supabase Dashboard → SQL Editor. See SETUP_SQL.sql\n")
