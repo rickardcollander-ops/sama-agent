@@ -181,13 +181,17 @@ async def get_leads(
 
 
 @router.get("/leads/stats")
-async def get_lead_stats():
+async def get_lead_stats(request: Request):
     """Get lead pipeline statistics for dashboard."""
     try:
         from shared.database import get_supabase
         sb = get_supabase()
+        tenant_id = getattr(request.state, "tenant_id", "default")
 
-        all_leads = sb.table("leads").select("status,score,utm_source,created_at").execute()
+        query = sb.table("leads").select("status,score,utm_source,created_at")
+        if tenant_id and tenant_id != "default":
+            query = query.eq("tenant_id", tenant_id)
+        all_leads = query.execute()
         leads = all_leads.data or []
 
         total = len(leads)
