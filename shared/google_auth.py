@@ -93,6 +93,88 @@ def is_ga4_configured() -> bool:
     )
 
 
+async def get_google_access_token(tenant_id: str, service: str) -> str:
+    """
+    Get a valid access token for a tenant's Google service, refreshing if needed.
+
+    Reads stored tokens from the google_connections table. If the access token
+    is expired, uses the refresh_token to obtain a new one and updates the DB.
+
+    Args:
+        tenant_id: The tenant identifier
+        service: One of 'search_console', 'analytics', 'ads'
+
+    Returns:
+        A valid access token string
+
+    Raises:
+        ValueError: If no connection exists or refresh fails
+    """
+    import time as _time
+    from datetime import datetime, timezone
+    from shared.database import get_supabase
+
+    sb = get_supabase()
+    result = (
+        sb.table("google_connections")
+        .select("access_token, refresh_token, token_expiry")
+        .eq("tenant_id", tenant_id)
+        .eq("service", service)
+        .single()
+        .execute()
+    )
+
+    if not result.data:
+        raise ValueError(f"No Google {service} connection for tenant {tenant_id}")
+
+    row = result.data
+    access_token = row.get("access_token")
+    refresh_token = row.get("refresh_token")
+    token_expiry = row.get("token_expiry")
+
+    # Check if token is still valid (with 60s buffer)
+    if access_token and token_expiry:
+        try:
+            expiry_dt = datetime.fromisoformat(token_expiry.replace("Z", "+00:00"))
+            if expiry_dt.timestamp() > _time.time() + 60:
+                return access_token
+        except (ValueError, TypeError):
+            pass  # expiry unparseable, refresh anyway
+
+    if not refresh_token:
+        raise ValueError(f"No refresh token stored for Google {service}, tenant {tenant_id}")
+
+    # Refresh the token
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(TOKEN_URL, data={
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        })
+
+    if resp.status_code != 200:
+        logger.error(f"Token refresh failed for tenant {tenant_id} / {service}: {resp.status_code} {resp.text}")
+        raise ValueError(f"Failed to refresh Google {service} token: {resp.status_code}")
+
+    data = resp.json()
+    new_access_token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+    new_expiry = datetime.fromtimestamp(_time.time() + expires_in, tz=timezone.utc).isoformat()
+
+    # Update stored token
+    try:
+        sb.table("google_connections").update({
+            "access_token": new_access_token,
+            "token_expiry": new_expiry,
+        }).eq("tenant_id", tenant_id).eq("service", service).execute()
+    except Exception as exc:
+        logger.warning(f"Failed to update refreshed token in DB: {exc}")
+
+    logger.info(f"Refreshed Google {service} token for tenant {tenant_id}")
+    return new_access_token
+
+
 def is_ads_configured() -> bool:
     """Check if Google Ads credentials are configured"""
     return bool(

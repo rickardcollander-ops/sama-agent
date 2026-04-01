@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     GOOGLE_ADS_CLIENT_SECRET: str = ""
     GOOGLE_ADS_REFRESH_TOKEN: str = ""
     GOOGLE_ADS_CUSTOMER_ID: str = ""
+    GOOGLE_OAUTH_REDIRECT_URI: str = "https://web-production-5324a.up.railway.app/api/auth/google/callback"
     
     # SEO APIs
     SEMRUSH_API_KEY: str = ""
