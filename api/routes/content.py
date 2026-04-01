@@ -138,13 +138,16 @@ async def get_content_library():
             "total": len(pieces),
             "content": [
                 {
-                    "id": str(cp.get("id", "")),
-                    "title": cp.get("title", ""),
-                    "type": cp.get("content_type", ""),
-                    "status": cp.get("status", "draft"),
-                    "word_count": cp.get("word_count", 0),
-                    "target_keyword": cp.get("target_keyword", ""),
-                    "meta_description": cp.get("meta_description", ""),
+                    "id": str(cp.get("id") or ""),
+                    "title": cp.get("title") or "",
+                    "type": cp.get("content_type") or "",
+                    "status": cp.get("status") or "draft",
+                    "word_count": cp.get("word_count") or 0,
+                    "target_keyword": cp.get("target_keyword") or "",
+                    "meta_description": cp.get("meta_description") or "",
+                    "impressions_30d": cp.get("impressions_30d") or 0,
+                    "clicks_30d": cp.get("clicks_30d") or 0,
+                    "avg_position": cp.get("avg_position") or 0.0,
                     "created_at": cp.get("created_at")
                 }
                 for cp in pieces

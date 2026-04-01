@@ -34,7 +34,14 @@ async def get_metrics(days: int = 30):
     try:
         sb = get_supabase()
         result = sb.table("daily_metrics").select("*").order("date", desc=True).limit(days).execute()
-        return {"metrics": result.data or []}
+        rows = result.data or []
+        # Ensure numeric fields are never null (prevents frontend toLocaleString crashes)
+        numeric_keys = ("clicks", "impressions", "sessions", "pageviews", "conversions", "bounce_rate", "avg_position")
+        for row in rows:
+            for key in numeric_keys:
+                if key in row and row[key] is None:
+                    row[key] = 0
+        return {"metrics": rows}
     except Exception as e:
         return {"metrics": [], "error": str(e)}
 
