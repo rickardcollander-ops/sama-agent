@@ -413,6 +413,17 @@ async def create_ad_creative(request: Request, payload: AdCreativeCreate):
 
 # ── CRUD: Update creative ───────────────────────────────────────────────────
 
+@router.delete("/creatives/{creative_id}")
+async def delete_ad_creative(creative_id: str, request: Request):
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+        sb.table("ad_creatives").delete().eq("id", creative_id).eq("tenant_id", tenant_id).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @router.patch("/creatives/{creative_id}")
 async def update_ad_creative(creative_id: str, payload: AdCreativeUpdate):
     """Update an existing ad creative draft."""
