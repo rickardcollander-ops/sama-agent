@@ -136,6 +136,9 @@ class Settings(BaseSettings):
     AUTO_RESPOND_REVIEWS_NEGATIVE: bool = False
     BUDGET_CHANGE_APPROVAL_THRESHOLD: float = 0.30
     
+    # Demo Mode - when True, GET endpoints return realistic seed data
+    DEMO_MODE: bool = False
+
     # CORS
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",

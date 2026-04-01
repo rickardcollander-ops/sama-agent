@@ -44,8 +44,8 @@ async def get_seo_stats():
         keywords = result.data or []
 
         positions = [kw["current_position"] for kw in keywords if kw.get("current_position")]
-        total_clicks = sum(kw.get("current_clicks", 0) for kw in keywords)
-        total_impressions = sum(kw.get("current_impressions", 0) for kw in keywords)
+        total_clicks = sum((kw.get("current_clicks") or 0) for kw in keywords)
+        total_impressions = sum((kw.get("current_impressions") or 0) for kw in keywords)
         avg_position = round(sum(positions) / len(positions), 1) if positions else 0
         avg_ctr = round((total_clicks / total_impressions * 100), 2) if total_impressions else 0
 
@@ -132,13 +132,14 @@ async def get_keywords():
             "total": len(keywords),
             "keywords": [
                 {
-                    "keyword": kw.get("keyword", ""),
-                    "intent": kw.get("intent", ""),
-                    "priority": kw.get("priority", ""),
-                    "current_position": kw.get("current_position", 0),
-                    "current_clicks": kw.get("current_clicks", 0),
-                    "current_impressions": kw.get("current_impressions", 0),
-                    "target_page": kw.get("target_page", "")
+                    "keyword": kw.get("keyword") or "",
+                    "intent": kw.get("intent") or "",
+                    "priority": kw.get("priority") or "",
+                    "current_position": kw.get("current_position") or 0,
+                    "current_clicks": kw.get("current_clicks") or 0,
+                    "current_impressions": kw.get("current_impressions") or 0,
+                    "current_ctr": kw.get("current_ctr") or 0.0,
+                    "target_page": kw.get("target_page") or ""
                 }
                 for kw in keywords
             ]
