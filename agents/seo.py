@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 PAGESPEED_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 # Google Search Console API
 GSC_API = "https://searchconsole.googleapis.com/webmasters/v3"
-# GSC uses sc-domain: format for domain properties
+# GSC uses sc-domain: format for domain properties (global default)
 GSC_SITE_URL = settings.GSC_SITE_URL
-# HTTP URL for PageSpeed and technical checks
+# HTTP URL for PageSpeed and technical checks (global default)
 SITE_URL = "https://successifier.com"
 
 
@@ -39,14 +39,26 @@ class SEOAgent:
     - On-page optimization
     - Competitor analysis
     """
-    
+
     COMPETITORS = ["gainsight.com", "totango.com", "churnzero.com"]
-    
-    def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
+
+    def __init__(self, tenant_config=None):
+        self.tenant_config = tenant_config
+        api_key = tenant_config.anthropic_api_key if tenant_config else settings.ANTHROPIC_API_KEY
+        self.client = Anthropic(api_key=api_key) if api_key else None
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.sb = None
+
+        # Per-tenant overrides with backward-compatible defaults
+        if tenant_config:
+            self.gsc_site_url = tenant_config.gsc_site_url
+            self.site_url = tenant_config.site_url
+            self.competitors = tenant_config.competitors
+        else:
+            self.gsc_site_url = GSC_SITE_URL
+            self.site_url = SITE_URL
+            self.competitors = list(self.COMPETITORS)
     
     def _get_sb(self):
         if not self.sb:

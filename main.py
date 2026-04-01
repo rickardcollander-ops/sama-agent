@@ -21,6 +21,7 @@ from shared.config import settings
 from shared.database import init_db, get_supabase
 from shared import scheduler as job_scheduler
 from shared.event_bus_registry import set_event_bus, get_event_bus
+from shared.tenant_middleware import TenantMiddleware
 
 # Configure logging
 logging.basicConfig(
@@ -111,6 +112,9 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+
+# Tenant middleware - extracts tenant_id from requests
+app.add_middleware(TenantMiddleware)
 
 # CORS middleware - allow all origins for now to fix deployment issues
 app.add_middleware(

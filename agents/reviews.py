@@ -116,11 +116,20 @@ class ReviewAgent:
         }
     }
     
-    def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    def __init__(self, tenant_config=None):
+        self.tenant_config = tenant_config
+        api_key = tenant_config.anthropic_api_key if tenant_config else settings.ANTHROPIC_API_KEY
+        self.client = Anthropic(api_key=api_key) if api_key else None
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
+
+        # Override review platforms from tenant config if available
+        if tenant_config and tenant_config.review_platforms:
+            for key, platform_override in tenant_config.review_platforms.items():
+                if key in self.PLATFORMS:
+                    self.PLATFORMS = dict(self.PLATFORMS)  # avoid mutating class attr
+                    self.PLATFORMS[key] = {**self.PLATFORMS[key], **platform_override}
 
     async def fetch_all_reviews(self) -> List[Dict[str, Any]]:
         """

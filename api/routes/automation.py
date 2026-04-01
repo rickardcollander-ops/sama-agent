@@ -2,7 +2,7 @@
 Automation Routes - Scheduled Tasks and Workflows
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 from typing import Optional
 import logging
@@ -16,12 +16,38 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _get_tenant_id(request: Request) -> Optional[str]:
+    """Extract tenant_id from request.state (set by TenantMiddleware)."""
+    return getattr(request.state, "tenant_id", None)
+
+
+async def _get_agents(tenant_id: Optional[str]):
+    """Return tenant-scoped agents when a non-default tenant_id is provided,
+    otherwise fall back to the global singleton agents."""
+    if tenant_id and tenant_id != "default":
+        from shared.tenant_agents import (
+            get_seo_agent, get_content_agent, get_social_agent, get_review_agent,
+        )
+        return (
+            await get_seo_agent(tenant_id),
+            await get_content_agent(tenant_id),
+            await get_social_agent(tenant_id),
+            await get_review_agent(tenant_id),
+        )
+    return seo_agent, content_agent, social_agent, review_agent
+
+
 class DailyWorkflowRequest(BaseModel):
     force: bool = False
+    tenant_id: Optional[str] = None
 
 
 @router.post("/daily-workflow")
-async def run_daily_workflow(request: DailyWorkflowRequest, background_tasks: BackgroundTasks):
+async def run_daily_workflow(
+    request: Request,
+    body: DailyWorkflowRequest,
+    background_tasks: BackgroundTasks,
+):
     """
     Run daily automated workflow:
     1. SEO keyword tracking
@@ -29,36 +55,41 @@ async def run_daily_workflow(request: DailyWorkflowRequest, background_tasks: Ba
     3. Social post generation
     4. Analytics update
     """
+    # Prefer explicit body param, then middleware value
+    tenant_id = body.tenant_id or _get_tenant_id(request)
     try:
+        _seo, _content, _social, _review = await _get_agents(tenant_id)
+
         results = {
+            "tenant_id": tenant_id,
             "seo": None,
             "reviews": None,
             "social": None,
             "timestamp": None
         }
-        
+
         # Run SEO keyword tracking
         logger.info("Running daily SEO keyword tracking...")
         try:
-            seo_result = await seo_agent.track_keyword_rankings()
+            seo_result = await _seo.track_keyword_rankings()
             results["seo"] = {"status": "success", "keywords_tracked": len(seo_result)}
         except Exception as e:
             logger.error(f"SEO tracking failed: {e}")
             results["seo"] = {"status": "error", "message": str(e)}
-        
+
         # Monitor reviews
         logger.info("Monitoring review platforms...")
         try:
-            review_result = await review_agent.fetch_all_reviews()
+            review_result = await _review.fetch_all_reviews()
             results["reviews"] = {"status": "success", "platforms_checked": len(review_result)}
         except Exception as e:
             logger.error(f"Review monitoring failed: {e}")
             results["reviews"] = {"status": "error", "message": str(e)}
-        
+
         # Generate social post
         logger.info("Generating daily social post...")
         try:
-            social_result = await social_agent.generate_post(
+            social_result = await _social.generate_post(
                 topic="Daily CS insight or product update",
                 style="educational"
             )
@@ -66,23 +97,23 @@ async def run_daily_workflow(request: DailyWorkflowRequest, background_tasks: Ba
         except Exception as e:
             logger.error(f"Social post generation failed: {e}")
             results["social"] = {"status": "error", "message": str(e)}
-        
+
         from datetime import datetime
         results["timestamp"] = datetime.utcnow().isoformat()
-        
+
         return {
             "success": True,
             "message": "Daily workflow completed",
             "results": results
         }
-        
+
     except Exception as e:
         logger.error(f"Daily workflow failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/weekly-seo-audit")
-async def run_weekly_seo_audit(background_tasks: BackgroundTasks):
+async def run_weekly_seo_audit(request: Request, background_tasks: BackgroundTasks):
     """
     Run comprehensive weekly SEO audit:
     - Full site crawl
@@ -90,8 +121,10 @@ async def run_weekly_seo_audit(background_tasks: BackgroundTasks):
     - Competitor analysis
     - Content gap identification
     """
+    tenant_id = _get_tenant_id(request)
     try:
-        background_tasks.add_task(seo_agent.run_weekly_audit)
+        _seo, _, _, _ = await _get_agents(tenant_id)
+        background_tasks.add_task(_seo.run_weekly_audit)
         return {
             "success": True,
             "message": "Weekly SEO audit started in background"
@@ -101,41 +134,44 @@ async def run_weekly_seo_audit(background_tasks: BackgroundTasks):
 
 
 @router.post("/content-generation-workflow")
-async def run_content_generation_workflow(background_tasks: BackgroundTasks):
+async def run_content_generation_workflow(request: Request, background_tasks: BackgroundTasks):
     """
     Automated content generation workflow:
     1. Identify keyword opportunities from SEO agent
     2. Generate blog post for top opportunity
     3. Create social posts to promote content
     """
+    tenant_id = _get_tenant_id(request)
     try:
+        _seo, _content, _social, _ = await _get_agents(tenant_id)
+
         # Get keyword opportunities
-        opportunities = await seo_agent.discover_keyword_opportunities()
-        
+        opportunities = await _seo.discover_keyword_opportunities()
+
         if not opportunities:
             return {
                 "success": True,
                 "message": "No keyword opportunities found",
                 "content_generated": False
             }
-        
+
         # Take top opportunity
         top_opportunity = opportunities[0]
-        
+
         # Generate blog post
-        blog_result = await content_agent.generate_blog_post(
+        blog_result = await _content.generate_blog_post(
             topic=f"Complete guide to {top_opportunity['keyword']}",
             target_keyword=top_opportunity['keyword'],
             word_count=2000,
             pillar="churn_prevention"  # Default pillar
         )
-        
+
         # Generate social post to promote
-        social_result = await social_agent.generate_post(
+        social_result = await _social.generate_post(
             topic=f"New blog post: {blog_result['title']}",
             style="announcement"
         )
-        
+
         return {
             "success": True,
             "message": "Content generation workflow completed",
@@ -149,7 +185,7 @@ async def run_content_generation_workflow(background_tasks: BackgroundTasks):
                 "platform": social_result.get("platform")
             }
         }
-        
+
     except Exception as e:
         logger.error(f"Content generation workflow failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -219,31 +255,31 @@ async def run_content_refresh_workflow():
     """
     try:
         from agents.content_advanced import advanced_content_generator
-        
+
         # Identify content to refresh
         content_to_refresh = await advanced_content_generator.identify_content_for_refresh()
-        
+
         if not content_to_refresh:
             return {
                 "success": True,
                 "message": "No content needs refreshing",
                 "refreshed_count": 0
             }
-        
+
         # Refresh top 5 oldest pieces
         refreshed = []
         for content in content_to_refresh[:5]:
             result = await advanced_content_generator.refresh_content(content["id"])
             if result.get("success"):
                 refreshed.append(content["id"])
-        
+
         return {
             "success": True,
             "message": f"Refreshed {len(refreshed)} content pieces",
             "refreshed_count": len(refreshed),
             "total_identified": len(content_to_refresh)
         }
-        
+
     except Exception as e:
         logger.error(f"Content refresh workflow failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -257,9 +293,9 @@ async def generate_weekly_report():
     """
     try:
         from agents.reporting import report_generator
-        
+
         result = await report_generator.generate_weekly_master_report()
-        
+
         if result.get("success"):
             return {
                 "success": True,
@@ -269,7 +305,7 @@ async def generate_weekly_report():
             }
         else:
             raise HTTPException(status_code=500, detail=result.get("error"))
-            
+
     except Exception as e:
         logger.error(f"Weekly report generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
