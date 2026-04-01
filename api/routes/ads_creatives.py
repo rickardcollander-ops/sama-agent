@@ -26,6 +26,17 @@ class GenerateCopyRequest(BaseModel):
     brand_description: str = ""
     target_audience: str = ""
     competitors: Optional[str] = ""
+    tone_of_voice: Optional[str] = ""
+    brand_name: Optional[str] = ""
+    domain: Optional[str] = ""
+
+
+class CompetitorAdAnalysisRequest(BaseModel):
+    competitors: List[str] = []
+    platform: str = "meta"
+    brand_name: str = ""
+    brand_description: str = ""
+    target_audience: str = ""
 
 
 class AnalyzeScreenshotRequest(BaseModel):
@@ -68,30 +79,75 @@ def _ensure_numeric_perf(row: dict) -> dict:
 
 # ── AI: Generate ad copy ────────────────────────────────────────────────────
 
+async def _load_brand_context(tenant_id: str) -> dict:
+    """Load brand settings from user_settings for a tenant."""
+    try:
+        sb = get_supabase()
+        data = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+        return data.data.get("settings", {}) if data.data else {}
+    except Exception:
+        return {}
+
+
 @router.post("/generate-copy")
-async def generate_ad_copy(payload: GenerateCopyRequest):
-    """Use Anthropic Claude to generate ad copy."""
+async def generate_ad_copy(request: Request, payload: GenerateCopyRequest):
+    """Use Anthropic Claude to generate ad copy, personalized to the brand."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
     try:
         import anthropic
+
+        # Load brand context from DB if not provided in payload
+        brand = await _load_brand_context(tenant_id) if tenant_id != "default" else {}
+        brand_name = payload.brand_name or brand.get("brand_name", "")
+        brand_desc = payload.brand_description or brand.get("brand_description", "")
+        audience = payload.target_audience or brand.get("target_audience", "")
+        competitors = payload.competitors or ", ".join(brand.get("competitors", []))
+        tone = payload.tone_of_voice or brand.get("tone_of_voice", "professional")
+        domain = payload.domain or brand.get("domain", "")
+
+        char_limits = {
+            "meta": {"headline": 40, "body": 125},
+            "linkedin": {"headline": 70, "body": 600},
+            "google": {"headline": 30, "body": 90},
+        }
+        limits = char_limits.get(payload.platform, {"headline": 50, "body": 200})
 
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
         prompt = f"""You are an expert digital advertising copywriter.
-Generate ad copy for the following brief:
 
-Platform: {payload.platform}
-Ad format: {payload.format}
-Campaign goal: {payload.goal}
-Brand: {payload.brand_description}
-Target audience: {payload.target_audience}
-Competitors to differentiate from: {payload.competitors}
+Generate ad copy for {brand_name} ({domain}).
 
-Return ONLY a JSON object with these keys (no markdown, no code fences):
+BRAND CONTEXT:
+- Brand: {brand_name}
+- Description: {brand_desc}
+- Website: {domain}
+- Target audience: {audience}
+- Tone of voice: {tone}
+- Competitors to differentiate from: {competitors}
+
+AD BRIEF:
+- Platform: {payload.platform}
+- Ad format: {payload.format}
+- Campaign goal: {payload.goal}
+- Headline max length: {limits['headline']} characters
+- Body max length: {limits['body']} characters
+
+INSTRUCTIONS:
+- Write copy that speaks directly to {audience}
+- Differentiate clearly from {competitors}
+- Match the brand's tone: {tone}
+- Stay within character limits
+- Include a compelling value proposition specific to {brand_name}
+- The CTA should drive toward the campaign goal ({payload.goal})
+
+Return ONLY a JSON object (no markdown, no code fences):
 {{
   "headline": "...",
   "body": "...",
   "cta": "...",
-  "rationale": "..."
+  "rationale": "Why this copy works for {brand_name}"
 }}
 """
         message = client.messages.create(
@@ -203,6 +259,105 @@ Provide your analysis as a JSON object with these keys (no markdown, no code fen
             "performance_assessment": f"Error: {str(e)}",
             "recommendations": [],
             "industry_benchmarks": {"avg_ctr": 0, "avg_quality_score": 0},
+        }
+
+
+# ── AI: Competitor ad analysis ──────────────────────────────────────────────
+
+@router.post("/competitor-analysis")
+async def analyze_competitor_ads(request: Request, payload: CompetitorAdAnalysisRequest):
+    """Analyze competitors' likely ad strategies and generate insights."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
+    try:
+        import anthropic
+        import json
+
+        # Load brand context if not provided
+        brand = await _load_brand_context(tenant_id) if tenant_id != "default" else {}
+        brand_name = payload.brand_name or brand.get("brand_name", "")
+        brand_desc = payload.brand_description or brand.get("brand_description", "")
+        audience = payload.target_audience or brand.get("target_audience", "")
+        competitors = payload.competitors or brand.get("competitors", [])
+
+        if not competitors:
+            return {"competitors": [], "insights": [], "opportunities": []}
+
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+        prompt = f"""You are an expert competitive advertising analyst.
+
+Analyze the likely advertising strategies of these competitors: {', '.join(competitors)}
+
+Context:
+- Your client: {brand_name} — {brand_desc}
+- Target audience: {audience}
+- Platform: {payload.platform}
+
+For each competitor, analyze their likely:
+1. Ad messaging and positioning
+2. Key value propositions they promote
+3. Target audience focus
+4. Common CTAs and offers
+5. Strengths and weaknesses in their ad strategy
+
+Then provide actionable opportunities for {brand_name}.
+
+Return ONLY a JSON object (no markdown, no code fences):
+{{
+  "competitors": [
+    {{
+      "name": "competitor.com",
+      "positioning": "How they position themselves",
+      "key_messages": ["Message 1", "Message 2"],
+      "strengths": ["Strength 1"],
+      "weaknesses": ["Weakness 1"],
+      "estimated_ad_spend": "Low/Medium/High",
+      "primary_cta": "Their likely CTA",
+      "target_audience": "Who they target"
+    }}
+  ],
+  "insights": [
+    "Key insight about the competitive landscape"
+  ],
+  "opportunities": [
+    {{
+      "opportunity": "What {brand_name} can do differently",
+      "reasoning": "Why this works",
+      "suggested_angle": "Specific ad angle to try",
+      "priority": "high/medium/low"
+    }}
+  ],
+  "differentiation_tips": [
+    "How to stand out from these competitors in ads"
+  ]
+}}
+"""
+        message = client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                result = json.loads(text.strip())
+            else:
+                result = {"competitors": [], "insights": [text], "opportunities": []}
+
+        return result
+    except Exception as e:
+        logger.error(f"competitor_analysis error: {e}")
+        return {
+            "competitors": [],
+            "insights": [f"Error: {str(e)}"],
+            "opportunities": [],
+            "differentiation_tips": [],
         }
 
 

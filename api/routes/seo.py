@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Body, Request
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
@@ -34,13 +34,17 @@ async def get_status():
 
 
 @router.get("/stats")
-async def get_seo_stats():
+async def get_seo_stats(request: Request):
     """Return aggregated SEO statistics for the dashboard."""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         sb = get_supabase()
-        result = sb.table("seo_keywords").select("*").execute()
+        query = sb.table("seo_keywords").select("*")
+        if tenant_id and tenant_id != "default":
+            query = query.eq("tenant_id", tenant_id)
+        result = query.execute()
         keywords = result.data or []
 
         positions = [kw["current_position"] for kw in keywords if kw.get("current_position")]
@@ -119,13 +123,17 @@ async def track_keywords():
 
 
 @router.get("/keywords")
-async def get_keywords():
+async def get_keywords(request: Request):
     """Get all tracked keywords"""
     from shared.database import get_supabase
-    
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
     try:
         sb = get_supabase()
-        result = sb.table("seo_keywords").select("*").limit(100).execute()
+        query = sb.table("seo_keywords").select("*").limit(100)
+        if tenant_id and tenant_id != "default":
+            query = query.eq("tenant_id", tenant_id)
+        result = query.execute()
         keywords = result.data or []
         
         return {
@@ -149,13 +157,17 @@ async def get_keywords():
 
 
 @router.get("/keywords/top-performers")
-async def get_top_performers():
+async def get_top_performers(request: Request):
     """Get top performing keywords (position <= 10)"""
     from shared.database import get_supabase
-    
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
     try:
         sb = get_supabase()
-        result = sb.table("seo_keywords").select("*").lte("current_position", 10).execute()
+        query = sb.table("seo_keywords").select("*").lte("current_position", 10)
+        if tenant_id and tenant_id != "default":
+            query = query.eq("tenant_id", tenant_id)
+        result = query.execute()
         keywords = result.data or []
         
         return {
