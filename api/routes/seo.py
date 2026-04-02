@@ -560,6 +560,75 @@ Be specific to successifier.com and the customer success SaaS space. Focus on re
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class KeywordSuggestRequest(BaseModel):
+    brand_name: str = ""
+    domain: str = ""
+    target_audience: str = ""
+    competitors: List[str] = []
+
+
+@router.post("/suggest-keywords")
+async def suggest_keywords(payload: KeywordSuggestRequest, request: Request):
+    """Use AI to suggest relevant keywords based on brand context."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
+    try:
+        import anthropic
+        import json
+
+        # Load brand context from DB if not provided
+        if not payload.brand_name and tenant_id != "default":
+            try:
+                sb = get_supabase()
+                data = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+                s = data.data.get("settings", {}) if data.data else {}
+                payload.brand_name = payload.brand_name or s.get("brand_name", "")
+                payload.domain = payload.domain or s.get("domain", "")
+                payload.target_audience = payload.target_audience or s.get("target_audience", "")
+                payload.competitors = payload.competitors or s.get("competitors", [])
+            except Exception:
+                pass
+
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        prompt = f"""You are an SEO expert. Suggest 10-15 high-value keywords for the following business:
+
+Brand: {payload.brand_name}
+Website: {payload.domain}
+Target audience: {payload.target_audience}
+Competitors: {', '.join(payload.competitors) if payload.competitors else 'N/A'}
+
+Return ONLY a JSON array of keyword strings, no markdown, no code fences. Example:
+["keyword 1", "keyword 2", "keyword 3"]
+
+Focus on:
+- Commercial intent keywords (people ready to buy/compare)
+- Informational keywords (people researching the topic)
+- Long-tail keywords with lower competition
+- Keywords the competitors likely target
+"""
+        message = client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+        try:
+            keywords = json.loads(text)
+        except json.JSONDecodeError:
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                keywords = json.loads(text.strip())
+            else:
+                keywords = []
+
+        return {"keywords": keywords if isinstance(keywords, list) else []}
+    except Exception as e:
+        logger.error(f"suggest_keywords error: {e}")
+        return {"keywords": [], "error": str(e)}
+
+
 @router.post("/discover-opportunities")
 async def discover_opportunities():
     """Discover new keyword opportunities"""
