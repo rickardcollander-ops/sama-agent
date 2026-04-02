@@ -91,6 +91,12 @@ class AnalyticsAgent:
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
 
+    async def run_cycle(self) -> str:
+        """Run an analytics cycle: collect daily metrics."""
+        result = await self.collect_daily_metrics()
+        channels = len(result.get("channels", {}))
+        return f"Collected metrics across {channels} channels"
+
     # ── Data fetchers (one per channel) ───────────────────────────────
 
     async def _fetch_seo_data(self, date_range: int = 28) -> Dict[str, Any]:

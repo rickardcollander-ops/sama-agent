@@ -131,6 +131,14 @@ class ReviewAgent:
                     self.PLATFORMS = dict(self.PLATFORMS)  # avoid mutating class attr
                     self.PLATFORMS[key] = {**self.PLATFORMS[key], **platform_override}
 
+    async def run_cycle(self) -> str:
+        """Run a reviews cycle: fetch reviews and analyze sentiment."""
+        reviews = await self.fetch_all_reviews()
+        analysis = await self.analyze_reviews()
+        total = len(reviews)
+        avg = analysis.get("average_rating", "N/A")
+        return f"Fetched {total} reviews, average rating: {avg}"
+
     async def fetch_all_reviews(self) -> List[Dict[str, Any]]:
         """
         Fetch recent reviews from all configured platforms.

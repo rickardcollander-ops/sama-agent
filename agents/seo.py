@@ -70,7 +70,16 @@ class SEOAgent:
         sb = self._get_sb()
         result = sb.table(KEYWORDS_TABLE).select("*").execute()
         return result.data or []
-    
+
+    async def run_cycle(self) -> str:
+        """Run a standard SEO cycle: track rankings and run audit."""
+        rankings = await self.track_keyword_rankings()
+        audit = await self.run_weekly_audit()
+        improved = len(rankings.get("improved", []))
+        declined = len(rankings.get("declined", []))
+        critical = len(audit.get("critical_issues", []))
+        return f"Tracked {rankings.get('total_keywords', 0)} keywords ({improved} improved, {declined} declined), audit found {critical} critical issues"
+
     async def run_weekly_audit(self) -> Dict[str, Any]:
         """Run complete weekly SEO audit with real API data"""
         logger.info("🔍 Starting weekly SEO audit...")
