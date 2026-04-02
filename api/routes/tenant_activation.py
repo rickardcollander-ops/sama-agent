@@ -62,7 +62,7 @@ async def activate_tenant(request: Request):
         try:
             import anthropic
 
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
             prompt = f"""You are an SEO expert. Suggest 12 high-value keywords for the following business:
 
 Brand: {brand_name}
@@ -80,7 +80,7 @@ Focus on:
 - Long-tail keywords with lower competition
 - Keywords the competitors likely target
 """
-            message = client.messages.create(
+            message = await client.messages.create(
                 model=settings.CLAUDE_MODEL,
                 max_tokens=512,
                 messages=[{"role": "user", "content": prompt}],
@@ -116,7 +116,7 @@ Focus on:
         try:
             import anthropic
 
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
             content_prompt = f"""You are an expert B2B SaaS content marketer.
 Generate a LinkedIn Post based on the following brief:
 
@@ -135,7 +135,7 @@ Return ONLY a JSON object (no markdown, no code fences) with these keys:
 
 For linkedin_post: body should be 100-200 words, optimized for LinkedIn.
 """
-            message = client.messages.create(
+            message = await client.messages.create(
                 model=settings.CLAUDE_MODEL,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": content_prompt}],

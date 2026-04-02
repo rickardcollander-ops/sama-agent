@@ -129,7 +129,7 @@ async def generate_ad_copy(request: Request, payload: GenerateCopyRequest):
         lang_code = brand.get("content_language", "en")
         language_name = LANGUAGE_MAP.get(lang_code, "English")
 
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
         prompt = f"""You are an expert digital advertising copywriter.
 Write ALL content in {language_name}.
@@ -167,7 +167,7 @@ Return ONLY a JSON object (no markdown, no code fences):
   "rationale": "Why this copy works for {brand_name}"
 }}
 """
-        message = client.messages.create(
+        message = await client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
@@ -211,7 +211,7 @@ async def analyze_ad_screenshot(payload: AnalyzeScreenshotRequest):
     try:
         import anthropic
 
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
         prompt = f"""You are an expert digital advertising analyst.
 Analyze this ad screenshot from {payload.platform}.
@@ -225,7 +225,7 @@ Provide your analysis as a JSON object with these keys (no markdown, no code fen
   "industry_benchmarks": {{"avg_ctr": 0.0, "avg_quality_score": 0}}
 }}
 """
-        message = client.messages.create(
+        message = await client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=1024,
             messages=[
@@ -304,7 +304,7 @@ async def analyze_competitor_ads(request: Request, payload: CompetitorAdAnalysis
         lang_code = brand.get("content_language", "en")
         language_name = LANGUAGE_MAP.get(lang_code, "English")
 
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
         prompt = f"""You are an expert competitive advertising analyst.
 Write ALL content in {language_name}.
@@ -355,7 +355,7 @@ Return ONLY a JSON object (no markdown, no code fences):
   ]
 }}
 """
-        message = client.messages.create(
+        message = await client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
