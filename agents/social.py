@@ -155,6 +155,18 @@ class SocialAgent:
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
     
+    async def run_cycle(self) -> str:
+        """Run a social media cycle: generate a post for today's theme."""
+        from datetime import datetime
+        day = datetime.now().strftime("%A").lower()
+        calendar_entry = self.CONTENT_CALENDAR.get(day, self.CONTENT_CALENDAR["monday"])
+        topic = calendar_entry["theme"]
+        style = calendar_entry.get("format", "educational")
+        result = await self.generate_post(topic=topic, style=style)
+        if result.get("error"):
+            return f"Social post generation skipped: {result['error']}"
+        return f"Generated {style} post about '{topic}'"
+
     # ── Twitter API v2 methods ─────────────────────────────────────────
     
     async def _twitter_get(self, endpoint: str, params: dict = None) -> Dict:

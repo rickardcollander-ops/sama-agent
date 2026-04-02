@@ -43,6 +43,20 @@ class ContentAgent:
             self.sb = get_supabase()
         return self.sb
     
+    async def run_cycle(self) -> str:
+        """Run a content cycle: analyze gaps and generate a blog post."""
+        gaps = await self.analyze_competitor_content_gaps()
+        gap_list = gaps.get("gaps", [])
+        if gap_list:
+            top = gap_list[0]
+            topic = top.get("title", "Industry Insights")
+            keyword = top.get("target_keyword")
+            result = await self.generate_blog_post(topic=topic, target_keyword=keyword)
+            return f"Generated blog post: {result.get('title', topic)}"
+        else:
+            result = await self.generate_blog_post(topic="Industry Best Practices")
+            return f"Generated blog post: {result.get('title', 'Industry Best Practices')}"
+
     async def generate_blog_post(
         self,
         topic: str,
