@@ -16,6 +16,18 @@ from shared.database import get_supabase
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+LANGUAGE_MAP = {
+    "en": "English",
+    "sv": "Swedish",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "no": "Norwegian",
+    "da": "Danish",
+    "fi": "Finnish",
+    "nl": "Dutch",
+}
+
 
 # ── Request / Response models ────────────────────────────────────────────────
 
@@ -113,9 +125,14 @@ async def generate_ad_copy(request: Request, payload: GenerateCopyRequest):
         }
         limits = char_limits.get(payload.platform, {"headline": 50, "body": 200})
 
+        # Resolve language
+        lang_code = brand.get("content_language", "en")
+        language_name = LANGUAGE_MAP.get(lang_code, "English")
+
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
         prompt = f"""You are an expert digital advertising copywriter.
+Write ALL content in {language_name}.
 
 Generate ad copy for {brand_name} ({domain}).
 
@@ -283,9 +300,14 @@ async def analyze_competitor_ads(request: Request, payload: CompetitorAdAnalysis
         if not competitors:
             return {"competitors": [], "insights": [], "opportunities": []}
 
+        # Resolve language
+        lang_code = brand.get("content_language", "en")
+        language_name = LANGUAGE_MAP.get(lang_code, "English")
+
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
         prompt = f"""You are an expert competitive advertising analyst.
+Write ALL content in {language_name}.
 
 Analyze the likely advertising strategies of these competitors: {', '.join(competitors)}
 
