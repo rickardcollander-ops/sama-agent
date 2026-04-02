@@ -7,13 +7,26 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from shared.config import settings
+from shared.database import get_supabase
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+LANGUAGE_MAP = {
+    "en": "English",
+    "sv": "Swedish",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "no": "Norwegian",
+    "da": "Danish",
+    "fi": "Finnish",
+    "nl": "Dutch",
+}
 
 
 class ContentGenerateRequest(BaseModel):
@@ -22,10 +35,23 @@ class ContentGenerateRequest(BaseModel):
     brand_description: str = ""
     target_audience: str = ""
     tone: str = "professional"
+    language: str = "en"
+
+
+async def _load_content_language(tenant_id: str) -> str:
+    """Load content_language from user_settings for a tenant."""
+    try:
+        sb = get_supabase()
+        data = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+        if data.data and data.data.get("settings"):
+            return data.data["settings"].get("content_language", "en")
+    except Exception:
+        pass
+    return "en"
 
 
 @router.post("/generate")
-async def generate_content(payload: ContentGenerateRequest):
+async def generate_content(request: Request, payload: ContentGenerateRequest):
     """
     Generate marketing content using Anthropic Claude.
     Returns title, body, platform, and suggestions.
@@ -37,7 +63,15 @@ async def generate_content(payload: ContentGenerateRequest):
 
         content_type_label = payload.type.replace("_", " ").title()
 
+        # Resolve language
+        tenant_id = getattr(request.state, "tenant_id", "default")
+        lang_code = payload.language
+        if lang_code == "en" and tenant_id != "default":
+            lang_code = await _load_content_language(tenant_id)
+        language_name = LANGUAGE_MAP.get(lang_code, "English")
+
         prompt = f"""You are an expert B2B SaaS content marketer.
+Write ALL content in {language_name}.
 Generate a {content_type_label} based on the following brief:
 
 Topic: {payload.topic or 'Choose a relevant topic'}
