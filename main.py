@@ -17,7 +17,8 @@ from api.routes import (
     ai_visibility, dashboard, social_reddit, gtm, goals, notifications, dev_agent,
     agent_reports, agent_chat, user_settings, leads, webhooks,
     content_pieces, content_generate, social_posts, analytics_overview,
-    ads_creatives, ads_credentials, google_oauth,
+    ads_creatives, ads_credentials, google_oauth, tenant_activation,
+    github_integration,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -187,6 +188,8 @@ app.include_router(analytics_overview.router, prefix="/api/analytics", tags=["an
 app.include_router(ads_creatives.router, prefix="/api/ads", tags=["ads-creatives"])
 app.include_router(ads_credentials.router, prefix="/api/ads", tags=["ads-credentials"])
 app.include_router(google_oauth.router, prefix="/api/auth/google", tags=["google-oauth"])
+app.include_router(tenant_activation.router, prefix="/api/tenant", tags=["tenant"])
+app.include_router(github_integration.router, prefix="/api/integrations/github", tags=["github-integration"])
 
 
 @app.get("/")
