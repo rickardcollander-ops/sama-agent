@@ -1,16 +1,27 @@
 """
 Social Posts API Routes
-Read-only listing of social posts and aggregated stats, scoped by tenant.
+Listing and creation of social posts, scoped by tenant.
 """
 
 import logging
+from typing import Optional
+
 from fastapi import APIRouter, Request
+from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+class SocialPostCreate(BaseModel):
+    platform: str
+    content: str
+    content_type: Optional[str] = "post"
+    topic: Optional[str] = None
+    style: Optional[str] = None
 
 
 def _ensure_numeric(row: dict) -> dict:
@@ -49,6 +60,28 @@ async def list_social_posts(request: Request, limit: int = 50):
     except Exception as e:
         logger.error(f"list_social_posts error: {e}")
         return {"posts": []}
+
+
+# ── Create post ─────────────────────────────────────────────────────────────
+
+@router.post("/posts")
+async def create_social_post(request: Request, payload: SocialPostCreate):
+    """Create a new draft social post."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
+    try:
+        sb = get_supabase()
+        data = {
+            **payload.model_dump(),
+            "tenant_id": tenant_id,
+            "status": "draft",
+        }
+        result = sb.table("social_posts").insert(data).execute()
+        row = result.data[0] if result.data else data
+        return {"success": True, "post": _ensure_numeric(row)}
+    except Exception as e:
+        logger.error(f"create_social_post error: {e}")
+        return {"success": False, "error": str(e)}
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────

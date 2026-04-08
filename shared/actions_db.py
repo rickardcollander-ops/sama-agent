@@ -78,18 +78,20 @@ async def _publish_chain_events(agent_name: str, action: Dict[str, Any]):
         logger.debug(f"[chains] Event publish skipped: {e}")
 
 
-async def clear_pending_actions(agent_name: str) -> int:
+async def clear_pending_actions(agent_name: str, tenant_id: Optional[str] = None) -> int:
     """Delete all pending actions for an agent and return deleted count."""
     sb = get_supabase()
 
     try:
-        result = (
+        query = (
             sb.table("agent_actions")
             .delete()
             .eq("agent_name", agent_name)
             .eq("status", "pending")
-            .execute()
         )
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+        result = query.execute()
         deleted_count = len(result.data or [])
         logger.info(f"🧹 Cleared {deleted_count} pending {agent_name} actions before saving new analysis")
         return deleted_count
@@ -98,14 +100,15 @@ async def clear_pending_actions(agent_name: str) -> int:
         return 0
 
 
-async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[str]:
+async def save_actions(agent_name: str, actions: List[Dict[str, Any]], tenant_id: Optional[str] = None) -> List[str]:
     """
     Save actions to database with deduplication
-    
+
     Args:
         agent_name: Name of the agent (seo, ads, content, social, reviews)
         actions: List of action dicts from /analyze
-    
+        tenant_id: Optional tenant scope
+
     Returns:
         List of created action IDs
     """
@@ -113,7 +116,7 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
     created_ids = []
 
     # Replace queue on each analysis run to avoid stale/duplicated pending actions.
-    await clear_pending_actions(agent_name)
+    await clear_pending_actions(agent_name, tenant_id=tenant_id)
     
     for action in actions:
         try:
@@ -137,6 +140,8 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
                 "expected_outcome": action.get("expected_outcome"),
                 "status": "pending"
             }
+            if tenant_id:
+                db_action["tenant_id"] = tenant_id
             
             # Insert into database
             result = sb.table("agent_actions").insert(db_action).execute()
@@ -162,29 +167,34 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
 async def get_actions(
     agent_name: Optional[str] = None,
     status: Optional[str] = None,
-    limit: int = 100
+    limit: int = 100,
+    tenant_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get actions from database
-    
+
     Args:
         agent_name: Filter by agent name
         status: Filter by status (pending, executing, completed, failed)
         limit: Max number of actions to return
-    
+        tenant_id: Filter by tenant
+
     Returns:
         List of actions
     """
     sb = get_supabase()
-    
+
     try:
         query = sb.table("agent_actions").select("*")
-        
+
         if agent_name:
             query = query.eq("agent_name", agent_name)
-        
+
         if status:
             query = query.eq("status", status)
+
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
         
         result = query.order("created_at", desc=True).limit(limit).execute()
         

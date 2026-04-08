@@ -369,12 +369,13 @@ def _strategy_to_tasks(strategy: dict) -> list:
 
 
 @router.get("/strategy")
-async def load_seo_strategy():
+async def load_seo_strategy(request: Request):
     """Load the most recent saved strategy"""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_strategies").select("*").order("created_at", desc=True).limit(1).execute()
+        result = sb.table("seo_strategies").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(1).execute()
         row = (result.data or [None])[0]
         if not row:
             return {"success": True, "strategy": None}
@@ -392,14 +393,15 @@ async def load_seo_strategy():
 
 
 @router.patch("/strategy/tasks/{task_id}")
-async def update_task(task_id: str, data: dict):
+async def update_task(request: Request, task_id: str, data: dict):
     """Toggle a task done/undone"""
     from shared.database import get_supabase
     from datetime import datetime
     import json
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_strategies").select("id,tasks").order("created_at", desc=True).limit(1).execute()
+        result = sb.table("seo_strategies").select("id,tasks").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(1).execute()
         row = (result.data or [None])[0]
         if not row:
             raise HTTPException(status_code=404, detail="No strategy found")
@@ -421,7 +423,7 @@ async def update_task(task_id: str, data: dict):
 
 
 @router.post("/strategy")
-async def get_seo_strategy(force: bool = False):
+async def get_seo_strategy(request: Request, force: bool = False):
     """Generate a strategic SEO plan using Claude. Skips generation if data hasn't changed significantly."""
     from shared.database import get_supabase
     from anthropic import Anthropic
@@ -429,18 +431,20 @@ async def get_seo_strategy(force: bool = False):
     import json, re
     from datetime import datetime
 
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
     try:
         sb = get_supabase()
 
         # Gather keyword data
-        kw_result = sb.table("seo_keywords").select("*").execute()
+        kw_result = sb.table("seo_keywords").select("*").eq("tenant_id", tenant_id).execute()
         keywords = kw_result.data or []
 
         current_fingerprint = _build_fingerprint(keywords)
 
         # Check if existing strategy has same fingerprint
         if not force:
-            existing = sb.table("seo_strategies").select("*").order("created_at", desc=True).limit(1).execute()
+            existing = sb.table("seo_strategies").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(1).execute()
             existing_row = (existing.data or [None])[0]
             if existing_row and existing_row.get("data_fingerprint") == current_fingerprint:
                 return {
@@ -541,6 +545,7 @@ Be specific to successifier.com and the customer success SaaS space. Focus on re
             "data_fingerprint": current_fingerprint,
             "ranked_keywords_count": len(ranked),
             "total_keywords_count": len(keywords),
+            "tenant_id": tenant_id,
         }).execute()
 
         saved_id = (row.data or [{}])[0].get("id")
@@ -654,10 +659,11 @@ async def sync_gsc_keywords(min_impressions: int = 1):
 
 
 @router.get("/actions")
-async def get_seo_actions(status: str = None, limit: int = 100):
+async def get_seo_actions(request: Request, status: str = None, limit: int = 100):
     """Get SEO actions from database"""
+    tenant_id = getattr(request.state, "tenant_id", "default")
     from shared.actions_db import get_actions
-    actions = await get_actions(agent_name="seo", status=status, limit=limit)
+    actions = await get_actions(agent_name="seo", status=status, limit=limit, tenant_id=tenant_id)
     return {"success": True, "actions": actions}
 
 
@@ -674,13 +680,14 @@ async def delete_action(action_id: str):
 
 
 @router.delete("/strategy/tasks/{task_id}")
-async def delete_strategy_task(task_id: str):
+async def delete_strategy_task(request: Request, task_id: str):
     """Delete a single task from the current strategy"""
     from shared.database import get_supabase
     from datetime import datetime
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_strategies").select("id,tasks").order("created_at", desc=True).limit(1).execute()
+        result = sb.table("seo_strategies").select("id,tasks").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(1).execute()
         row = (result.data or [None])[0]
         if not row:
             raise HTTPException(status_code=404, detail="No strategy found")
