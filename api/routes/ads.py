@@ -1,9 +1,10 @@
 import logging
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Body, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from agents.ads import ads_agent
+from shared.usage import UsageLimitExceeded, check_and_increment
 
 logger = logging.getLogger(__name__)
 
@@ -175,13 +176,21 @@ async def create_campaign(request: CampaignCreateRequest):
 
 
 @router.post("/rsa/generate")
-async def generate_rsa(request: RSARequest):
-    """Generate Responsive Search Ad variants"""
+async def generate_rsa(payload: RSARequest, request: Request):
+    """Generate Responsive Search Ad variants (metered against ad_creatives)."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        await check_and_increment(tenant_id, "ad_creatives")
+    except UsageLimitExceeded as e:
+        raise HTTPException(
+            status_code=402,
+            detail={"message": str(e), "metric": e.metric, "limit": e.limit},
+        )
     try:
         result = await ads_agent.generate_rsa(
-            campaign=request.campaign,
-            ad_group=request.ad_group,
-            target_keyword=request.target_keyword
+            campaign=payload.campaign,
+            ad_group=payload.ad_group,
+            target_keyword=payload.target_keyword
         )
         return {"success": True, "rsa": result}
     except Exception as e:
