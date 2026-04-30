@@ -20,6 +20,7 @@ from api.routes import (
     ads_creatives, ads_credentials, google_oauth, tenant_activation,
     github_integration, usage, social_schedule, analytics_attribution,
     content_validation, analysis as analysis_routes, approvals,
+    content_suggest, ads_suggest, social_suggest, tech_agent,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -197,6 +198,10 @@ app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(github_integration.router, prefix="/api/integrations/github", tags=["github-integration"])
 app.include_router(analysis_routes.router, prefix="/api/analysis", tags=["analysis"])
 app.include_router(approvals.router, prefix="/api/approvals", tags=["approvals"])
+app.include_router(content_suggest.router, prefix="/api/content", tags=["content-suggest"])
+app.include_router(ads_suggest.router, prefix="/api/ads", tags=["ads-suggest"])
+app.include_router(social_suggest.router, prefix="/api/social", tags=["social-suggest"])
+app.include_router(tech_agent.router, prefix="/api/tech", tags=["tech-agent"])
 
 
 @app.get("/")
