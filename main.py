@@ -18,7 +18,8 @@ from api.routes import (
     agent_reports, agent_chat, user_settings, leads, webhooks,
     content_pieces, content_generate, social_posts, analytics_overview,
     ads_creatives, ads_credentials, google_oauth, tenant_activation,
-    github_integration,
+    github_integration, usage, social_schedule, analytics_attribution,
+    content_validation,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -182,13 +183,17 @@ app.include_router(user_settings.router, prefix="/api", tags=["user-settings"])
 app.include_router(leads.router, prefix="/api", tags=["leads"])
 app.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 app.include_router(content_pieces.router, prefix="/api/content", tags=["content-pieces"])
+app.include_router(content_validation.router, prefix="/api/content", tags=["content-validation"])
 app.include_router(content_generate.router, prefix="/api/content", tags=["content-generate"])
 app.include_router(social_posts.router, prefix="/api/social", tags=["social-posts"])
+app.include_router(social_schedule.router, prefix="/api/social", tags=["social-schedule"])
 app.include_router(analytics_overview.router, prefix="/api/analytics", tags=["analytics-overview"])
+app.include_router(analytics_attribution.router, prefix="/api/analytics", tags=["analytics-attribution"])
 app.include_router(ads_creatives.router, prefix="/api/ads", tags=["ads-creatives"])
 app.include_router(ads_credentials.router, prefix="/api/ads", tags=["ads-credentials"])
 app.include_router(google_oauth.router, prefix="/api/auth/google", tags=["google-oauth"])
 app.include_router(tenant_activation.router, prefix="/api/tenant", tags=["tenant"])
+app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(github_integration.router, prefix="/api/integrations/github", tags=["github-integration"])
 
 

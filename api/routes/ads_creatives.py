@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.usage import UsageLimitExceeded, check_and_increment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -105,6 +106,17 @@ async def _load_brand_context(tenant_id: str) -> dict:
 async def generate_ad_copy(request: Request, payload: GenerateCopyRequest):
     """Use Anthropic Claude to generate ad copy, personalized to the brand."""
     tenant_id = getattr(request.state, "tenant_id", "default")
+
+    try:
+        await check_and_increment(tenant_id, "ad_creatives")
+    except UsageLimitExceeded as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "limit_exceeded": True,
+            "metric": e.metric,
+            "limit": e.limit,
+        }
 
     try:
         import anthropic

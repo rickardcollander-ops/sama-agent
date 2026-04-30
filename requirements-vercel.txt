@@ -9,3 +9,4 @@ httpx==0.26.0
 python-dotenv==1.0.1
 redis==5.0.1
 sentry-sdk==1.40.0
+PyJWT==2.9.0
