@@ -19,7 +19,7 @@ from api.routes import (
     content_pieces, content_generate, social_posts, analytics_overview,
     ads_creatives, ads_credentials, google_oauth, tenant_activation,
     github_integration, usage, social_schedule, analytics_attribution,
-    content_validation,
+    content_validation, analysis as analysis_routes, approvals,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -195,6 +195,8 @@ app.include_router(google_oauth.router, prefix="/api/auth/google", tags=["google
 app.include_router(tenant_activation.router, prefix="/api/tenant", tags=["tenant"])
 app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(github_integration.router, prefix="/api/integrations/github", tags=["github-integration"])
+app.include_router(analysis_routes.router, prefix="/api/analysis", tags=["analysis"])
+app.include_router(approvals.router, prefix="/api/approvals", tags=["approvals"])
 
 
 @app.get("/")
