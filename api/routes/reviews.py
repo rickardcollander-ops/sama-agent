@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, HTTPException, Body, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from agents.reviews import review_agent
+from shared.usage import UsageLimitExceeded, check_and_increment
 
 router = APIRouter()
 
@@ -64,12 +65,20 @@ async def get_platforms():
 
 
 @router.post("/response/generate")
-async def generate_review_response(request: ReviewResponseRequest):
-    """Generate response to a review"""
+async def generate_review_response(payload: ReviewResponseRequest, request: Request):
+    """Generate response to a review (metered against the review_responses limit)."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        await check_and_increment(tenant_id, "review_responses")
+    except UsageLimitExceeded as e:
+        raise HTTPException(
+            status_code=402,
+            detail={"message": str(e), "metric": e.metric, "limit": e.limit},
+        )
     try:
         result = await review_agent.generate_review_response(
-            review=request.review,
-            platform=request.platform
+            review=payload.review,
+            platform=payload.platform
         )
         return {"success": True, "response": result}
     except Exception as e:
@@ -633,3 +642,68 @@ async def delete_review(review_id: str):
         return {"success": True, "message": f"Review {review_id} deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/auto-respond")
+async def auto_respond(request: Request):
+    """
+    Walk all unresponded reviews for the tenant and generate AI response drafts
+    where the tenant's settings permit (auto_respond_reviews_positive /
+    auto_respond_reviews_negative). Drafts are saved on the review row but
+    the review is not marked responded — operator approval still required.
+    """
+    from shared.database import get_supabase
+    from shared.tenant import get_tenant_config
+    from datetime import datetime
+
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    if tenant_id == "default":
+        raise HTTPException(status_code=400, detail="Tenant ID required")
+
+    cfg = await get_tenant_config(tenant_id)
+    allow_positive = cfg.auto_respond_reviews_positive
+    allow_negative = cfg.auto_respond_reviews_negative
+
+    sb = get_supabase()
+    try:
+        result = (
+            sb.table("reviews")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("responded", False)
+            .limit(20)
+            .execute()
+        )
+        reviews = result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    drafted = 0
+    skipped: List[Dict[str, Any]] = []
+    for r in reviews:
+        rating = int(r.get("rating") or 0)
+        is_positive = rating >= 4
+        is_negative = rating <= 2
+        if (is_positive and not allow_positive) or (is_negative and not allow_negative):
+            skipped.append({"id": r.get("id"), "reason": "policy_disabled"})
+            continue
+        try:
+            await check_and_increment(tenant_id, "review_responses")
+        except UsageLimitExceeded:
+            skipped.append({"id": r.get("id"), "reason": "limit_exceeded"})
+            break
+        try:
+            draft = await review_agent.generate_review_response(
+                review=r, platform=r.get("platform", "g2")
+            )
+            sb.table("reviews").update(
+                {
+                    "draft_response": draft.get("response") if isinstance(draft, dict) else str(draft),
+                    "draft_generated_at": datetime.utcnow().isoformat(),
+                }
+            ).eq("id", r["id"]).execute()
+            drafted += 1
+        except Exception as e:
+            skipped.append({"id": r.get("id"), "reason": str(e)})
+
+    return {"drafted": drafted, "skipped": skipped, "tenant_id": tenant_id}

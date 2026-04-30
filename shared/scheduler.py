@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +354,52 @@ async def _run_daily_lead_scoring():
         await _notify_failure("daily_lead_scoring", str(e))
 
 
+async def _run_publish_due_social_posts():
+    """Publish any social_posts whose scheduled_for has passed."""
+    job_id = "publish_due_social_posts"
+    try:
+        from datetime import datetime, timezone
+        from shared.database import get_supabase
+        from api.routes.social_schedule import _publish_to_platform
+
+        sb = get_supabase()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        result = (
+            sb.table("social_posts")
+            .select("*")
+            .eq("status", "scheduled")
+            .lte("scheduled_for", now_iso)
+            .limit(50)
+            .execute()
+        )
+        due = result.data or []
+        for post in due:
+            try:
+                delivery = await _publish_to_platform(
+                    post["platform"], post["content"], post.get("tenant_id", "default")
+                )
+                sb.table("social_posts").update(
+                    {
+                        "status": "published" if delivery["delivered"] else "published_locally",
+                        "published_at": now_iso,
+                        "engagement_data": {
+                            **(post.get("engagement_data") or {}),
+                            **delivery,
+                        },
+                    }
+                ).eq("id", post["id"]).execute()
+            except Exception as e:
+                logger.warning(f"Failed to publish post {post.get('id')}: {e}")
+                sb.table("social_posts").update(
+                    {"status": "failed", "engagement_data": {"error": str(e)}}
+                ).eq("id", post["id"]).execute()
+        _record(job_id, "ok")
+    except Exception as e:
+        logger.error(f"[scheduler] {job_id} failed: {e}")
+        _record(job_id, "error", str(e))
+        await _notify_failure(job_id, str(e))
+
+
 def start():
     """Register all jobs and start the scheduler."""
     # Daily keyword tracking — 02:00 UTC every day
@@ -471,6 +518,14 @@ def start():
         _run_daily_lead_scoring,
         CronTrigger(hour=7, minute=0),
         id="daily_lead_scoring",
+        replace_existing=True,
+    )
+
+    # Publish due social posts — every 5 minutes
+    scheduler.add_job(
+        _run_publish_due_social_posts,
+        IntervalTrigger(minutes=5),
+        id="publish_due_social_posts",
         replace_existing=True,
     )
 

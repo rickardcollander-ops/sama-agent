@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.usage import UsageLimitExceeded, check_and_increment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -85,6 +86,16 @@ async def list_content_pieces(request: Request, limit: int = 100):
 async def create_content_piece(request: Request, payload: ContentPieceCreate):
     """Create a new content piece."""
     tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        await check_and_increment(tenant_id, "content_pieces")
+    except UsageLimitExceeded as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "limit_exceeded": True,
+            "metric": e.metric,
+            "limit": e.limit,
+        }
     try:
         sb = get_supabase()
         data = {

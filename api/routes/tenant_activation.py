@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.usage import UsageLimitExceeded, check_and_increment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -253,6 +254,19 @@ async def trigger_agent(agent_name: str, request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     if agent_name not in ALL_AGENTS:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
+
+    try:
+        await check_and_increment(tenant_id, "agent_runs")
+    except UsageLimitExceeded as e:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": str(e),
+                "metric": e.metric,
+                "limit": e.limit,
+                "current": e.current,
+            },
+        )
 
     sb = get_supabase()
 
