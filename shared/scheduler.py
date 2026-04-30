@@ -397,6 +397,12 @@ async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
             asyncio.create_task(_execute_run(run_id, tenant_id, agent_name))
 
         _record(job_id, "success")
+    except Exception as e:
+        logger.error(f"[scheduler] {job_id} failed: {e}")
+        _record(job_id, "error", str(e))
+        await _notify_failure(job_id, str(e))
+
+
 async def _run_publish_due_social_posts():
     """Publish any social_posts whose scheduled_for has passed."""
     job_id = "publish_due_social_posts"
