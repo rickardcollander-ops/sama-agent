@@ -3,6 +3,7 @@ SAMA 2.0 - Job Scheduler
 Runs automated workflows on a schedule using APScheduler.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
@@ -67,6 +68,8 @@ def get_job_history() -> Dict[str, Dict[str, Any]]:
 
 
 def _record(job_id: str, status: str, error: Optional[str] = None):
+    if job_id not in _job_history:
+        _job_history[job_id] = {"last_run": None, "last_status": None, "last_error": None}
     _job_history[job_id]["last_run"] = datetime.now(timezone.utc).isoformat()
     _job_history[job_id]["last_status"] = status
     _job_history[job_id]["last_error"] = error
@@ -353,6 +356,63 @@ async def _run_daily_lead_scoring():
         await _notify_failure("daily_lead_scoring", str(e))
 
 
+async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
+    """
+    Fan-out: for every tenant where (agent_name, schedule) matches the row in
+    tenant_agent_config AND enabled is true, dispatch a cycle. Each tenant's
+    run is recorded in agent_runs and executes independently in the background
+    so one tenant's failure doesn't block the others.
+    """
+    job_id = f"tenants_{agent_name}_{schedule}"
+    logger.info(f"[scheduler] {job_id}: fan-out start")
+    try:
+        from shared.database import get_supabase
+        from api.routes.tenant_activation import _execute_run
+
+        sb = get_supabase()
+        rows = (
+            sb.table("tenant_agent_config")
+            .select("tenant_id")
+            .eq("agent_name", agent_name)
+            .eq("schedule", schedule)
+            .eq("enabled", True)
+            .execute()
+        )
+        tenants = [r["tenant_id"] for r in (rows.data or []) if r.get("tenant_id")]
+        logger.info(f"[scheduler] {job_id}: dispatching to {len(tenants)} tenants")
+
+        for tenant_id in tenants:
+            run_id = None
+            try:
+                ins = sb.table("agent_runs").insert({
+                    "tenant_id": tenant_id,
+                    "agent_name": agent_name,
+                    "status": "running",
+                }).execute()
+                if ins.data:
+                    run_id = ins.data[0]["id"]
+            except Exception as e:
+                logger.warning(f"[scheduler] could not record run for {tenant_id}/{agent_name}: {e}")
+            asyncio.create_task(_execute_run(run_id, tenant_id, agent_name))
+
+        _record(job_id, "success")
+    except Exception as e:
+        logger.error(f"[scheduler] {job_id} failed: {e}")
+        _record(job_id, "error", str(e))
+        await _notify_failure(job_id, str(e))
+
+
+async def _run_watchdog() -> None:
+    """Mark agent_runs that have been 'running' too long as failed."""
+    try:
+        from api.routes.tenant_activation import reap_stale_runs
+        n = await reap_stale_runs()
+        if n:
+            logger.info(f"[scheduler] watchdog reaped {n} stale runs")
+    except Exception as e:
+        logger.warning(f"[scheduler] watchdog failed: {e}")
+
+
 def start():
     """Register all jobs and start the scheduler."""
     # Daily keyword tracking — 02:00 UTC every day
@@ -471,6 +531,37 @@ def start():
         _run_daily_lead_scoring,
         CronTrigger(hour=7, minute=0),
         id="daily_lead_scoring",
+        replace_existing=True,
+    )
+
+    # ── Multi-tenant agent fan-out ────────────────────────────────────────
+    # Each (agent_name, schedule) combination iterates tenant_agent_config
+    # and dispatches a per-tenant cycle. The legacy global jobs above only
+    # serve the home brand; these jobs serve every paying tenant.
+    tenant_fanout_jobs = [
+        ("seo", "daily", CronTrigger(hour=2, minute=30)),
+        ("analytics", "daily", CronTrigger(hour=4, minute=30)),
+        ("social", "daily", CronTrigger(hour=6, minute=30)),
+        ("reviews", "daily", CronTrigger(hour=14, minute=30)),
+        ("content", "weekly", CronTrigger(day_of_week="wed", hour=5, minute=30)),
+        ("geo", "weekly", CronTrigger(day_of_week="thu", hour=10, minute=30)),
+    ]
+    for agent_name, schedule_kind, trigger in tenant_fanout_jobs:
+        job_id = f"tenants_{agent_name}_{schedule_kind}"
+        scheduler.add_job(
+            _run_for_all_tenants,
+            trigger,
+            args=[agent_name, schedule_kind],
+            id=job_id,
+            replace_existing=True,
+        )
+
+    # Watchdog: reap orphaned "running" rows every 5 minutes so a process
+    # restart mid-cycle doesn't leave the dashboard stuck on a spinner.
+    scheduler.add_job(
+        _run_watchdog,
+        CronTrigger(minute="*/5"),
+        id="agent_runs_watchdog",
         replace_existing=True,
     )
 

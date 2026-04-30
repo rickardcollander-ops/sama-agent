@@ -3,9 +3,10 @@ Tenant Activation & Agent Control API Routes
 Activate tenants, manage agent configs, trigger manual runs, view run history.
 """
 
+import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -28,6 +29,10 @@ DEFAULT_SCHEDULES = {
     "analytics": "daily",
     "geo": "weekly",
 }
+
+# A single agent cycle should never legitimately take longer than this.
+# Anything past it is treated as orphaned (process restart, deadlock, etc.).
+STALE_RUN_AFTER = timedelta(minutes=15)
 
 
 # ── POST /activate — Initial setup for a new tenant ─────────────────────────
@@ -245,18 +250,79 @@ async def toggle_agent(agent_name: str, payload: TogglePayload, request: Request
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Helpers: agent dispatch + run record management ──────────────────────────
+
+async def _dispatch_agent_cycle(agent_name: str, tenant_id: str) -> str:
+    """
+    Run one cycle of the given agent for the given tenant. Returns a short
+    human-readable summary. Raises on failure so the caller can mark the
+    agent_runs row as failed with the exception message.
+    """
+    from shared.tenant_agents import AGENT_FACTORIES, get_agent
+    if agent_name not in AGENT_FACTORIES:
+        return f"{agent_name} triggered"
+    agent = await get_agent(agent_name, tenant_id)
+    result = await agent.run_cycle()
+    return result or f"{agent_name} cycle completed"
+
+
+async def _execute_run(run_id: Optional[str], tenant_id: str, agent_name: str) -> None:
+    """
+    Background task: runs the agent cycle and updates the agent_runs row.
+    Never raises — failures are recorded as status=failed.
+    """
+    sb = get_supabase()
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        summary = await _dispatch_agent_cycle(agent_name, tenant_id)
+        status = "completed"
+        error_msg: Optional[str] = None
+    except Exception as e:
+        summary = ""
+        status = "failed"
+        error_msg = str(e)[:500]
+        logger.exception(f"Agent {agent_name} run failed for {tenant_id}")
+
+    if run_id:
+        try:
+            update = {
+                "status": status,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+            }
+            if error_msg:
+                update["error"] = error_msg
+            sb.table("agent_runs").update(update).eq("id", run_id).execute()
+        except Exception:
+            logger.warning(f"Could not update agent_runs {run_id}", exc_info=True)
+
+    try:
+        sb.table("tenant_agent_config").upsert({
+            "tenant_id": tenant_id,
+            "agent_name": agent_name,
+            "last_run_at": started,
+            "schedule": DEFAULT_SCHEDULES.get(agent_name, "daily"),
+        }, on_conflict="tenant_id,agent_name").execute()
+    except Exception:
+        pass
+
+
 # ── POST /agents/{agent_name}/trigger — Manually run an agent ────────────────
 
 @router.post("/agents/{agent_name}/trigger")
 async def trigger_agent(agent_name: str, request: Request):
-    """Manually trigger an agent run for this tenant."""
+    """
+    Enqueue an agent run for this tenant.
+
+    The actual agent cycle is dispatched as a background task so this endpoint
+    returns immediately. Clients should poll GET /agent-runs to follow status.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
     if agent_name not in ALL_AGENTS:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
 
     sb = get_supabase()
 
-    # Record run start
     run_id = None
     try:
         run_result = sb.table("agent_runs").insert({
@@ -269,77 +335,14 @@ async def trigger_agent(agent_name: str, request: Request):
     except Exception as e:
         logger.warning(f"Could not record agent run: {e}")
 
-    summary = ""
-    error_msg = None
-    status = "completed"
+    asyncio.create_task(_execute_run(run_id, tenant_id, agent_name))
 
-    try:
-        # Use tenant agent factory where available
-        if agent_name == "seo":
-            from shared.tenant_agents import get_seo_agent
-            agent = await get_seo_agent(tenant_id)
-            result = await agent.run_cycle()
-            summary = f"SEO cycle completed: {result}" if result else "SEO cycle completed"
-        elif agent_name == "content":
-            from shared.tenant_agents import get_content_agent
-            agent = await get_content_agent(tenant_id)
-            result = await agent.run_cycle()
-            summary = f"Content cycle completed: {result}" if result else "Content cycle completed"
-        elif agent_name == "social":
-            from shared.tenant_agents import get_social_agent
-            agent = await get_social_agent(tenant_id)
-            result = await agent.run_cycle()
-            summary = f"Social cycle completed: {result}" if result else "Social cycle completed"
-        elif agent_name == "reviews":
-            from shared.tenant_agents import get_review_agent
-            agent = await get_review_agent(tenant_id)
-            result = await agent.run_cycle()
-            summary = f"Reviews cycle completed: {result}" if result else "Reviews cycle completed"
-        elif agent_name == "analytics":
-            from shared.tenant_agents import get_analytics_agent
-            agent = await get_analytics_agent(tenant_id)
-            result = await agent.run_cycle()
-            summary = f"Analytics cycle completed: {result}" if result else "Analytics cycle completed"
-        elif agent_name == "geo":
-            summary = "GEO monitoring triggered"
-        elif agent_name == "ads":
-            summary = "Ads agent triggered"
-        else:
-            summary = f"{agent_name} triggered"
-    except Exception as e:
-        status = "failed"
-        error_msg = str(e)
-        logger.error(f"Agent {agent_name} run failed for {tenant_id}: {e}")
-
-    # Update run record
-    if run_id:
-        try:
-            update_data = {
-                "status": status,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "summary": summary,
-            }
-            if error_msg:
-                update_data["error"] = error_msg
-            sb.table("agent_runs").update(update_data).eq("id", run_id).execute()
-        except Exception:
-            pass
-
-    # Update last_run_at on config
-    try:
-        sb.table("tenant_agent_config").upsert({
-            "tenant_id": tenant_id,
-            "agent_name": agent_name,
-            "last_run_at": datetime.now(timezone.utc).isoformat(),
-            "schedule": DEFAULT_SCHEDULES.get(agent_name, "daily"),
-        }, on_conflict="tenant_id,agent_name").execute()
-    except Exception:
-        pass
-
-    if status == "failed":
-        raise HTTPException(status_code=500, detail=error_msg or "Agent run failed")
-
-    return {"success": True, "agent": agent_name, "status": status, "summary": summary}
+    return {
+        "success": True,
+        "agent": agent_name,
+        "status": "running",
+        "run_id": run_id,
+    }
 
 
 # ── GET /agent-runs — Recent run history ─────────────────────────────────────
@@ -363,3 +366,62 @@ async def get_agent_runs(request: Request, limit: int = 10):
     except Exception as e:
         logger.error(f"get_agent_runs error: {e}")
         return {"runs": []}
+
+
+# ── GET /agent-runs/{run_id} — Single run status (used by dashboard polling) ──
+
+@router.get("/agent-runs/{run_id}")
+async def get_agent_run(run_id: str, request: Request):
+    """Return a single run for status polling. 404 if not in this tenant."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    sb = get_supabase()
+    try:
+        result = (
+            sb.table("agent_runs")
+            .select("*")
+            .eq("id", run_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_agent_run error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Watchdog: mark stale "running" rows as failed ────────────────────────────
+
+async def reap_stale_runs() -> int:
+    """
+    Mark agent_runs rows that have been "running" for longer than STALE_RUN_AFTER
+    as failed. Called on startup and periodically by the scheduler so a process
+    crash mid-cycle doesn't leave the dashboard stuck on a spinner.
+    Returns the number of rows updated.
+    """
+    sb = get_supabase()
+    cutoff = (datetime.now(timezone.utc) - STALE_RUN_AFTER).isoformat()
+    try:
+        result = (
+            sb.table("agent_runs")
+            .update({
+                "status": "failed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": "Run did not complete within timeout",
+            })
+            .eq("status", "running")
+            .lt("started_at", cutoff)
+            .execute()
+        )
+        n = len(result.data or [])
+        if n:
+            logger.warning(f"Watchdog marked {n} stale agent_runs as failed")
+        return n
+    except Exception as e:
+        logger.warning(f"reap_stale_runs failed: {e}")
+        return 0
