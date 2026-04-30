@@ -22,7 +22,10 @@ from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
 
-client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+# Module-level fallback client used by legacy callers that still touch the
+# default `ai_visibility_agent` singleton. Per-tenant runs use `self.client`
+# constructed in __init__ from tenant_config.
+client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
 
 # ── AI Engine personas ─────────────────────────────────────────────────────────
 # Each engine gets a different system prompt to simulate its characteristic style.
@@ -111,6 +114,26 @@ COMPETITORS = [
 
 class AIVisibilityAgent:
 
+    def __init__(self, tenant_config=None):
+        self.tenant_config = tenant_config
+        api_key = (
+            tenant_config.anthropic_api_key
+            if tenant_config and tenant_config.anthropic_api_key
+            else settings.ANTHROPIC_API_KEY
+        )
+        self.client = Anthropic(api_key=api_key) if api_key else None
+
+    async def run_cycle(self) -> str:
+        """Standard cycle entry point used by the trigger endpoint and scheduler."""
+        result = await self.run_monitoring()
+        if isinstance(result, dict):
+            mention_rate = result.get("mention_rate")
+            checks = result.get("total_checks") or len(result.get("results", []))
+            if mention_rate is not None:
+                return f"{checks} checks, {mention_rate}% mention rate"
+            return f"{checks} checks completed"
+        return "GEO check completed"
+
     async def _query_engine(self, prompt: str, engine_name: str, engine_config: Dict) -> str:
         """Query an AI engine for its response to *prompt*.
 
@@ -150,7 +173,7 @@ class AIVisibilityAgent:
         """Simulate an engine response via Claude (used as proxy when direct API access is unavailable)."""
         try:
             msg = await asyncio.to_thread(
-                client.messages.create,
+                self.client.messages.create,
                 model="claude-opus-4-6",
                 max_tokens=800,
                 system=engine_config["system"],
@@ -508,7 +531,7 @@ Respond ONLY with valid JSON (no markdown fences).
 """
         try:
             msg = await asyncio.to_thread(
-                client.messages.create,
+                self.client.messages.create,
                 model="claude-opus-4-6",
                 max_tokens=3000,
                 messages=[{"role": "user", "content": prompt}],
@@ -565,7 +588,7 @@ Respond ONLY as a JSON array with objects having these fields:
 """
         try:
             msg = await asyncio.to_thread(
-                client.messages.create,
+                self.client.messages.create,
                 model="claude-opus-4-6",
                 max_tokens=1200,
                 messages=[{"role": "user", "content": prompt}],

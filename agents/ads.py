@@ -152,12 +152,31 @@ class GoogleAdsAgent:
         }
     }
     
-    def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
+    def __init__(self, tenant_config=None):
+        self.tenant_config = tenant_config
+        api_key = (
+            tenant_config.anthropic_api_key
+            if tenant_config and tenant_config.anthropic_api_key
+            else settings.ANTHROPIC_API_KEY
+        )
+        self.client = Anthropic(api_key=api_key) if api_key else None
         self.model = "claude-sonnet-4-20250514"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
-        self.customer_id = settings.GOOGLE_ADS_CUSTOMER_ID.replace("-", "")
+        customer_id = settings.GOOGLE_ADS_CUSTOMER_ID or ""
+        self.customer_id = customer_id.replace("-", "") if customer_id else ""
+
+    async def run_cycle(self) -> str:
+        """Daily ads check: fetch recent campaign performance and surface a summary."""
+        try:
+            campaigns = await self.get_campaign_performance(date_range=7)
+        except Exception as e:
+            logger.warning(f"Ads run_cycle could not fetch campaigns: {e}")
+            return "Ads not configured"
+        if not campaigns:
+            return "No active campaigns"
+        spend = sum(float(c.get("metrics", {}).get("cost_micros", 0)) / 1_000_000 for c in campaigns)
+        return f"{len(campaigns)} campaigns reviewed, ${spend:.0f} 7d spend"
     
     # ── Google Ads REST API helpers ────────────────────────────────────
     

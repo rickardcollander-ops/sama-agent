@@ -44,3 +44,38 @@ async def get_analytics_agent(tenant_id: str):
     from agents.analytics import AnalyticsAgent
     config = await get_tenant_config(tenant_id)
     return AnalyticsAgent(tenant_config=config)
+
+
+async def get_ai_visibility_agent(tenant_id: str):
+    """Create an AIVisibilityAgent (GEO monitor) configured for the given tenant."""
+    from agents.ai_visibility import AIVisibilityAgent
+    config = await get_tenant_config(tenant_id)
+    return AIVisibilityAgent(tenant_config=config)
+
+
+async def get_ads_agent(tenant_id: str):
+    """Create a GoogleAdsAgent configured for the given tenant."""
+    from agents.ads import GoogleAdsAgent
+    config = await get_tenant_config(tenant_id)
+    return GoogleAdsAgent(tenant_config=config)
+
+
+# Map of agent_name → factory. Used by the scheduler and trigger endpoint to
+# avoid the agent_name → factory if/elif ladder.
+AGENT_FACTORIES = {
+    "seo": get_seo_agent,
+    "content": get_content_agent,
+    "social": get_social_agent,
+    "reviews": get_review_agent,
+    "analytics": get_analytics_agent,
+    "geo": get_ai_visibility_agent,
+    "ads": get_ads_agent,
+}
+
+
+async def get_agent(agent_name: str, tenant_id: str):
+    """Generic factory: returns a tenant-scoped instance of any registered agent."""
+    factory = AGENT_FACTORIES.get(agent_name)
+    if not factory:
+        raise ValueError(f"Unknown agent: {agent_name}")
+    return await factory(tenant_id)
