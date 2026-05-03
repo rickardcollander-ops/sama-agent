@@ -51,17 +51,28 @@ async def run_site_audit(payload: RunPayload, request: Request):
     max_pages = max(1, min(payload.max_pages or 15, 30))
     sb = get_supabase()
 
-    run_id = None
+    # Persist the row before kicking off the background task — if the insert
+    # fails (RLS, missing table, bad credentials) the dashboard has no id to
+    # poll, so surface the real reason instead of returning {"id": null}.
     try:
         ins = sb.table("site_audits").insert({
             "tenant_id": tenant_id,
             "domain": domain,
             "status": "running",
         }).execute()
-        if ins.data:
-            run_id = ins.data[0]["id"]
     except Exception as e:
-        logger.warning(f"Could not insert site_audits row: {e}")
+        logger.exception("Could not insert site_audits row")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create site audit row: {e}",
+        )
+
+    if not ins.data:
+        raise HTTPException(
+            status_code=500,
+            detail="site_audits insert returned no row (check RLS policy for site_audits)",
+        )
+    run_id = ins.data[0]["id"]
 
     asyncio.create_task(_execute_audit(run_id, tenant_id, domain, max_pages))
 
@@ -69,7 +80,7 @@ async def run_site_audit(payload: RunPayload, request: Request):
 
 
 async def _execute_audit(
-    run_id: Optional[str],
+    run_id: str,
     tenant_id: str,
     domain: str,
     max_pages: int,
@@ -82,8 +93,7 @@ async def _execute_audit(
 
     try:
         result = await agent.audit_domain(domain=domain, max_pages=max_pages)
-        if run_id:
-            result["id"] = run_id
+        result["id"] = run_id
         update = {
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -99,11 +109,10 @@ async def _execute_audit(
             "error": str(e)[:500],
         }
 
-    if run_id:
-        try:
-            sb.table("site_audits").update(update).eq("id", run_id).execute()
-        except Exception:
-            logger.warning(f"Could not persist site_audit {run_id} update", exc_info=True)
+    try:
+        sb.table("site_audits").update(update).eq("id", run_id).execute()
+    except Exception:
+        logger.warning(f"Could not persist site_audit {run_id} update", exc_info=True)
 
 
 # ── GET /runs ────────────────────────────────────────────────────────────────
