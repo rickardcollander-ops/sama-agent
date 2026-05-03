@@ -21,6 +21,7 @@ from api.routes import (
     github_integration, usage, social_schedule, analytics_attribution,
     content_validation, analysis as analysis_routes, approvals,
     site_audit as site_audit_routes,
+    content_suggest, ads_suggest, social_suggest, tech_agent,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
