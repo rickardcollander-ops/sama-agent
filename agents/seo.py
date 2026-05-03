@@ -7,7 +7,7 @@ Uses Supabase for persistence and real Google APIs where configured.
 import asyncio
 import logging
 import re
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Set
 from datetime import datetime, timedelta
 from anthropic import Anthropic
 import httpx
@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from shared.config import settings
 from shared.database import get_supabase
 from shared.google_auth import get_access_token, is_gsc_configured
-from .models import KEYWORDS_TABLE, SEO_AUDITS_TABLE, BACKLINK_PROFILES_TABLE, COMPETITOR_ANALYSES_TABLE
+from .models import KEYWORDS_TABLE, SEO_AUDITS_TABLE
 
 logger = logging.getLogger(__name__)
 
