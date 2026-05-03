@@ -1,16 +1,17 @@
 """
-Site Audit Agent — full SEO + GEO technical audit of a domain.
+SiteAuditAgent — full-domain SEO + GEO + technical + link health audit.
 
-Crawls the tenant's domain (BFS over internal links, capped at MAX_PAGES),
-parses each page's HTML, and scores four categories on a 0–100 scale:
-  - technical:  HTTPS, viewport, canonical, sitemap, robots.txt, status codes
-  - geo:        schema.org JSON-LD (FAQ, Article, Org, …), structured headings,
-                alt-text coverage, language attribute, descriptive titles
-  - content:    word count, heading hierarchy, image-alt coverage, title length
-  - links:      broken-link rate, internal/external balance, anchor variety
+Given a domain, this agent:
+  1. Discovers pages via sitemap.xml (falls back to crawling the homepage).
+  2. Fetches up to N pages and parses on-page signals with BeautifulSoup.
+  3. HEAD-checks discovered links to find broken ones.
+  4. Scores the site across five categories (technical / on-page / GEO /
+     links / performance) plus an overall score.
+  5. Produces structured findings + recommendations the dashboard can render
+     as gauges, tables, and CTAs.
 
-The output shape matches the TypeScript SiteAudit type in
-app/c/analysis/types.ts so the dashboard can render it unchanged.
+Network calls all go through a single httpx.AsyncClient so we share a
+connection pool, follow redirects once, and respect a per-request timeout.
 """
 
 from __future__ import annotations
@@ -19,692 +20,677 @@ import asyncio
 import json
 import logging
 import re
-from collections import Counter
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
+from xml.etree import ElementTree as ET
 
 import httpx
 from bs4 import BeautifulSoup
 
+from shared.tenant import TenantConfig
+
 logger = logging.getLogger(__name__)
 
 
-MAX_PAGES = 25
-MAX_LINK_CHECKS = 80
-CONCURRENCY = 6
-PAGE_TIMEOUT = 15.0
-LINK_TIMEOUT = 8.0
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; SamaSiteAuditBot/1.0; "
-    "+https://successifier.com/bot)"
-)
+# ── Tunables ─────────────────────────────────────────────────────────────────
+DEFAULT_MAX_PAGES = 15
+DEFAULT_MAX_LINKS_TO_CHECK = 40
+DEFAULT_TIMEOUT_S = 12.0
+USER_AGENT = "SamaSiteAudit/1.0 (+https://successifier.com)"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data containers
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── Data types ───────────────────────────────────────────────────────────────
 
 @dataclass
 class PageReport:
     url: str
-    status_code: Optional[int] = None
-    response_time_ms: Optional[int] = None
+    status_code: int
+    response_ms: int
     title: Optional[str] = None
     title_length: int = 0
     meta_description: Optional[str] = None
     meta_description_length: int = 0
     h1_count: int = 0
-    h1_text: Optional[str] = None
     h2_count: int = 0
     h3_count: int = 0
     word_count: int = 0
+    images_total: int = 0
+    images_missing_alt: int = 0
     canonical: Optional[str] = None
+    has_schema: bool = False
+    schema_types: List[str] = field(default_factory=list)
+    has_open_graph: bool = False
     has_viewport: bool = False
     has_lang: bool = False
-    has_og_tags: bool = False
-    has_twitter_card: bool = False
-    schema_types: List[str] = field(default_factory=list)
-    image_count: int = 0
-    images_missing_alt: int = 0
     internal_links: int = 0
     external_links: int = 0
     issues: List[str] = field(default_factory=list)
-    page_score: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "url": self.url,
-            "status_code": self.status_code,
-            "response_time_ms": self.response_time_ms,
-            "title": self.title,
-            "title_length": self.title_length,
-            "meta_description": self.meta_description,
-            "meta_description_length": self.meta_description_length,
-            "h1_count": self.h1_count,
-            "h1_text": self.h1_text,
-            "h2_count": self.h2_count,
-            "h3_count": self.h3_count,
-            "word_count": self.word_count,
-            "canonical": self.canonical,
-            "has_viewport": self.has_viewport,
-            "has_lang": self.has_lang,
-            "has_og_tags": self.has_og_tags,
-            "has_twitter_card": self.has_twitter_card,
-            "schema_types": self.schema_types,
-            "image_count": self.image_count,
-            "images_missing_alt": self.images_missing_alt,
-            "internal_links": self.internal_links,
-            "external_links": self.external_links,
-            "issues": self.issues,
-            "page_score": self.page_score,
-        }
+        return self.__dict__.copy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Agent
-# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class BrokenLink:
+    url: str
+    status_code: int
+    found_on: List[str]
 
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _normalise_domain(raw: str) -> Tuple[str, str]:
+    """
+    Return (base_url_with_scheme, hostname).
+    'foo.com' → ('https://foo.com', 'foo.com')
+    'https://foo.com/path' → ('https://foo.com', 'foo.com')
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("domain is empty")
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError(f"could not parse host from {raw!r}")
+    base = f"{parsed.scheme}://{host}"
+    if parsed.port:
+        base += f":{parsed.port}"
+    return base, host
+
+
+def _abs_url(base: str, href: str) -> Optional[str]:
+    if not href:
+        return None
+    href = href.strip()
+    if href.startswith(("javascript:", "mailto:", "tel:", "#")):
+        return None
+    try:
+        joined = urljoin(base + "/", href)
+        parsed = urlparse(joined)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        # Strip fragment
+        return urlunparse(parsed._replace(fragment=""))
+    except Exception:
+        return None
+
+
+def _is_same_host(url: str, host: str) -> bool:
+    try:
+        h = (urlparse(url).hostname or "").lower()
+        host = host.lower()
+        return h == host or h.endswith("." + host) or host.endswith("." + h)
+    except Exception:
+        return False
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text or ""))
+
+
+# ── The agent ────────────────────────────────────────────────────────────────
 
 class SiteAuditAgent:
-    """Tenant-scoped site auditor.
+    def __init__(self, tenant_config: TenantConfig):
+        self.tenant_config = tenant_config
 
-    Usage:
-        agent = SiteAuditAgent(domain="example.com")
-        report = await agent.run()
-    """
+    async def audit_domain(
+        self,
+        domain: str,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        max_links_to_check: int = DEFAULT_MAX_LINKS_TO_CHECK,
+    ) -> Dict[str, Any]:
+        """Run a full audit and return a JSON-serialisable report."""
+        base_url, host = _normalise_domain(domain)
+        started = time.time()
 
-    def __init__(self, domain: str, max_pages: int = MAX_PAGES):
-        self.domain = self._normalise_domain(domain)
-        self.max_pages = max(1, min(max_pages, MAX_PAGES))
-        self._link_checks: Dict[str, int] = {}  # url -> status
-
-    # ── public API ──────────────────────────────────────────────────────────
-
-    async def run(self) -> Dict[str, Any]:
-        if not self.domain:
-            return self._empty_report("No domain configured")
-
-        base_url = f"https://{self.domain}"
         async with httpx.AsyncClient(
-            timeout=PAGE_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_S,
             follow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
-            verify=True,
-        ) as http:
-            robots = await self._fetch_robots(http, base_url)
-            sitemap = await self._fetch_sitemap(http, base_url, robots["sitemap_url"])
-            pages = await self._crawl(http, base_url, sitemap["urls"])
-            broken = await self._check_external_links(http, pages)
+            headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        ) as client:
+            robots = await self._fetch_text(client, base_url + "/robots.txt")
+            llms = await self._fetch_text(client, base_url + "/llms.txt")
+            sitemap_urls = await self._discover_sitemap_urls(client, base_url, robots)
 
-        scores = self._compute_scores(pages, robots, sitemap, broken)
-        issues = self._top_issues(pages, robots, sitemap, broken)
+            # Choose pages to audit: prefer sitemap, fall back to homepage links.
+            pages_to_audit: List[str] = []
+            if sitemap_urls:
+                pages_to_audit = sitemap_urls[:max_pages]
+            else:
+                home_html, home_status, home_ms = await self._fetch_html(client, base_url + "/")
+                if home_html:
+                    home_links = self._extract_links(base_url, home_html, host, internal_only=True)
+                    pages_to_audit = [base_url + "/"] + home_links[: max_pages - 1]
+                else:
+                    pages_to_audit = [base_url + "/"]
 
-        return {
-            "domain": self.domain,
-            "pages_crawled": len(pages),
-            "robots_txt": robots,
-            "sitemap": sitemap,
-            "scores": scores,
-            "issues": issues,
-            "broken_links": broken,
-            "pages": [p.to_dict() for p in pages],
-        }
+            # De-dupe and audit each page in parallel (bounded concurrency).
+            seen: Set[str] = set()
+            unique_pages = [p for p in pages_to_audit if not (p in seen or seen.add(p))]
 
-    # ── crawl ───────────────────────────────────────────────────────────────
+            sem = asyncio.Semaphore(5)
 
-    async def _crawl(
-        self,
-        http: httpx.AsyncClient,
-        base_url: str,
-        sitemap_urls: List[str],
-    ) -> List[PageReport]:
-        seed_urls = [base_url] + [u for u in sitemap_urls if self._same_host(u, base_url)]
-        seen: Set[str] = set()
-        queue: List[str] = []
-        for u in seed_urls:
-            n = self._canonicalise_url(u)
-            if n and n not in seen:
-                seen.add(n)
-                queue.append(n)
+            async def _bounded(url: str) -> Optional[PageReport]:
+                async with sem:
+                    return await self._audit_page(client, url, host)
 
-        results: List[PageReport] = []
-        sem = asyncio.Semaphore(CONCURRENCY)
+            page_results = await asyncio.gather(*[_bounded(u) for u in unique_pages])
+            pages: List[PageReport] = [p for p in page_results if p is not None]
 
-        async def fetch(url: str) -> Tuple[PageReport, List[str]]:
-            async with sem:
-                return await self._fetch_and_parse(http, url, base_url)
+            # Gather all unique outgoing links from audited pages and HEAD-check
+            # a sample of them for broken-link detection.
+            all_links: Dict[str, List[str]] = {}
+            for page in pages:
+                # We re-fetch just to extract hrefs; cheaper to re-parse the
+                # cached HTML, but we kept the parsed page dict only. So skip:
+                # links discovered during audit are tracked in `all_links` via
+                # _audit_page hooks. For simplicity, do a second light pass.
+                pass
+            broken_links = await self._check_links(client, pages, base_url, host, max_links_to_check)
 
-        # BFS: process the current frontier in parallel, collect new internal
-        # links, repeat until we hit the page cap.
-        idx = 0
-        while idx < len(queue) and len(results) < self.max_pages:
-            batch = queue[idx : idx + CONCURRENCY]
-            idx += len(batch)
-            outcomes = await asyncio.gather(
-                *(fetch(u) for u in batch),
-                return_exceptions=True,
-            )
-            for outcome in outcomes:
-                if isinstance(outcome, Exception):
-                    continue
-                page, discovered = outcome
-                results.append(page)
-                if len(results) >= self.max_pages:
-                    break
-                for link in discovered:
-                    n = self._canonicalise_url(link)
-                    if n and n not in seen and self._same_host(n, base_url):
-                        seen.add(n)
-                        queue.append(n)
-        return results
+            # Compute scores + findings + recommendations.
+            scores = self._compute_scores(pages, robots, llms, sitemap_urls, base_url, broken_links)
+            findings = self._compute_findings(pages, robots, llms, sitemap_urls, base_url, broken_links)
+            recommendations = self._compute_recommendations(findings)
 
-    async def _fetch_and_parse(
-        self,
-        http: httpx.AsyncClient,
-        url: str,
-        base_url: str,
-    ) -> Tuple[PageReport, List[str]]:
-        page = PageReport(url=url)
+            summary = {
+                "pages_analyzed": len(pages),
+                "total_pages_discovered": len(sitemap_urls) if sitemap_urls else len(pages),
+                "has_robots_txt": robots is not None,
+                "has_sitemap_xml": bool(sitemap_urls),
+                "has_llms_txt": llms is not None,
+                "https": base_url.startswith("https://"),
+                "avg_response_ms": int(sum(p.response_ms for p in pages) / len(pages)) if pages else 0,
+                "total_links_checked": min(max_links_to_check, sum(p.internal_links + p.external_links for p in pages)),
+                "broken_links_count": len(broken_links),
+                "audit_duration_ms": int((time.time() - started) * 1000),
+            }
+
+            return {
+                "domain": host,
+                "base_url": base_url,
+                "scores": scores,
+                "summary": summary,
+                "pages": [p.to_dict() for p in pages],
+                "broken_links": [bl.__dict__ for bl in broken_links],
+                "findings": findings,
+                "recommendations": recommendations,
+            }
+
+    # ── Network primitives ──────────────────────────────────────────────────
+
+    async def _fetch_text(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
         try:
-            t0 = asyncio.get_event_loop().time()
-            resp = await http.get(url)
-            page.response_time_ms = int((asyncio.get_event_loop().time() - t0) * 1000)
-            page.status_code = resp.status_code
-            content_type = resp.headers.get("content-type", "")
-            if resp.status_code >= 400 or "html" not in content_type.lower():
-                page.issues.append(f"HTTP {resp.status_code}")
-                page.page_score = self._score_page(page)
-                return page, []
-            html = resp.text
+            r = await client.get(url)
+            if r.status_code == 200 and r.text:
+                return r.text
+        except Exception:
+            return None
+        return None
+
+    async def _fetch_html(
+        self, client: httpx.AsyncClient, url: str
+    ) -> Tuple[Optional[str], int, int]:
+        start = time.time()
+        try:
+            r = await client.get(url)
+            ms = int((time.time() - start) * 1000)
+            ctype = r.headers.get("content-type", "").lower()
+            if r.status_code < 400 and ("html" in ctype or not ctype):
+                return r.text, r.status_code, ms
+            return None, r.status_code, ms
         except Exception as e:
-            logger.info(f"site-audit fetch failed {url}: {e}")
-            page.issues.append("Could not fetch page")
-            page.page_score = self._score_page(page)
-            return page, []
+            logger.debug(f"fetch_html {url}: {e}")
+            return None, 0, int((time.time() - start) * 1000)
+
+    # ── Sitemap discovery ───────────────────────────────────────────────────
+
+    async def _discover_sitemap_urls(
+        self, client: httpx.AsyncClient, base_url: str, robots: Optional[str]
+    ) -> List[str]:
+        """Pull URLs from sitemap.xml (and robots.txt's Sitemap: directive)."""
+        sitemap_locations: List[str] = []
+
+        # robots.txt may declare Sitemap: lines
+        if robots:
+            for line in robots.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    loc = line.split(":", 1)[1].strip()
+                    if loc:
+                        sitemap_locations.append(loc)
+
+        if not sitemap_locations:
+            sitemap_locations.append(base_url + "/sitemap.xml")
+
+        urls: List[str] = []
+        seen: Set[str] = set()
+        for sm in sitemap_locations[:3]:  # don't follow forever
+            text = await self._fetch_text(client, sm)
+            if not text:
+                continue
+            urls.extend(self._parse_sitemap(text, seen))
+            if len(urls) > 200:
+                break
+        return urls
+
+    def _parse_sitemap(self, xml_text: str, seen: Set[str]) -> List[str]:
+        """Parse a sitemap (or sitemap index) and return page URLs."""
+        out: List[str] = []
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return out
+        # Strip namespace
+        ns = re.match(r"\{(.*)\}", root.tag)
+        nsmap = {"sm": ns.group(1)} if ns else {}
+        loc_path = ".//sm:loc" if nsmap else ".//loc"
+        for el in root.findall(loc_path, nsmap):
+            url = (el.text or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+        return out
+
+    # ── Per-page audit ──────────────────────────────────────────────────────
+
+    async def _audit_page(
+        self, client: httpx.AsyncClient, url: str, host: str
+    ) -> Optional[PageReport]:
+        html, status, ms = await self._fetch_html(client, url)
+        if html is None:
+            return PageReport(url=url, status_code=status, response_ms=ms,
+                              issues=["fetch_failed"])
 
         soup = BeautifulSoup(html, "lxml")
-        self._extract_basics(page, soup)
-        discovered = self._extract_links(page, soup, url, base_url)
-        page.page_score = self._score_page(page)
-        return page, discovered
+        report = PageReport(url=url, status_code=status, response_ms=ms)
 
-    def _extract_basics(self, page: PageReport, soup: BeautifulSoup) -> None:
         # Title
         if soup.title and soup.title.string:
-            page.title = soup.title.string.strip()
-            page.title_length = len(page.title)
+            report.title = soup.title.string.strip()
+            report.title_length = len(report.title)
 
         # Meta description
-        md = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+        md = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
         if md and md.get("content"):
-            page.meta_description = md["content"].strip()
-            page.meta_description_length = len(page.meta_description)
+            report.meta_description = md["content"].strip()
+            report.meta_description_length = len(report.meta_description)
 
         # Headings
-        h1s = soup.find_all("h1")
-        page.h1_count = len(h1s)
-        if h1s:
-            page.h1_text = (h1s[0].get_text() or "").strip()[:200]
-        page.h2_count = len(soup.find_all("h2"))
-        page.h3_count = len(soup.find_all("h3"))
+        report.h1_count = len(soup.find_all("h1"))
+        report.h2_count = len(soup.find_all("h2"))
+        report.h3_count = len(soup.find_all("h3"))
 
-        # Word count (text excluding script/style/nav)
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        text = " ".join(soup.get_text(" ").split())
-        page.word_count = len(text.split())
-
-        # Canonical
-        canonical = soup.find("link", rel=lambda v: v and "canonical" in v)
-        if canonical and canonical.get("href"):
-            page.canonical = canonical["href"].strip()
-
-        # Viewport
-        page.has_viewport = bool(soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)}))
-
-        # Lang
-        html_tag = soup.find("html")
-        page.has_lang = bool(html_tag and html_tag.get("lang"))
-
-        # OG / Twitter
-        page.has_og_tags = bool(soup.find("meta", attrs={"property": re.compile(r"^og:")}))
-        page.has_twitter_card = bool(soup.find("meta", attrs={"name": re.compile(r"^twitter:")}))
-
-        # JSON-LD
-        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        # Schema.org JSON-LD — extract BEFORE stripping <script> tags below.
+        for s in soup.find_all("script", type=lambda v: v and "ld+json" in v.lower()):
             try:
-                data = json.loads(script.string or "{}")
+                data = json.loads(s.string or "{}")
             except Exception:
                 continue
+            report.has_schema = True
             for t in self._extract_schema_types(data):
-                if t and t not in page.schema_types:
-                    page.schema_types.append(t)
+                if t and t not in report.schema_types:
+                    report.schema_types.append(t)
+
+        # Word count (rough — strip script/style after we've consumed them)
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        report.word_count = _word_count(soup.get_text(" ", strip=True))
 
         # Images
         imgs = soup.find_all("img")
-        page.image_count = len(imgs)
-        page.images_missing_alt = sum(
-            1 for img in imgs if not (img.get("alt") or "").strip()
+        report.images_total = len(imgs)
+        report.images_missing_alt = sum(
+            1 for i in imgs if not (i.get("alt") and i["alt"].strip())
         )
 
-        # Per-page issue summary
-        if not page.title:
-            page.issues.append("Missing <title>")
-        elif page.title_length < 20 or page.title_length > 65:
-            page.issues.append(f"Title length {page.title_length} (recommended 20–65)")
-        if not page.meta_description:
-            page.issues.append("Missing meta description")
-        elif page.meta_description_length < 50 or page.meta_description_length > 165:
-            page.issues.append(f"Meta description length {page.meta_description_length} (recommended 50–165)")
-        if page.h1_count == 0:
-            page.issues.append("No <h1> heading")
-        elif page.h1_count > 1:
-            page.issues.append(f"{page.h1_count} <h1> tags (use one)")
-        if page.word_count < 250:
-            page.issues.append(f"Thin content ({page.word_count} words)")
-        if not page.has_viewport:
-            page.issues.append("No viewport meta (mobile)")
-        if not page.canonical:
-            page.issues.append("No canonical link")
-        if page.image_count and page.images_missing_alt / page.image_count > 0.2:
-            page.issues.append(
-                f"{page.images_missing_alt}/{page.image_count} images missing alt text"
-            )
-        if not page.schema_types:
-            page.issues.append("No schema.org JSON-LD (hurts AI/GEO discovery)")
+        # Canonical
+        canon = soup.find("link", rel=lambda v: v and "canonical" in (v if isinstance(v, list) else [v]))
+        if canon and canon.get("href"):
+            report.canonical = canon["href"].strip()
 
-    def _extract_links(
-        self,
-        page: PageReport,
-        soup: BeautifulSoup,
-        url: str,
-        base_url: str,
-    ) -> List[str]:
-        discovered: List[str] = []
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+        # Open Graph
+        report.has_open_graph = bool(soup.find("meta", attrs={"property": re.compile(r"^og:", re.I)}))
+
+        # Viewport
+        vp = soup.find("meta", attrs={"name": re.compile(r"^viewport$", re.I)})
+        report.has_viewport = bool(vp and vp.get("content"))
+
+        # <html lang>
+        html_tag = soup.find("html")
+        report.has_lang = bool(html_tag and html_tag.get("lang"))
+
+        # Links
+        all_links = soup.find_all("a", href=True)
+        for a in all_links:
+            absu = _abs_url(url, a["href"])
+            if not absu:
                 continue
-            absolute = urljoin(url, href)
-            if self._same_host(absolute, base_url):
-                page.internal_links += 1
-                discovered.append(absolute)
+            if _is_same_host(absu, host):
+                report.internal_links += 1
             else:
-                page.external_links += 1
-                # Track external links for broken-link checks (capped).
-                if absolute not in self._link_checks and len(self._link_checks) < MAX_LINK_CHECKS:
-                    self._link_checks[absolute] = 0
-        return discovered
+                report.external_links += 1
 
-    # ── robots & sitemap ────────────────────────────────────────────────────
+        # Per-page issues (used for findings rollup)
+        if report.title_length == 0:
+            report.issues.append("missing_title")
+        elif report.title_length < 30:
+            report.issues.append("short_title")
+        elif report.title_length > 65:
+            report.issues.append("long_title")
+        if report.meta_description_length == 0:
+            report.issues.append("missing_meta_description")
+        elif report.meta_description_length < 80:
+            report.issues.append("short_meta_description")
+        elif report.meta_description_length > 165:
+            report.issues.append("long_meta_description")
+        if report.h1_count == 0:
+            report.issues.append("missing_h1")
+        elif report.h1_count > 1:
+            report.issues.append("multiple_h1")
+        if report.word_count < 300:
+            report.issues.append("thin_content")
+        if report.images_missing_alt > 0:
+            report.issues.append("images_missing_alt")
+        if not report.has_viewport:
+            report.issues.append("missing_viewport")
+        if not report.has_lang:
+            report.issues.append("missing_html_lang")
+        if not report.has_schema:
+            report.issues.append("missing_structured_data")
+        if not report.has_open_graph:
+            report.issues.append("missing_open_graph")
+        if not report.canonical:
+            report.issues.append("missing_canonical")
 
-    async def _fetch_robots(
-        self, http: httpx.AsyncClient, base_url: str
-    ) -> Dict[str, Any]:
-        try:
-            resp = await http.get(f"{base_url}/robots.txt")
-            if resp.status_code != 200:
-                return {"present": False, "sitemap_url": None, "size": 0}
-            text = resp.text or ""
-            sitemap_url: Optional[str] = None
-            for line in text.splitlines():
-                m = re.match(r"^\s*sitemap:\s*(\S+)", line, re.I)
-                if m:
-                    sitemap_url = m.group(1).strip()
-                    break
-            return {
-                "present": True,
-                "sitemap_url": sitemap_url,
-                "size": len(text),
-            }
-        except Exception:
-            return {"present": False, "sitemap_url": None, "size": 0}
+        return report
 
-    async def _fetch_sitemap(
-        self,
-        http: httpx.AsyncClient,
-        base_url: str,
-        robots_sitemap: Optional[str],
-    ) -> Dict[str, Any]:
-        candidates = []
-        if robots_sitemap:
-            candidates.append(robots_sitemap)
-        candidates.append(f"{base_url}/sitemap.xml")
-        for sm_url in candidates:
-            try:
-                resp = await http.get(sm_url)
-                if resp.status_code != 200:
-                    continue
-                urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", resp.text or "")
-                return {
-                    "present": True,
-                    "url": sm_url,
-                    "url_count": len(urls),
-                    "urls": urls[: self.max_pages],
-                }
-            except Exception:
-                continue
-        return {"present": False, "url": None, "url_count": 0, "urls": []}
-
-    # ── external link health ────────────────────────────────────────────────
-
-    async def _check_external_links(
-        self,
-        http: httpx.AsyncClient,
-        pages: List[PageReport],
-    ) -> Dict[str, Any]:
-        urls = list(self._link_checks.keys())
-        if not urls:
-            return {"checked": 0, "broken_count": 0, "broken": []}
-
-        sem = asyncio.Semaphore(CONCURRENCY)
-
-        async def head(u: str) -> Tuple[str, int]:
-            async with sem:
-                try:
-                    resp = await http.head(u, timeout=LINK_TIMEOUT)
-                    code = resp.status_code
-                    # Some servers reject HEAD; retry with GET when 405/501.
-                    if code in (405, 501):
-                        resp = await http.get(u, timeout=LINK_TIMEOUT)
-                        code = resp.status_code
-                    return u, code
-                except Exception:
-                    return u, 0
-
-        outcomes = await asyncio.gather(*(head(u) for u in urls), return_exceptions=False)
-        broken: List[Dict[str, Any]] = []
-        for url, code in outcomes:
-            self._link_checks[url] = code
-            if code == 0 or code >= 400:
-                broken.append({"url": url, "status": code})
-        return {
-            "checked": len(urls),
-            "broken_count": len(broken),
-            "broken": broken[:20],
-        }
-
-    # ── scoring ─────────────────────────────────────────────────────────────
-
-    def _score_page(self, p: PageReport) -> int:
-        score = 100
-        if not p.title:
-            score -= 15
-        elif p.title_length < 20 or p.title_length > 65:
-            score -= 5
-        if not p.meta_description:
-            score -= 10
-        elif p.meta_description_length < 50 or p.meta_description_length > 165:
-            score -= 4
-        if p.h1_count == 0:
-            score -= 10
-        elif p.h1_count > 1:
-            score -= 4
-        if p.word_count < 250:
-            score -= 8
-        if not p.has_viewport:
-            score -= 5
-        if not p.canonical:
-            score -= 5
-        if not p.schema_types:
-            score -= 8
-        if p.image_count:
-            missing_ratio = p.images_missing_alt / p.image_count
-            if missing_ratio > 0.5:
-                score -= 8
-            elif missing_ratio > 0.2:
-                score -= 4
-        if p.status_code and p.status_code >= 400:
-            score = max(0, min(score, 30))
-        return max(0, min(100, score))
-
-    def _compute_scores(
-        self,
-        pages: List[PageReport],
-        robots: Dict[str, Any],
-        sitemap: Dict[str, Any],
-        broken: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        if not pages:
-            return {
-                "overall": 0,
-                "technical": 0,
-                "geo": 0,
-                "content": 0,
-                "links": 0,
-                "details": {},
-            }
-
-        n = len(pages)
-        ok = sum(1 for p in pages if p.status_code and 200 <= p.status_code < 400)
-        with_canonical = sum(1 for p in pages if p.canonical)
-        with_viewport = sum(1 for p in pages if p.has_viewport)
-        with_lang = sum(1 for p in pages if p.has_lang)
-        with_og = sum(1 for p in pages if p.has_og_tags)
-        with_schema = sum(1 for p in pages if p.schema_types)
-        faq_or_howto = sum(
-            1 for p in pages
-            if any(t in {"FAQPage", "HowTo", "Article", "BlogPosting", "Product"} for t in p.schema_types)
-        )
-        with_h1 = sum(1 for p in pages if p.h1_count == 1)
-        with_title = sum(1 for p in pages if p.title and 20 <= p.title_length <= 65)
-        with_meta = sum(1 for p in pages if p.meta_description and 50 <= p.meta_description_length <= 165)
-        long_enough = sum(1 for p in pages if p.word_count >= 250)
-        avg_words = sum(p.word_count for p in pages) / n
-        total_imgs = sum(p.image_count for p in pages)
-        missing_alt = sum(p.images_missing_alt for p in pages)
-        alt_coverage = 1.0 if total_imgs == 0 else 1.0 - (missing_alt / total_imgs)
-
-        # Technical: HTTPS implicit (we requested https://), uptime, sitemap,
-        # robots, canonical, viewport.
-        technical = round(
-            100
-            * (
-                0.20 * (ok / n)
-                + 0.15 * (1.0 if robots["present"] else 0.0)
-                + 0.15 * (1.0 if sitemap["present"] else 0.0)
-                + 0.20 * (with_canonical / n)
-                + 0.20 * (with_viewport / n)
-                + 0.10 * (with_lang / n)
-            )
-        )
-
-        # GEO/AI readiness: schema markup, FAQ/Article schemas, alt text,
-        # language attribute, OG metadata, descriptive titles.
-        geo = round(
-            100
-            * (
-                0.30 * (with_schema / n)
-                + 0.20 * (faq_or_howto / n)
-                + 0.15 * alt_coverage
-                + 0.10 * (with_lang / n)
-                + 0.10 * (with_og / n)
-                + 0.15 * (with_title / n)
-            )
-        )
-
-        # Content: word count, headings, meta descriptions, alt text.
-        content = round(
-            100
-            * (
-                0.30 * (long_enough / n)
-                + 0.25 * (with_h1 / n)
-                + 0.20 * (with_meta / n)
-                + 0.15 * alt_coverage
-                + 0.10 * min(avg_words / 800.0, 1.0)
-            )
-        )
-
-        # Links: broken-link rate + internal-link density.
-        avg_internal = sum(p.internal_links for p in pages) / n
-        broken_rate = (broken["broken_count"] / broken["checked"]) if broken["checked"] else 0.0
-        links = round(
-            100
-            * (
-                0.55 * (1.0 - broken_rate)
-                + 0.25 * min(avg_internal / 10.0, 1.0)
-                + 0.20 * (1.0 if sitemap["present"] else 0.0)
-            )
-        )
-
-        overall = round(0.30 * technical + 0.30 * geo + 0.25 * content + 0.15 * links)
-
-        return {
-            "overall": overall,
-            "technical": technical,
-            "geo": geo,
-            "content": content,
-            "links": links,
-            "details": {
-                "pages_ok": ok,
-                "pages_total": n,
-                "robots_present": robots["present"],
-                "sitemap_present": sitemap["present"],
-                "sitemap_url_count": sitemap.get("url_count", 0),
-                "with_canonical": with_canonical,
-                "with_viewport": with_viewport,
-                "with_lang": with_lang,
-                "with_og": with_og,
-                "with_schema": with_schema,
-                "with_faq_or_article_schema": faq_or_howto,
-                "with_proper_h1": with_h1,
-                "with_good_title": with_title,
-                "with_good_meta": with_meta,
-                "long_enough_pages": long_enough,
-                "avg_word_count": round(avg_words),
-                "alt_coverage": round(alt_coverage * 100),
-                "avg_internal_links": round(avg_internal, 1),
-                "broken_link_rate": round(broken_rate * 100, 1),
-            },
-        }
-
-    def _top_issues(
-        self,
-        pages: List[PageReport],
-        robots: Dict[str, Any],
-        sitemap: Dict[str, Any],
-        broken: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        issues: List[Dict[str, Any]] = []
-        n = len(pages) or 1
-
-        if not robots["present"]:
-            issues.append({"severity": "high", "category": "technical",
-                           "title": "robots.txt missing",
-                           "detail": "Search engines and AI crawlers expect a robots.txt at /robots.txt."})
-        if not sitemap["present"]:
-            issues.append({"severity": "high", "category": "technical",
-                           "title": "sitemap.xml missing",
-                           "detail": "Add a sitemap so crawlers can discover all your pages."})
-
-        without_schema = sum(1 for p in pages if not p.schema_types)
-        if without_schema / n >= 0.5:
-            issues.append({"severity": "high", "category": "geo",
-                           "title": f"{without_schema}/{n} pages have no schema markup",
-                           "detail": "Add JSON-LD (Article, FAQPage, Product, Organization) to help AI engines cite you."})
-
-        thin = [p for p in pages if p.word_count < 250]
-        if len(thin) / n >= 0.3:
-            issues.append({"severity": "medium", "category": "content",
-                           "title": f"{len(thin)} thin pages (<250 words)",
-                           "detail": "Expand thin pages with substantive copy that answers buyer questions."})
-
-        no_meta = [p for p in pages if not p.meta_description]
-        if len(no_meta) / n >= 0.3:
-            issues.append({"severity": "medium", "category": "technical",
-                           "title": f"{len(no_meta)} pages missing meta description",
-                           "detail": "Meta descriptions drive click-through from SERPs and AI summaries."})
-
-        no_h1 = [p for p in pages if p.h1_count != 1]
-        if len(no_h1) / n >= 0.3:
-            issues.append({"severity": "medium", "category": "content",
-                           "title": f"{len(no_h1)} pages with bad <h1>",
-                           "detail": "Each page should have exactly one descriptive <h1>."})
-
-        if broken["broken_count"]:
-            issues.append({"severity": "high", "category": "links",
-                           "title": f"{broken['broken_count']} broken external links",
-                           "detail": "Broken links erode trust and crawl budget. Fix or remove."})
-
-        no_canonical = sum(1 for p in pages if not p.canonical)
-        if no_canonical / n >= 0.3:
-            issues.append({"severity": "medium", "category": "technical",
-                           "title": f"{no_canonical} pages without canonical",
-                           "detail": "Add <link rel=\"canonical\"> to avoid duplicate-content penalties."})
-
-        # Surface most common per-page issue too.
-        all_issues = [iss for p in pages for iss in p.issues]
-        if all_issues:
-            common = Counter(all_issues).most_common(3)
-            for label, count in common:
-                if count / n >= 0.4:
-                    issues.append({"severity": "low", "category": "content",
-                                   "title": f"{count} pages: {label}",
-                                   "detail": "Common across many pages — fix at the template level."})
-
-        return issues[:10]
-
-    # ── helpers ─────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _normalise_domain(raw: str) -> str:
-        if not raw:
-            return ""
-        d = raw.strip().lower()
-        d = re.sub(r"^https?://", "", d)
-        d = d.split("/")[0]
-        if d.startswith("www."):
-            d = d[4:]
-        return d
-
-    @staticmethod
-    def _same_host(url: str, base_url: str) -> bool:
-        try:
-            a = urlparse(url).netloc.lower().lstrip("www.")
-            b = urlparse(base_url).netloc.lower().lstrip("www.")
-            return bool(a) and a == b
-        except Exception:
-            return False
-
-    @staticmethod
-    def _canonicalise_url(url: str) -> Optional[str]:
-        try:
-            p = urlparse(url)
-            if p.scheme not in ("http", "https"):
-                return None
-            # Drop fragment, trailing slash on root paths only.
-            path = p.path or "/"
-            return urlunparse((p.scheme, p.netloc.lower(), path, "", p.query, ""))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _extract_schema_types(data: Any) -> List[str]:
+    def _extract_schema_types(self, node: Any) -> List[str]:
         out: List[str] = []
-        if isinstance(data, dict):
-            t = data.get("@type")
+        if isinstance(node, dict):
+            t = node.get("@type")
             if isinstance(t, str):
                 out.append(t)
             elif isinstance(t, list):
                 out.extend([x for x in t if isinstance(x, str)])
-            for v in data.values():
-                out.extend(SiteAuditAgent._extract_schema_types(v))
-        elif isinstance(data, list):
-            for item in data:
-                out.extend(SiteAuditAgent._extract_schema_types(item))
+            for v in node.values():
+                out.extend(self._extract_schema_types(v))
+        elif isinstance(node, list):
+            for v in node:
+                out.extend(self._extract_schema_types(v))
         return out
 
-    @staticmethod
-    def _empty_report(reason: str) -> Dict[str, Any]:
+    # ── Link health ─────────────────────────────────────────────────────────
+
+    def _extract_links(
+        self, base: str, html: str, host: str, internal_only: bool = False
+    ) -> List[str]:
+        soup = BeautifulSoup(html, "lxml")
+        out: List[str] = []
+        seen: Set[str] = set()
+        for a in soup.find_all("a", href=True):
+            absu = _abs_url(base, a["href"])
+            if not absu or absu in seen:
+                continue
+            if internal_only and not _is_same_host(absu, host):
+                continue
+            seen.add(absu)
+            out.append(absu)
+        return out
+
+    async def _check_links(
+        self,
+        client: httpx.AsyncClient,
+        pages: List[PageReport],
+        base_url: str,
+        host: str,
+        max_links: int,
+    ) -> List[BrokenLink]:
+        """
+        Re-fetch each audited page's HTML to enumerate <a href>s, then HEAD-
+        check a sample for broken status. We keep this bounded to stay within
+        a few seconds of total budget.
+        """
+        # Collect candidate links by re-fetching pages cheaply (HTML cache miss
+        # is acceptable here — pages list is already small).
+        link_to_sources: Dict[str, List[str]] = {}
+        for page in pages[:10]:  # sample top-10 audited pages for link extraction
+            text = await self._fetch_text(client, page.url)
+            if not text:
+                continue
+            for href in self._extract_links(page.url, text, host, internal_only=False):
+                link_to_sources.setdefault(href, []).append(page.url)
+                if len(link_to_sources) >= max_links:
+                    break
+            if len(link_to_sources) >= max_links:
+                break
+
+        async def _head(url: str) -> Tuple[str, int]:
+            try:
+                # Try HEAD first; some servers reject it, fall back to GET.
+                r = await client.head(url)
+                if r.status_code in (405, 501) or r.status_code >= 400:
+                    r = await client.get(url)
+                return url, r.status_code
+            except Exception:
+                return url, 0
+
+        sem = asyncio.Semaphore(8)
+
+        async def _bounded(url: str) -> Tuple[str, int]:
+            async with sem:
+                return await _head(url)
+
+        results = await asyncio.gather(*[_bounded(u) for u in list(link_to_sources.keys())[:max_links]])
+
+        broken: List[BrokenLink] = []
+        for url, status in results:
+            if status == 0 or status >= 400:
+                broken.append(BrokenLink(
+                    url=url,
+                    status_code=status,
+                    found_on=link_to_sources.get(url, [])[:5],
+                ))
+        return broken
+
+    # ── Scoring ─────────────────────────────────────────────────────────────
+
+    def _compute_scores(
+        self,
+        pages: List[PageReport],
+        robots: Optional[str],
+        llms: Optional[str],
+        sitemap_urls: List[str],
+        base_url: str,
+        broken_links: List[BrokenLink],
+    ) -> Dict[str, int]:
+        if not pages:
+            return {"overall": 0, "technical_seo": 0, "on_page_seo": 0,
+                    "geo_readiness": 0, "link_health": 0, "performance": 0}
+
+        n = len(pages)
+
+        # Technical SEO (0-100)
+        tech = 100
+        if not robots:
+            tech -= 10
+        if not sitemap_urls:
+            tech -= 15
+        if not base_url.startswith("https://"):
+            tech -= 25
+        viewport_pct = sum(1 for p in pages if p.has_viewport) / n
+        lang_pct = sum(1 for p in pages if p.has_lang) / n
+        canonical_pct = sum(1 for p in pages if p.canonical) / n
+        tech -= int((1 - viewport_pct) * 15)
+        tech -= int((1 - lang_pct) * 10)
+        tech -= int((1 - canonical_pct) * 10)
+        tech = max(0, min(100, tech))
+
+        # On-page SEO (0-100)
+        good_title = sum(1 for p in pages if 30 <= p.title_length <= 65) / n
+        good_meta = sum(1 for p in pages if 80 <= p.meta_description_length <= 165) / n
+        good_h1 = sum(1 for p in pages if p.h1_count == 1) / n
+        good_word_count = sum(1 for p in pages if p.word_count >= 300) / n
+        good_alt = sum(
+            1 for p in pages
+            if p.images_total == 0 or p.images_missing_alt / max(1, p.images_total) <= 0.1
+        ) / n
+        on_page = int((good_title * 25 + good_meta * 25 + good_h1 * 20
+                       + good_word_count * 15 + good_alt * 15))
+
+        # GEO readiness (0-100) — how friendly is the site for AI assistants
+        geo = 0
+        schema_pct = sum(1 for p in pages if p.has_schema) / n
+        og_pct = sum(1 for p in pages if p.has_open_graph) / n
+        meta_pct = sum(1 for p in pages if p.meta_description_length > 0) / n
+        h2_pct = sum(1 for p in pages if p.h2_count >= 2) / n
+        long_form_pct = sum(1 for p in pages if p.word_count >= 600) / n
+        geo += int(schema_pct * 30)
+        geo += int(og_pct * 15)
+        geo += int(meta_pct * 15)
+        geo += int(h2_pct * 15)
+        geo += int(long_form_pct * 15)
+        if llms:
+            geo += 10
+        geo = max(0, min(100, geo))
+
+        # Link health (0-100) — penalise broken links
+        total_checked = max(1, len(broken_links) + 20)  # baseline assumed sample
+        broken_ratio = len(broken_links) / total_checked
+        link_health = max(0, int(100 - broken_ratio * 200))
+        if any("missing_internal_links" in p.issues for p in pages):
+            link_health -= 5
+        link_health = max(0, min(100, link_health))
+
+        # Performance proxy (0-100) — based on response time (we have no Core
+        # Web Vitals without a headless browser).
+        avg_ms = sum(p.response_ms for p in pages) / n
+        if avg_ms <= 200:
+            perf = 100
+        elif avg_ms <= 500:
+            perf = 90
+        elif avg_ms <= 1000:
+            perf = 75
+        elif avg_ms <= 2000:
+            perf = 55
+        elif avg_ms <= 4000:
+            perf = 35
+        else:
+            perf = 15
+
+        overall = int(round(
+            tech * 0.25 + on_page * 0.25 + geo * 0.20 + link_health * 0.15 + perf * 0.15
+        ))
+
         return {
-            "domain": "",
-            "pages_crawled": 0,
-            "robots_txt": {"present": False, "sitemap_url": None, "size": 0},
-            "sitemap": {"present": False, "url": None, "url_count": 0, "urls": []},
-            "scores": {"overall": 0, "technical": 0, "geo": 0, "content": 0, "links": 0, "details": {}},
-            "issues": [{"severity": "high", "category": "technical", "title": reason, "detail": ""}],
-            "broken_links": {"checked": 0, "broken_count": 0, "broken": []},
-            "pages": [],
+            "overall": overall,
+            "technical_seo": tech,
+            "on_page_seo": on_page,
+            "geo_readiness": geo,
+            "link_health": link_health,
+            "performance": perf,
         }
+
+    # ── Findings + recommendations ──────────────────────────────────────────
+
+    def _compute_findings(
+        self,
+        pages: List[PageReport],
+        robots: Optional[str],
+        llms: Optional[str],
+        sitemap_urls: List[str],
+        base_url: str,
+        broken_links: List[BrokenLink],
+    ) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        n = len(pages) or 1
+
+        def _add(category: str, severity: str, title: str, description: str, affected: int) -> None:
+            findings.append({
+                "category": category,
+                "severity": severity,
+                "title": title,
+                "description": description,
+                "affected_pages": affected,
+            })
+
+        # Domain-level
+        if not base_url.startswith("https://"):
+            _add("technical", "critical", "Site not served over HTTPS",
+                 "Search engines and browsers penalise non-HTTPS sites; switch to TLS.", n)
+        if not robots:
+            _add("technical", "warning", "robots.txt is missing",
+                 "Add a robots.txt at the domain root to control crawler access.", 0)
+        if not sitemap_urls:
+            _add("technical", "warning", "sitemap.xml is missing",
+                 "Submit a sitemap so search engines and AI crawlers can discover every page.", 0)
+        if not llms:
+            _add("geo", "info", "llms.txt not present",
+                 "An llms.txt file lets you guide LLM crawlers about which content to prioritise.", 0)
+
+        # Page-level rollups
+        def _count(issue: str) -> int:
+            return sum(1 for p in pages if issue in p.issues)
+
+        rules = [
+            ("missing_title",            "on_page",   "critical", "Pages missing a <title>",                  "Every page needs a unique, descriptive title between 30–65 characters."),
+            ("short_title",              "on_page",   "warning",  "Page titles too short",                    "Aim for 30–65 characters to maximise SERP CTR."),
+            ("long_title",               "on_page",   "warning",  "Page titles too long",                     "Titles over 65 chars get truncated in Google SERPs."),
+            ("missing_meta_description", "on_page",   "warning",  "Pages missing a meta description",         "Meta descriptions help CTR and are surfaced by AI assistants summarising the page."),
+            ("short_meta_description",   "on_page",   "info",     "Meta descriptions too short",              "Aim for 80–165 characters."),
+            ("long_meta_description",    "on_page",   "info",     "Meta descriptions too long",               "Descriptions over 165 chars get truncated."),
+            ("missing_h1",               "on_page",   "critical", "Pages missing an <h1>",                    "Every page needs exactly one h1 describing the page topic."),
+            ("multiple_h1",              "on_page",   "warning",  "Pages with multiple <h1> tags",            "Use one h1 and structure the rest as h2/h3."),
+            ("thin_content",             "on_page",   "warning",  "Thin content (<300 words)",                "Pages with under 300 words rarely rank or get cited by AI assistants."),
+            ("images_missing_alt",       "on_page",   "warning",  "Images missing alt text",                  "Alt text helps accessibility, image search, and AI summarisation."),
+            ("missing_viewport",         "technical", "critical", "Pages without mobile viewport",            "Add <meta name=\"viewport\"> for mobile rendering and Google mobile-friendly status."),
+            ("missing_html_lang",        "technical", "warning",  "Pages without <html lang>",                "Set the lang attribute so search engines and AI know the language."),
+            ("missing_structured_data",  "geo",       "warning",  "Pages without schema.org markup",          "Schema.org JSON-LD significantly boosts AI assistant citation rate."),
+            ("missing_open_graph",       "geo",       "info",     "Pages without Open Graph tags",            "OG tags control how the page renders when shared and are read by some AI crawlers."),
+            ("missing_canonical",        "technical", "info",     "Pages without canonical link",             "Canonical links prevent duplicate-content penalties."),
+            ("fetch_failed",             "technical", "critical", "Pages that failed to load",                "These pages returned an error or timed out during the audit."),
+        ]
+        for issue, category, severity, title, desc in rules:
+            c = _count(issue)
+            if c > 0:
+                _add(category, severity, title, desc, c)
+
+        # Broken links
+        if broken_links:
+            _add("links", "critical" if len(broken_links) >= 5 else "warning",
+                 f"{len(broken_links)} broken outbound link{'s' if len(broken_links) != 1 else ''}",
+                 "Broken links waste crawl budget and damage user trust.", len(broken_links))
+
+        # Healthy signals
+        if all(p.has_schema for p in pages) and pages:
+            _add("geo", "success", "All audited pages include structured data",
+                 "Schema.org markup is consistently applied — keep it up to date.", n)
+        if all(p.h1_count == 1 for p in pages) and pages:
+            _add("on_page", "success", "All audited pages have exactly one <h1>",
+                 "Heading structure is clean across the audited pages.", n)
+
+        return findings
+
+    def _compute_recommendations(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sev_priority = {"critical": "high", "warning": "medium", "info": "low", "success": "low"}
+        # Drop "success" entries from recommendations.
+        actionable = [f for f in findings if f["severity"] != "success"]
+        # Sort: critical → warning → info, then by affected count descending.
+        sev_order = {"critical": 0, "warning": 1, "info": 2}
+        actionable.sort(key=lambda f: (sev_order.get(f["severity"], 99), -f.get("affected_pages", 0)))
+        return [
+            {
+                "priority": sev_priority.get(f["severity"], "low"),
+                "category": f["category"],
+                "title": f["title"],
+                "description": f["description"],
+                "affected_count": f.get("affected_pages", 0),
+            }
+            for f in actionable[:10]
+        ]
