@@ -145,10 +145,15 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
         """
         platforms = platforms or DEFAULT_PLATFORMS
 
-        # Run all per-query work concurrently; one slow query shouldn't block
-        # the others. Each helper handles its own errors.
-        tasks = [self._analyze_query(q, platforms) for q in queries]
-        query_results = await asyncio.gather(*tasks, return_exceptions=False)
+        # Run all per-query work AND the full site audit concurrently. Each
+        # helper handles its own errors; one slow query or a flaky site shouldn't
+        # block the rest.
+        query_tasks = [self._analyze_query(q, platforms) for q in queries]
+        site_audit_task = self._run_site_audit()
+
+        outcomes = await asyncio.gather(*query_tasks, site_audit_task, return_exceptions=False)
+        query_results = list(outcomes[:-1])
+        site_audit = outcomes[-1]
 
         overview = self._build_overview(query_results)
 
@@ -160,8 +165,21 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
             "platforms": platforms,
             "query_results": query_results,
             "overview": overview,
+            "site_audit": site_audit,
             "status": "completed",
         }
+
+    async def _run_site_audit(self) -> Optional[Dict[str, Any]]:
+        """Crawl the tenant domain and produce a full SEO/GEO site report."""
+        if not self.domain:
+            return None
+        try:
+            from agents.site_audit import SiteAuditAgent
+            audit = SiteAuditAgent(domain=self.domain)
+            return await audit.run()
+        except Exception as e:
+            logger.warning(f"site audit failed for {self.domain}: {e}")
+            return None
 
     # ── Per-query analysis ──────────────────────────────────────────────────
 

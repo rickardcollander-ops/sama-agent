@@ -36,6 +36,11 @@ class GenerateQueriesPayload(BaseModel):
 class RunPayload(BaseModel):
     queries: List[str]
     platforms: Optional[List[str]] = None
+    # Optional overrides — when the user just typed these on the analysis
+    # page they should win over whatever's stored in tenant settings.
+    brand_name: Optional[str] = None
+    domain: Optional[str] = None
+    competitors: Optional[List[str]] = None
 
 
 # ── POST /generate-queries ───────────────────────────────────────────────────
@@ -72,12 +77,21 @@ async def run_analysis(payload: RunPayload, request: Request):
     config = await get_tenant_config(tenant_id)
     sb = get_supabase()
 
+    # Apply per-request overrides (what the user just typed) over the
+    # stored tenant config. This is what gets persisted on the run row
+    # AND what the agent uses for crawling/mention detection.
+    brand_name = (payload.brand_name or getattr(config, "brand_name", None) or "").strip() or None
+    domain = (payload.domain or getattr(config, "domain", None) or "").strip() or None
+    competitors = payload.competitors if payload.competitors is not None else (
+        list(getattr(config, "competitors", []) or [])
+    )
+
     run_id = None
     try:
         ins = sb.table("analysis_runs").insert({
             "tenant_id": tenant_id,
-            "brand_name": getattr(config, "brand_name", None),
-            "domain": getattr(config, "domain", None),
+            "brand_name": brand_name,
+            "domain": domain,
             "query_count": len(queries),
             "platform_count": len(platforms),
             "status": "running",
@@ -87,7 +101,9 @@ async def run_analysis(payload: RunPayload, request: Request):
     except Exception as e:
         logger.warning(f"Could not insert analysis_runs row: {e}")
 
-    asyncio.create_task(_execute_analysis(run_id, tenant_id, queries, platforms))
+    asyncio.create_task(_execute_analysis(
+        run_id, tenant_id, queries, platforms, brand_name, domain, competitors,
+    ))
 
     return {"id": run_id, "status": "running"}
 
@@ -97,12 +113,21 @@ async def _execute_analysis(
     tenant_id: str,
     queries: List[str],
     platforms: List[str],
+    brand_name: Optional[str] = None,
+    domain: Optional[str] = None,
+    competitors: Optional[List[str]] = None,
 ) -> None:
     """Background task: runs the analysis and updates the row."""
     from agents.analysis import AnalysisAgent
     sb = get_supabase()
     config = await get_tenant_config(tenant_id)
     agent = AnalysisAgent(tenant_config=config)
+    if brand_name:
+        agent.brand_name = brand_name
+    if domain:
+        agent.domain = domain
+    if competitors is not None:
+        agent.competitors = list(competitors)
 
     try:
         result = await agent.run(queries, platforms)
