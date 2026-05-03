@@ -199,6 +199,10 @@ app.include_router(github_integration.router, prefix="/api/integrations/github",
 app.include_router(analysis_routes.router, prefix="/api/analysis", tags=["analysis"])
 app.include_router(site_audit_routes.router, prefix="/api/site-audit", tags=["site-audit"])
 app.include_router(approvals.router, prefix="/api/approvals", tags=["approvals"])
+app.include_router(content_suggest.router, prefix="/api/content", tags=["content-suggest"])
+app.include_router(ads_suggest.router, prefix="/api/ads", tags=["ads-suggest"])
+app.include_router(social_suggest.router, prefix="/api/social", tags=["social-suggest"])
+app.include_router(tech_agent.router, prefix="/api/tech", tags=["tech-agent"])
 
 
 @app.get("/")
