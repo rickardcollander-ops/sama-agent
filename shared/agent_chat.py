@@ -10,7 +10,7 @@ import logging
 import json
 import httpx
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from uuid import uuid4
 
 from shared.database import get_supabase
