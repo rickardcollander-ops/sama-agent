@@ -19,7 +19,7 @@ from shared.usage import UsageLimitExceeded, check_and_increment
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-ALL_AGENTS = ["seo", "content", "social", "ads", "reviews", "analytics", "geo"]
+ALL_AGENTS = ["seo", "content", "social", "ads", "reviews", "analytics", "geo", "strategy"]
 
 DEFAULT_SCHEDULES = {
     "seo": "daily",
@@ -29,6 +29,7 @@ DEFAULT_SCHEDULES = {
     "reviews": "daily",
     "analytics": "daily",
     "geo": "weekly",
+    "strategy": "weekly",
 }
 
 # A single agent cycle should never legitimately take longer than this.

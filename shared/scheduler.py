@@ -584,6 +584,8 @@ def start():
         ("reviews", "daily", CronTrigger(hour=14, minute=30)),
         ("content", "weekly", CronTrigger(day_of_week="wed", hour=5, minute=30)),
         ("geo", "weekly", CronTrigger(day_of_week="thu", hour=10, minute=30)),
+        # Strategy runs Sunday 18:00 UTC, after a full week of domain activity.
+        ("strategy", "weekly", CronTrigger(day_of_week="sun", hour=18, minute=0)),
     ]
     for agent_name, schedule_kind, trigger in tenant_fanout_jobs:
         job_id = f"tenants_{agent_name}_{schedule_kind}"
