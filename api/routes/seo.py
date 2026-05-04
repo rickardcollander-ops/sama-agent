@@ -643,12 +643,60 @@ async def discover_opportunities():
 
 
 @router.post("/keywords/sync-gsc")
-async def sync_gsc_keywords(min_impressions: int = 1):
+async def sync_gsc_keywords(request: Request, min_impressions: int = 1):
     """Sync all keywords from Google Search Console into the seo_keywords table.
-    New keywords are auto-added, existing ones get updated metrics."""
+    New keywords are auto-added, existing ones get updated metrics. Writes are
+    scoped to the requesting tenant so per-tenant /keywords queries can read them.
+    """
     try:
-        result = await seo_agent.sync_gsc_keywords(min_impressions=min_impressions)
-        return {"success": True, **result}
+        from shared.tenant_agents import get_seo_agent
+        tenant_id = getattr(request.state, "tenant_id", "default")
+        agent = await get_seo_agent(tenant_id)
+        result = await agent.sync_gsc_keywords(min_impressions=min_impressions)
+        return {"success": True, "tenant_id": tenant_id, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/gsc/queries")
+async def get_gsc_queries(request: Request, limit: int = 1000):
+    """Return GSC queries for the tenant.
+
+    Frontend probes several legacy paths for this — this is the canonical one.
+    Pulls from seo_keywords (already populated by /keywords/sync-gsc) so it
+    works even when the tenant's Google connection has rate limits.
+    """
+    from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    sb = get_supabase()
+
+    try:
+        query = (
+            sb.table("seo_keywords")
+            .select("keyword,current_position,current_clicks,current_impressions,current_ctr,last_checked_at,target_page")
+            .order("current_impressions", desc=True)
+            .limit(min(limit, 5000))
+        )
+        if tenant_id and tenant_id != "default":
+            query = query.eq("tenant_id", tenant_id)
+        result = query.execute()
+        rows = result.data or []
+        return {
+            "tenant_id": tenant_id,
+            "total": len(rows),
+            "queries": [
+                {
+                    "query": r.get("keyword") or "",
+                    "page": r.get("target_page") or "",
+                    "position": r.get("current_position") or 0,
+                    "clicks": r.get("current_clicks") or 0,
+                    "impressions": r.get("current_impressions") or 0,
+                    "ctr": r.get("current_ctr") or 0.0,
+                    "last_checked_at": r.get("last_checked_at"),
+                }
+                for r in rows
+            ],
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
