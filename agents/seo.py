@@ -49,6 +49,7 @@ class SEOAgent:
         self.model = "claude-sonnet-4-6"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.sb = None
+        self.tenant_id = getattr(tenant_config, "tenant_id", "default") if tenant_config else "default"
 
         # Per-tenant overrides with backward-compatible defaults
         if tenant_config:
@@ -443,8 +444,13 @@ class SEOAgent:
         if not gsc_data:
             return {"inserted": 0, "updated": 0, "total_gsc": 0, "message": "No GSC data available"}
 
-        # Get existing keywords from DB
-        existing_result = sb.table(KEYWORDS_TABLE).select("id,keyword,current_position").execute()
+        # Get existing keywords for THIS tenant from DB
+        existing_result = (
+            sb.table(KEYWORDS_TABLE)
+            .select("id,keyword,current_position")
+            .eq("tenant_id", self.tenant_id)
+            .execute()
+        )
         existing_map = {row["keyword"].lower(): row for row in (existing_result.data or [])}
 
         inserted = 0
@@ -493,6 +499,7 @@ class SEOAgent:
                 try:
                     sb.table(KEYWORDS_TABLE).insert({
                         "keyword": query,
+                        "tenant_id": self.tenant_id,
                         "intent": intent,
                         "priority": priority,
                         "target_page": data.get("page", "/"),
