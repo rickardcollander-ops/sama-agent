@@ -332,55 +332,74 @@ class SEOAgent:
     ]
 
     async def initialize_keywords(self) -> Dict[str, Any]:
-        """Seed seo_keywords table with TARGET_KEYWORDS, then enrich from GSC if available"""
+        """Seed seo_keywords table with TARGET_KEYWORDS, enriching each with
+        live GSC metrics so rows have real data attached on insert."""
         sb = self._get_sb()
         inserted = 0
         skipped = 0
+        now = datetime.utcnow().isoformat()
 
-        # Fetch existing keywords to avoid duplicates
-        existing_result = sb.table(KEYWORDS_TABLE).select("keyword").execute()
+        # Fetch GSC data ONCE and reuse for both seed paths so hardcoded
+        # TARGET_KEYWORDS get real metrics instead of zeros.
+        try:
+            gsc_data = await self._fetch_gsc_keyword_data()
+        except Exception as e:
+            logger.warning(f"GSC fetch failed during initialize: {e}")
+            gsc_data = {}
+
+        # Existing keywords for THIS tenant only — avoids cross-tenant collisions
+        existing_result = (
+            sb.table(KEYWORDS_TABLE)
+            .select("keyword")
+            .eq("tenant_id", self.tenant_id)
+            .execute()
+        )
         existing = {row["keyword"].lower() for row in (existing_result.data or [])}
 
         for kw in self.TARGET_KEYWORDS:
-            if kw["keyword"].lower() in existing:
+            kw_lower = kw["keyword"].lower()
+            if kw_lower in existing:
                 skipped += 1
                 continue
+            metrics = gsc_data.get(kw_lower, {})
+            position = metrics.get("position")
             sb.table(KEYWORDS_TABLE).insert({
                 "keyword": kw["keyword"],
+                "tenant_id": self.tenant_id,
                 "intent": kw["intent"],
                 "priority": kw["priority"],
                 "target_page": kw["target_page"],
-                "current_position": None,
-                "current_clicks": 0,
-                "current_impressions": 0,
-                "current_ctr": 0.0,
-                "position_history": []
+                "current_position": int(position) if position else None,
+                "current_clicks": metrics.get("clicks", 0),
+                "current_impressions": metrics.get("impressions", 0),
+                "current_ctr": metrics.get("ctr", 0.0),
+                "position_history": [],
+                "last_checked_at": now,
             }).execute()
             inserted += 1
 
-        # Also pull top GSC queries not yet tracked
-        try:
-            gsc_data = await self._fetch_gsc_keyword_data(limit=50)
-            for query, data in gsc_data.items():
-                if query in existing or data.get("impressions", 0) < 5:
-                    continue
-                try:
-                    sb.table(KEYWORDS_TABLE).insert({
-                        "keyword": query,
-                        "intent": "gsc_discovered",
-                        "priority": "medium",
-                        "target_page": "/",
-                        "current_position": int(data.get("position", 0)) or None,
-                        "current_clicks": data.get("clicks", 0),
-                        "current_impressions": data.get("impressions", 0),
-                        "current_ctr": data.get("ctr", 0.0),
-                        "position_history": []
-                    }).execute()
-                    inserted += 1
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"GSC seed failed during initialize: {e}")
+        # Also pull top GSC queries not yet tracked (≥5 impressions to filter noise)
+        for query, data in gsc_data.items():
+            if query in existing or data.get("impressions", 0) < 5:
+                continue
+            position = data.get("position")
+            try:
+                sb.table(KEYWORDS_TABLE).insert({
+                    "keyword": query,
+                    "tenant_id": self.tenant_id,
+                    "intent": "gsc_discovered",
+                    "priority": "medium",
+                    "target_page": "/",
+                    "current_position": int(position) if position else None,
+                    "current_clicks": data.get("clicks", 0),
+                    "current_impressions": data.get("impressions", 0),
+                    "current_ctr": data.get("ctr", 0.0),
+                    "position_history": [],
+                    "last_checked_at": now,
+                }).execute()
+                inserted += 1
+            except Exception:
+                pass
 
         logger.info(f"✅ initialize_keywords: {inserted} inserted, {skipped} skipped")
         return {"inserted": inserted, "skipped": skipped, "total_target": len(self.TARGET_KEYWORDS)}
@@ -511,8 +530,8 @@ class SEOAgent:
                         "last_checked_at": now,
                     }).execute()
                     inserted += 1
-                except Exception:
-                    pass  # Duplicate or constraint error
+                except Exception as e:
+                    logger.debug(f"Insert failed for keyword '{query}' (tenant={self.tenant_id}): {e}")
 
         logger.info(f"✅ GSC sync: {inserted} new keywords, {updated} updated, {len(gsc_data)} total GSC queries")
         return {
@@ -612,9 +631,9 @@ class SEOAgent:
         end_date = datetime.utcnow().strftime("%Y-%m-%d")
         start_date = (datetime.utcnow() - timedelta(days=28)).strftime("%Y-%m-%d")
         
-        encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
+        encoded_site = self.gsc_site_url.replace(':', '%3A').replace('/', '%2F')
         url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
-        
+
         resp = await self.http_client.post(url, json={
             "startDate": start_date,
             "endDate": end_date,
@@ -668,7 +687,7 @@ class SEOAgent:
         end_date = datetime.utcnow().strftime("%Y-%m-%d")
         start_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        encoded_site = GSC_SITE_URL.replace(':', '%3A').replace('/', '%2F')
+        encoded_site = self.gsc_site_url.replace(':', '%3A').replace('/', '%2F')
         url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
         headers = {"Authorization": f"Bearer {token}"}
 
