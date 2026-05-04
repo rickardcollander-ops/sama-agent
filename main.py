@@ -23,6 +23,7 @@ from api.routes import (
     site_audit as site_audit_routes,
     content_suggest, ads_suggest, social_suggest, tech_agent,
     strategy as strategy_routes, menu as menu_routes,
+    google_analytics as google_analytics_routes,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -207,6 +208,11 @@ app.include_router(social_suggest.router, prefix="/api/social", tags=["social-su
 app.include_router(tech_agent.router, prefix="/api/tech", tags=["tech-agent"])
 app.include_router(strategy_routes.router, prefix="/api/strategy", tags=["strategy"])
 app.include_router(menu_routes.router, prefix="/api/menu", tags=["menu"])
+app.include_router(
+    google_analytics_routes.router,
+    prefix="/api/integrations/google/analytics",
+    tags=["google-analytics"],
+)
 
 
 @app.get("/")

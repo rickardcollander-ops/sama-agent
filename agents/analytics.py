@@ -13,7 +13,13 @@ import httpx
 
 from shared.config import settings
 from shared.database import get_supabase
-from shared.google_auth import is_gsc_configured, is_ads_configured, is_ga4_configured, get_access_token
+from shared.google_auth import (
+    is_gsc_configured,
+    is_ads_configured,
+    is_ga4_configured,
+    get_access_token,
+    get_google_access_token,
+)
 from .models import (
     CONTENT_PIECES_TABLE, DAILY_METRICS_TABLE, KEYWORDS_TABLE, REVIEWS_TABLE,
 )
@@ -155,9 +161,21 @@ class AnalyticsAgent:
         return channel_data
 
     async def _fetch_ga4_data(self, date_range: int = 30) -> Dict[str, Any]:
-        """Fetch site-wide traffic data from Google Analytics 4 Data API."""
+        """Fetch site-wide traffic data from Google Analytics 4 Data API.
+
+        Resolution order for the GA4 property:
+        1. tenant_config.ga4_property_id (saved via /select-property)
+        2. settings.GA4_PROPERTY_ID (legacy global fallback)
+        """
+        # Resolve which property to query.
+        tenant_property_id = (
+            getattr(self.tenant_config, "ga4_property_id", None) if self.tenant_config else None
+        )
+        raw_property_id = tenant_property_id or settings.GA4_PROPERTY_ID
+
         channel_data = {
-            "configured": is_ga4_configured(),
+            "configured": bool(raw_property_id),
+            "property_id": raw_property_id or None,
             "total_sessions": 0,
             "total_pageviews": 0,
             "total_users": 0,
@@ -166,22 +184,33 @@ class AnalyticsAgent:
             "date_range_days": date_range,
         }
 
-        if not is_ga4_configured():
-            channel_data["status"] = "not_configured"
+        if not raw_property_id:
+            channel_data["status"] = "no_property_selected"
+            channel_data["message"] = "Open Settings to select a GA4 property."
             return channel_data
 
         try:
-            access_token = await get_access_token("gsc")  # reuses same Google OAuth
+            access_token: Optional[str] = None
+            tenant_id = getattr(self.tenant_config, "tenant_id", None) if self.tenant_config else None
+            if tenant_id:
+                try:
+                    access_token = await get_google_access_token(tenant_id, "analytics")
+                except ValueError:
+                    # No per-tenant connection — fall back to the global refresh token.
+                    access_token = None
+            if not access_token:
+                access_token = await get_access_token("gsc")
             if not access_token:
                 logger.warning("GA4: Could not obtain access token")
                 channel_data["status"] = "auth_error"
+                channel_data["message"] = "Connect Google Analytics in Settings."
                 return channel_data
 
             end_date = datetime.utcnow()
             start_date = end_date - timedelta(days=date_range)
 
             # Normalise property ID — accept both "properties/123" and bare "123"
-            prop_id = settings.GA4_PROPERTY_ID
+            prop_id = raw_property_id
             if not prop_id.startswith("properties/"):
                 prop_id = f"properties/{prop_id}"
 
