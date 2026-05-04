@@ -667,45 +667,55 @@ async def sync_gsc_keywords(request: Request, min_impressions: int = 1):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/gsc/queries")
-async def get_gsc_queries(request: Request, limit: int = 1000):
-    """Return GSC queries for the tenant.
-
-    Frontend probes several legacy paths for this — this is the canonical one.
-    Pulls from seo_keywords (already populated by /keywords/sync-gsc) so it
-    works even when the tenant's Google connection has rate limits.
-    """
+async def _gsc_queries_payload(request: Request, limit: int) -> dict:
+    """Shared handler for the canonical /gsc/queries endpoint and its aliases."""
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
 
+    query = (
+        sb.table("seo_keywords")
+        .select("keyword,current_position,current_clicks,current_impressions,current_ctr,last_checked_at,target_page")
+        .order("current_impressions", desc=True)
+        .limit(min(limit, 5000))
+    )
+    if tenant_id and tenant_id != "default":
+        query = query.eq("tenant_id", tenant_id)
+    result = query.execute()
+    rows = result.data or []
+    return {
+        "tenant_id": tenant_id,
+        "total": len(rows),
+        "queries": [
+            {
+                "query": r.get("keyword") or "",
+                "page": r.get("target_page") or "",
+                "position": r.get("current_position") or 0,
+                "clicks": r.get("current_clicks") or 0,
+                "impressions": r.get("current_impressions") or 0,
+                "ctr": r.get("current_ctr") or 0.0,
+                "last_checked_at": r.get("last_checked_at"),
+            }
+            for r in rows
+        ],
+    }
+
+
+# Canonical endpoint + legacy aliases the dashboard probes for. All return
+# the same payload so 404/405 noise disappears regardless of which path the
+# frontend tries first.
+@router.get("/gsc/queries")
+@router.get("/gsc/top-queries")
+@router.get("/search-console/queries")
+@router.get("/keywords/gsc")
+@router.get("/keywords/all")
+@router.get("/rankings")
+@router.get("/metrics")
+async def get_gsc_queries(request: Request, limit: int = 1000):
+    """Return GSC queries for the tenant. Pulls from seo_keywords (populated
+    by /keywords/sync-gsc) so it works even when GSC API is rate-limited."""
     try:
-        query = (
-            sb.table("seo_keywords")
-            .select("keyword,current_position,current_clicks,current_impressions,current_ctr,last_checked_at,target_page")
-            .order("current_impressions", desc=True)
-            .limit(min(limit, 5000))
-        )
-        if tenant_id and tenant_id != "default":
-            query = query.eq("tenant_id", tenant_id)
-        result = query.execute()
-        rows = result.data or []
-        return {
-            "tenant_id": tenant_id,
-            "total": len(rows),
-            "queries": [
-                {
-                    "query": r.get("keyword") or "",
-                    "page": r.get("target_page") or "",
-                    "position": r.get("current_position") or 0,
-                    "clicks": r.get("current_clicks") or 0,
-                    "impressions": r.get("current_impressions") or 0,
-                    "ctr": r.get("current_ctr") or 0.0,
-                    "last_checked_at": r.get("last_checked_at"),
-                }
-                for r in rows
-            ],
-        }
+        return await _gsc_queries_payload(request, limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
