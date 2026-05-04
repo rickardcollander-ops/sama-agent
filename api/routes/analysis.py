@@ -86,7 +86,9 @@ async def run_analysis(payload: RunPayload, request: Request):
         list(getattr(config, "competitors", []) or [])
     )
 
-    run_id = None
+    # Persist the row before kicking off the background task — if the insert
+    # fails (RLS, missing table, bad credentials) the dashboard has no id to
+    # poll, so surface the real reason instead of returning {"id": null}.
     try:
         ins = sb.table("analysis_runs").insert({
             "tenant_id": tenant_id,
@@ -96,10 +98,19 @@ async def run_analysis(payload: RunPayload, request: Request):
             "platform_count": len(platforms),
             "status": "running",
         }).execute()
-        if ins.data:
-            run_id = ins.data[0]["id"]
     except Exception as e:
-        logger.warning(f"Could not insert analysis_runs row: {e}")
+        logger.exception("Could not insert analysis_runs row")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create analysis run row: {e}",
+        )
+
+    if not ins.data:
+        raise HTTPException(
+            status_code=500,
+            detail="analysis_runs insert returned no row (check RLS policy for analysis_runs)",
+        )
+    run_id = ins.data[0]["id"]
 
     asyncio.create_task(_execute_analysis(
         run_id, tenant_id, queries, platforms, brand_name, domain, competitors,
@@ -109,7 +120,7 @@ async def run_analysis(payload: RunPayload, request: Request):
 
 
 async def _execute_analysis(
-    run_id: Optional[str],
+    run_id: str,
     tenant_id: str,
     queries: List[str],
     platforms: List[str],
@@ -131,8 +142,7 @@ async def _execute_analysis(
 
     try:
         result = await agent.run(queries, platforms)
-        if run_id:
-            result["id"] = run_id
+        result["id"] = run_id
         update = {
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -146,11 +156,10 @@ async def _execute_analysis(
             "error": str(e)[:500],
         }
 
-    if run_id:
-        try:
-            sb.table("analysis_runs").update(update).eq("id", run_id).execute()
-        except Exception:
-            logger.warning(f"Could not persist analysis_run {run_id} update", exc_info=True)
+    try:
+        sb.table("analysis_runs").update(update).eq("id", run_id).execute()
+    except Exception:
+        logger.warning(f"Could not persist analysis_run {run_id} update", exc_info=True)
 
 
 # ── GET /runs ────────────────────────────────────────────────────────────────
