@@ -37,8 +37,14 @@ logger = logging.getLogger(__name__)
 # ── Tunables ─────────────────────────────────────────────────────────────────
 DEFAULT_MAX_PAGES = 15
 DEFAULT_MAX_LINKS_TO_CHECK = 40
-DEFAULT_TIMEOUT_S = 12.0
-USER_AGENT = "SamaSiteAudit/1.0 (+https://successifier.com)"
+DEFAULT_TIMEOUT_S = 20.0
+# Some CDNs (Cloudflare, Vercel edge) return 403 to "non-browser" UAs. We send
+# a Chrome-like UA and identify ourselves in the comment so site owners can
+# still allow-list us via robots.txt.
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; SamaSiteAudit/1.0; +https://successifier.com) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+)
 
 
 # ── Data types ───────────────────────────────────────────────────────────────
@@ -119,6 +125,26 @@ def _abs_url(base: str, href: str) -> Optional[str]:
         return None
 
 
+def _toggle_www(url: str) -> Optional[str]:
+    """Return the same URL with www. prepended or stripped. Used as a fallback
+    when an apex domain doesn't redirect to www (or vice versa)."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return None
+        if host.startswith("www."):
+            new_host = host[4:]
+        else:
+            new_host = "www." + host
+        netloc = new_host
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urlunparse(parsed._replace(netloc=netloc))
+    except Exception:
+        return None
+
+
 def _is_same_host(url: str, host: str) -> bool:
     try:
         h = (urlparse(url).hostname or "").lower()
@@ -151,12 +177,22 @@ class SiteAuditAgent:
         async with httpx.AsyncClient(
             timeout=DEFAULT_TIMEOUT_S,
             follow_redirects=True,
-            headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+            max_redirects=10,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            verify=True,
         ) as client:
-            robots = await self._fetch_text(client, base_url + "/robots.txt")
-            llms = await self._fetch_text(client, base_url + "/llms.txt")
-            sitemap_urls = await self._discover_sitemap_urls(client, base_url, robots)
+            robots, robots_info = await self._fetch_meta_file(client, base_url, "/robots.txt")
+            llms, llms_info = await self._fetch_meta_file(client, base_url, "/llms.txt")
+            sitemap_urls, sitemap_info = await self._discover_sitemap_urls(client, base_url, robots)
+            logger.info(
+                f"site-audit meta-files for {host}: "
+                f"robots={robots_info} llms={llms_info} sitemap={sitemap_info}"
+            )
 
             # Choose pages to audit: prefer sitemap, fall back to homepage links.
             pages_to_audit: List[str] = []
@@ -210,6 +246,14 @@ class SiteAuditAgent:
                 "total_links_checked": min(max_links_to_check, sum(p.internal_links + p.external_links for p in pages)),
                 "broken_links_count": len(broken_links),
                 "audit_duration_ms": int((time.time() - started) * 1000),
+                # Diagnostic detail so the dashboard can distinguish "file not
+                # present" from "we couldn't reach the server" — the latter
+                # should not be presented to users as a missing-file finding.
+                "meta_files": {
+                    "robots_txt": robots_info,
+                    "llms_txt": llms_info,
+                    "sitemap_xml": sitemap_info,
+                },
             }
 
             return {
@@ -226,13 +270,60 @@ class SiteAuditAgent:
     # ── Network primitives ──────────────────────────────────────────────────
 
     async def _fetch_text(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
+        text, _status, _err = await self._fetch_text_detailed(client, url)
+        return text
+
+    async def _fetch_text_detailed(
+        self, client: httpx.AsyncClient, url: str
+    ) -> Tuple[Optional[str], int, Optional[str]]:
+        """Fetch a text URL and report (text, status, error). Used so callers
+        can distinguish "404 — file not present" from "network/timeout error".
+        """
         try:
             r = await client.get(url)
-            if r.status_code == 200 and r.text:
-                return r.text
-        except Exception:
-            return None
-        return None
+        except httpx.TimeoutException as e:
+            logger.info(f"timeout fetching {url}: {e}")
+            return None, 0, "timeout"
+        except httpx.HTTPError as e:
+            logger.info(f"http error fetching {url}: {e}")
+            return None, 0, type(e).__name__
+        except Exception as e:
+            logger.warning(f"unexpected error fetching {url}: {e}")
+            return None, 0, type(e).__name__
+        if r.status_code == 200 and r.text:
+            return r.text, r.status_code, None
+        return None, r.status_code, None
+
+    async def _fetch_meta_file(
+        self, client: httpx.AsyncClient, base_url: str, path: str
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Fetch a well-known meta file (robots.txt / sitemap.xml / llms.txt),
+        retrying once with the toggled apex↔www host if the first attempt
+        looks like a network error or a redirect that wasn't followed.
+
+        Returns (text_or_none, info_dict) where info_dict carries the final
+        status and which URL won, so the API surfaces *why* a file looks
+        missing instead of silently swallowing the failure.
+        """
+        primary = base_url.rstrip("/") + path
+        text, status, err = await self._fetch_text_detailed(client, primary)
+        info: Dict[str, Any] = {"url": primary, "status": status, "error": err}
+        if text is not None:
+            return text, info
+
+        # If the first attempt failed at the network layer or returned a
+        # redirect status (some hosts only do apex→www and httpx may not
+        # have followed it for the root file), retry with the toggled host.
+        retry_url = _toggle_www(primary)
+        if retry_url and retry_url != primary and (
+            err is not None or status in (301, 302, 307, 308) or status == 0
+        ):
+            text2, status2, err2 = await self._fetch_text_detailed(client, retry_url)
+            info = {"url": retry_url, "status": status2, "error": err2,
+                    "fallback_from": primary}
+            if text2 is not None:
+                return text2, info
+        return None, info
 
     async def _fetch_html(
         self, client: httpx.AsyncClient, url: str
@@ -253,8 +344,12 @@ class SiteAuditAgent:
 
     async def _discover_sitemap_urls(
         self, client: httpx.AsyncClient, base_url: str, robots: Optional[str]
-    ) -> List[str]:
-        """Pull URLs from sitemap.xml (and robots.txt's Sitemap: directive)."""
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        """Pull URLs from sitemap.xml (and robots.txt's Sitemap: directive).
+
+        Returns (urls, info) so callers know which sitemap location worked
+        and why it might have been empty.
+        """
         sitemap_locations: List[str] = []
 
         # robots.txt may declare Sitemap: lines
@@ -265,19 +360,31 @@ class SiteAuditAgent:
                     if loc:
                         sitemap_locations.append(loc)
 
-        if not sitemap_locations:
-            sitemap_locations.append(base_url + "/sitemap.xml")
+        # Always probe the conventional location too — robots.txt may omit it.
+        default_loc = base_url.rstrip("/") + "/sitemap.xml"
+        if default_loc not in sitemap_locations:
+            sitemap_locations.append(default_loc)
 
         urls: List[str] = []
         seen: Set[str] = set()
-        for sm in sitemap_locations[:3]:  # don't follow forever
-            text = await self._fetch_text(client, sm)
+        attempts: List[Dict[str, Any]] = []
+        for sm in sitemap_locations[:4]:  # don't follow forever
+            # If the sitemap is at the apex domain, _fetch_meta_file gives us
+            # the apex↔www fallback for free; otherwise just try once.
+            if sm.endswith("/sitemap.xml"):
+                parsed = urlparse(sm)
+                sm_base = f"{parsed.scheme}://{parsed.netloc}"
+                text, info = await self._fetch_meta_file(client, sm_base, "/sitemap.xml")
+            else:
+                text, status, err = await self._fetch_text_detailed(client, sm)
+                info = {"url": sm, "status": status, "error": err}
+            attempts.append(info)
             if not text:
                 continue
             urls.extend(self._parse_sitemap(text, seen))
             if len(urls) > 200:
                 break
-        return urls
+        return urls, {"attempts": attempts}
 
     def _parse_sitemap(self, xml_text: str, seen: Set[str]) -> List[str]:
         """Parse a sitemap (or sitemap index) and return page URLs."""
