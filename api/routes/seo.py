@@ -132,34 +132,58 @@ async def track_keywords():
 
 
 @router.get("/keywords")
-async def get_keywords(request: Request):
-    """Get all tracked keywords"""
+async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
+    """Get all tracked keywords for the tenant.
+
+    Returns each row with both the `current_*` field names (legacy) and
+    short aliases (`clicks`, `impressions`, `position`, `ctr`) so any
+    frontend column mapping works.
+    """
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         sb = get_supabase()
-        query = sb.table("seo_keywords").select("*").limit(100)
+        query = (
+            sb.table("seo_keywords")
+            .select("*")
+            .order("current_impressions", desc=True)
+            .range(offset, offset + min(limit, 5000) - 1)
+        )
         if tenant_id and tenant_id != "default":
             query = query.eq("tenant_id", tenant_id)
         result = query.execute()
         keywords = result.data or []
-        
+
         return {
             "total": len(keywords),
+            "tenant_id": tenant_id,
             "keywords": [
                 {
+                    "id": kw.get("id"),
                     "keyword": kw.get("keyword") or "",
                     "intent": kw.get("intent") or "",
                     "priority": kw.get("priority") or "",
+                    "target_page": kw.get("target_page") or "",
+                    # Legacy names
                     "current_position": kw.get("current_position") or 0,
                     "current_clicks": kw.get("current_clicks") or 0,
                     "current_impressions": kw.get("current_impressions") or 0,
                     "current_ctr": kw.get("current_ctr") or 0.0,
-                    "target_page": kw.get("target_page") or ""
+                    # Short aliases — many dashboards expect these
+                    "position": kw.get("current_position") or 0,
+                    "clicks": kw.get("current_clicks") or 0,
+                    "impressions": kw.get("current_impressions") or 0,
+                    "ctr": kw.get("current_ctr") or 0.0,
+                    # Trend metadata
+                    "position_change": kw.get("position_change") or 0,
+                    "position_trend": kw.get("position_trend") or "stable",
+                    "last_checked_at": kw.get("last_checked_at"),
+                    "added_at": kw.get("added_at"),
+                    "auto_discovered": kw.get("auto_discovered") or False,
                 }
                 for kw in keywords
-            ]
+            ],
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -333,10 +333,12 @@ class SEOAgent:
 
     async def initialize_keywords(self) -> Dict[str, Any]:
         """Seed seo_keywords table with TARGET_KEYWORDS, enriching each with
-        live GSC metrics so rows have real data attached on insert."""
+        live GSC metrics. Existing rows for this tenant get refreshed with
+        fresh metrics so re-running this fixes any zero-data rows from
+        earlier buggy runs."""
         sb = self._get_sb()
         inserted = 0
-        skipped = 0
+        updated = 0
         now = datetime.utcnow().isoformat()
 
         # Fetch GSC data ONCE and reuse for both seed paths so hardcoded
@@ -347,62 +349,84 @@ class SEOAgent:
             logger.warning(f"GSC fetch failed during initialize: {e}")
             gsc_data = {}
 
-        # Existing keywords for THIS tenant only — avoids cross-tenant collisions
+        # Existing keywords for THIS tenant (id + keyword) so we can decide
+        # update vs insert and target the right row on update.
         existing_result = (
             sb.table(KEYWORDS_TABLE)
-            .select("keyword")
+            .select("id,keyword")
             .eq("tenant_id", self.tenant_id)
             .execute()
         )
-        existing = {row["keyword"].lower() for row in (existing_result.data or [])}
+        existing_map = {row["keyword"].lower(): row["id"] for row in (existing_result.data or [])}
 
-        for kw in self.TARGET_KEYWORDS:
-            kw_lower = kw["keyword"].lower()
-            if kw_lower in existing:
-                skipped += 1
-                continue
-            metrics = gsc_data.get(kw_lower, {})
+        def _metrics_payload(metrics: Dict[str, Any]) -> Dict[str, Any]:
             position = metrics.get("position")
-            sb.table(KEYWORDS_TABLE).insert({
-                "keyword": kw["keyword"],
-                "tenant_id": self.tenant_id,
-                "intent": kw["intent"],
-                "priority": kw["priority"],
-                "target_page": kw["target_page"],
+            return {
                 "current_position": int(position) if position else None,
                 "current_clicks": metrics.get("clicks", 0),
                 "current_impressions": metrics.get("impressions", 0),
                 "current_ctr": metrics.get("ctr", 0.0),
-                "position_history": [],
                 "last_checked_at": now,
-            }).execute()
-            inserted += 1
+            }
+
+        for kw in self.TARGET_KEYWORDS:
+            kw_lower = kw["keyword"].lower()
+            metrics = gsc_data.get(kw_lower, {})
+            payload = _metrics_payload(metrics)
+            if kw_lower in existing_map:
+                # Refresh metrics on the existing row instead of skipping.
+                try:
+                    sb.table(KEYWORDS_TABLE).update(payload).eq(
+                        "id", existing_map[kw_lower]
+                    ).execute()
+                    updated += 1
+                except Exception as e:
+                    logger.debug(f"Update failed for '{kw['keyword']}': {e}")
+            else:
+                try:
+                    sb.table(KEYWORDS_TABLE).insert({
+                        "keyword": kw["keyword"],
+                        "tenant_id": self.tenant_id,
+                        "intent": kw["intent"],
+                        "priority": kw["priority"],
+                        "target_page": kw["target_page"],
+                        "position_history": [],
+                        **payload,
+                    }).execute()
+                    inserted += 1
+                except Exception as e:
+                    logger.debug(f"Insert failed for '{kw['keyword']}': {e}")
 
         # Also pull top GSC queries not yet tracked (≥5 impressions to filter noise)
         for query, data in gsc_data.items():
-            if query in existing or data.get("impressions", 0) < 5:
+            if data.get("impressions", 0) < 5:
                 continue
-            position = data.get("position")
-            try:
-                sb.table(KEYWORDS_TABLE).insert({
-                    "keyword": query,
-                    "tenant_id": self.tenant_id,
-                    "intent": "gsc_discovered",
-                    "priority": "medium",
-                    "target_page": "/",
-                    "current_position": int(position) if position else None,
-                    "current_clicks": data.get("clicks", 0),
-                    "current_impressions": data.get("impressions", 0),
-                    "current_ctr": data.get("ctr", 0.0),
-                    "position_history": [],
-                    "last_checked_at": now,
-                }).execute()
-                inserted += 1
-            except Exception:
-                pass
+            payload = _metrics_payload(data)
+            if query in existing_map:
+                try:
+                    sb.table(KEYWORDS_TABLE).update(payload).eq(
+                        "id", existing_map[query]
+                    ).execute()
+                    updated += 1
+                except Exception:
+                    pass
+            else:
+                try:
+                    sb.table(KEYWORDS_TABLE).insert({
+                        "keyword": query,
+                        "tenant_id": self.tenant_id,
+                        "intent": "gsc_discovered",
+                        "priority": "medium",
+                        "target_page": "/",
+                        "position_history": [],
+                        **payload,
+                    }).execute()
+                    inserted += 1
+                except Exception:
+                    pass
 
-        logger.info(f"✅ initialize_keywords: {inserted} inserted, {skipped} skipped")
-        return {"inserted": inserted, "skipped": skipped, "total_target": len(self.TARGET_KEYWORDS)}
+        logger.info(f"✅ initialize_keywords: {inserted} inserted, {updated} updated (tenant={self.tenant_id})")
+        return {"inserted": inserted, "updated": updated, "total_target": len(self.TARGET_KEYWORDS)}
 
     async def discover_keyword_opportunities(self) -> List[Dict[str, Any]]:
         """
