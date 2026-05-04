@@ -510,14 +510,6 @@ def start():
         replace_existing=True,
     )
 
-    # Weekly AI visibility check — Thursdays 10:00 UTC
-    scheduler.add_job(
-        _run_weekly_ai_visibility,
-        CronTrigger(day_of_week="thu", hour=10, minute=0),
-        id="weekly_ai_visibility",
-        replace_existing=True,
-    )
-
     # Midday review check — 14:00 UTC every day
     scheduler.add_job(
         _run_midday_review_check,
@@ -617,7 +609,7 @@ def start():
         "[scheduler] Started — "
         "keywords 02:00, SEO OODA Mon 03:00, metrics 04:00, "
         "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads OODA 08:00, "
-        "social OODA Tue 11:00, AI visibility Thu 10:00, "
+        "social OODA Tue 11:00, "
         "reviews OODA 14:00, content OODA Wed 05:00, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )

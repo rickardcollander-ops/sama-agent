@@ -174,7 +174,7 @@ class AIVisibilityAgent:
         try:
             msg = await asyncio.to_thread(
                 self.client.messages.create,
-                model="claude-opus-4-6",
+                model=settings.CLAUDE_MODEL,
                 max_tokens=800,
                 system=engine_config["system"],
                 messages=[{"role": "user", "content": prompt}],
@@ -564,7 +564,7 @@ Respond ONLY with valid JSON (no markdown fences).
         try:
             msg = await asyncio.to_thread(
                 self.client.messages.create,
-                model="claude-opus-4-6",
+                model=settings.CLAUDE_MODEL,
                 max_tokens=3000,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -621,7 +621,7 @@ Respond ONLY as a JSON array with objects having these fields:
         try:
             msg = await asyncio.to_thread(
                 self.client.messages.create,
-                model="claude-opus-4-6",
+                model=settings.CLAUDE_MODEL,
                 max_tokens=1200,
                 messages=[{"role": "user", "content": prompt}],
             )

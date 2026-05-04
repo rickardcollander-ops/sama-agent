@@ -183,7 +183,7 @@ async def test_single():
         from shared.config import settings
         c = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         msg = c.messages.create(
-            model="claude-opus-4-6",
+            model=settings.CLAUDE_MODEL,
             max_tokens=200,
             system="You are ChatGPT. Answer helpfully.",
             messages=[{"role": "user", "content": "What are the best customer success tools?"}],
