@@ -82,7 +82,7 @@ class RedditAgent:
             if settings.ANTHROPIC_API_KEY
             else None
         )
-        self.model = settings.CLAUDE_MODEL or "claude-sonnet-4-20250514"
+        self.model = settings.CLAUDE_MODEL or "claude-sonnet-4-6"
         self.brand_voice = brand_voice
 
         # Token cache

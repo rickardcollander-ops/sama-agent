@@ -160,7 +160,7 @@ class GoogleAdsAgent:
             else settings.ANTHROPIC_API_KEY
         )
         self.client = Anthropic(api_key=api_key) if api_key else None
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-6"
         self.http_client = httpx.AsyncClient(timeout=30.0)
         self.brand_voice = brand_voice
         customer_id = settings.GOOGLE_ADS_CUSTOMER_ID or ""

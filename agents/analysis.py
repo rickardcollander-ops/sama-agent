@@ -79,7 +79,7 @@ class AnalysisAgent:
             else settings.ANTHROPIC_API_KEY
         )
         self.client = Anthropic(api_key=api_key) if api_key else None
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-6"
         self.serp_key = settings.VALUESERP_API_KEY
         self.perplexity_key = settings.PERPLEXITY_API_KEY
         self.brand_name = (tenant_config.brand_name if tenant_config else "Successifier") or "Brand"

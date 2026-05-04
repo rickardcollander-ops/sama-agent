@@ -250,7 +250,7 @@ Format as JSON:
         try:
             def _call():
                 return client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=1000,
                     system=system_prompt,
                     messages=[{"role": "user", "content": f"Create LinkedIn post about: {topic}"}]

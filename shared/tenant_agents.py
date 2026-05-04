@@ -60,6 +60,13 @@ async def get_ads_agent(tenant_id: str):
     return GoogleAdsAgent(tenant_config=config)
 
 
+async def get_strategy_agent(tenant_id: str):
+    """Create a StrategyAgent configured for the given tenant."""
+    from agents.strategy import StrategyAgent
+    config = await get_tenant_config(tenant_id)
+    return StrategyAgent(tenant_config=config)
+
+
 # Map of agent_name → factory. Used by the scheduler and trigger endpoint to
 # avoid the agent_name → factory if/elif ladder.
 AGENT_FACTORIES = {
@@ -70,6 +77,7 @@ AGENT_FACTORIES = {
     "analytics": get_analytics_agent,
     "geo": get_ai_visibility_agent,
     "ads": get_ads_agent,
+    "strategy": get_strategy_agent,
 }
 
 

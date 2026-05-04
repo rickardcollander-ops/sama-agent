@@ -24,7 +24,7 @@ class ReportGenerator:
     
     def __init__(self):
         self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-6"
         self.sb = None
     
     def _get_sb(self):

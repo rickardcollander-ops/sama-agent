@@ -88,7 +88,7 @@ class AnalyticsAgent:
         self.tenant_config = tenant_config
         api_key = tenant_config.anthropic_api_key if tenant_config else settings.ANTHROPIC_API_KEY
         self.client = Anthropic(api_key=api_key) if api_key else None
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-6"
         self.http_client = httpx.AsyncClient(timeout=30.0)
 
     async def run_cycle(self) -> str:

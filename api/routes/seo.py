@@ -513,7 +513,7 @@ Be specific to successifier.com and the customer success SaaS space. Focus on re
         client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}]
         )
