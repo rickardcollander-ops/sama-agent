@@ -24,6 +24,7 @@ from api.routes import (
     content_suggest, ads_suggest, social_suggest, tech_agent,
     strategy as strategy_routes, menu as menu_routes,
     google_analytics as google_analytics_routes,
+    integrations_gsc as integrations_gsc_routes,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -212,6 +213,11 @@ app.include_router(
     google_analytics_routes.router,
     prefix="/api/integrations/google/analytics",
     tags=["google-analytics"],
+)
+app.include_router(
+    integrations_gsc_routes.router,
+    prefix="/api/integrations/gsc",
+    tags=["integrations-gsc"],
 )
 
 
