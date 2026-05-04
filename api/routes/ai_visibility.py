@@ -10,8 +10,9 @@ import threading
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-from agents.ai_visibility import ai_visibility_agent
+from agents.ai_visibility import AIVisibilityAgent, ai_visibility_agent
 from shared.database import get_supabase
+from shared.tenant import get_tenant_config
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -108,21 +109,36 @@ async def get_gaps():
 
 # ── Run check ──────────────────────────────────────────────────────────────────
 
-def _run_check_thread():
+def _run_check_thread(agent: AIVisibilityAgent, label: str):
     try:
-        logger.info("AI Visibility monitoring thread started")
-        result = asyncio.run(ai_visibility_agent.run_monitoring())
-        logger.info(f"AI Visibility monitoring done: {result}")
+        logger.info(f"AI Visibility monitoring thread started for {label}")
+        result = asyncio.run(agent.run_monitoring())
+        logger.info(f"AI Visibility monitoring done for {label}: {result}")
     except Exception as e:
-        logger.error(f"AI Visibility monitoring thread error: {e}", exc_info=True)
+        logger.error(f"AI Visibility monitoring thread error for {label}: {e}", exc_info=True)
 
 
 @router.post("/check")
-async def run_check():
-    """Kick off a monitoring run in a background thread (~13 min for 5 engines × 16 prompts)"""
-    t = threading.Thread(target=_run_check_thread, daemon=True)
+async def run_check(request: Request):
+    """Kick off a monitoring run in a background thread.
+
+    For tenant requests, build a per-tenant agent so the run uses the
+    user's saved geo_queries, brand name and competitors.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    if tenant_id and tenant_id != "default":
+        config = await get_tenant_config(tenant_id)
+        agent = AIVisibilityAgent(tenant_config=config)
+        label = f"tenant={tenant_id}"
+        if not config.geo_queries:
+            logger.warning(f"Tenant {tenant_id} has no geo_queries configured; falling back to default prompts")
+    else:
+        agent = ai_visibility_agent
+        label = "default"
+
+    t = threading.Thread(target=_run_check_thread, args=(agent, label), daemon=True)
     t.start()
-    logger.info(f"AI Visibility monitoring thread started: {t.name}")
+    logger.info(f"AI Visibility monitoring thread started: {t.name} ({label})")
     return {"status": "started", "message": "Monitoring thread started. Results appear as checks complete."}
 
 

@@ -184,16 +184,31 @@ class AIVisibilityAgent:
             logger.error(f"Claude API error for engine {engine_name}: {e}")
             return ""
 
+    def _brand_token(self) -> str:
+        """Lower-case brand name to scan for in AI responses."""
+        if self.tenant_config and getattr(self.tenant_config, "brand_name", None):
+            return self.tenant_config.brand_name.strip().lower()
+        return "successifier"
+
+    def _competitors(self) -> List[str]:
+        """Tenant competitors when configured, otherwise the legacy global list."""
+        if self.tenant_config:
+            comp = self.tenant_config.competitors
+            if comp:
+                return list(comp)
+        return list(COMPETITORS)
+
     def _analyze_response(self, response: str) -> Dict[str, Any]:
         """Parse response for mention, rank, sentiment, competitors"""
         resp_lower = response.lower()
-        successifier_mentioned = "successifier" in resp_lower
+        brand = self._brand_token()
+        brand_mentioned = bool(brand) and brand in resp_lower
 
         rank = None
-        if successifier_mentioned:
+        if brand_mentioned:
             lines = response.split("\n")
             for i, line in enumerate(lines):
-                if "successifier" in line.lower():
+                if brand in line.lower():
                     for j in range(max(0, i - 2), i + 1):
                         line_j = lines[j] if j < len(lines) else ""
                         for n in range(1, 10):
@@ -206,26 +221,26 @@ class AIVisibilityAgent:
                         rank = 1
                     break
 
-        competitors_found = [c for c in COMPETITORS if c.lower() in resp_lower]
+        competitors_found = [c for c in self._competitors() if c.lower() in resp_lower]
 
         sentiment = None
-        if successifier_mentioned:
+        if brand_mentioned:
             positive_words = ["recommend", "great", "excellent", "best", "top", "ideal", "perfect", "affordable", "easy"]
             negative_words = ["expensive", "complex", "difficult", "limited", "basic", "lacking"]
             pos = sum(1 for w in positive_words if w in resp_lower)
             neg = sum(1 for w in negative_words if w in resp_lower)
             sentiment = "positive" if pos > neg else "negative" if neg > pos else "neutral"
 
-        # Excerpt: first sentence mentioning Successifier (max 400 chars)
+        # Excerpt: first sentence mentioning the brand (max 400 chars)
         excerpt = None
-        if successifier_mentioned:
+        if brand_mentioned:
             for sentence in response.replace("\n", " ").split("."):
-                if "successifier" in sentence.lower():
+                if brand in sentence.lower():
                     excerpt = sentence.strip()[:400]
                     break
 
         return {
-            "mentioned": successifier_mentioned,
+            "mentioned": brand_mentioned,
             "rank": rank,
             "competitors_mentioned": competitors_found,
             "sentiment": sentiment,
@@ -250,6 +265,17 @@ class AIVisibilityAgent:
             "action_type": action_map.get(category, "create_content"),
         }
 
+    def _build_prompt_categories(self) -> Dict[str, List[str]]:
+        """Return the prompts to monitor.
+
+        When the tenant has saved GEO queries via the dashboard, those drive
+        the run (categorised as ``user_query``). Otherwise we fall back to the
+        legacy hard-coded MONITORING_PROMPTS so default/test runs still work.
+        """
+        if self.tenant_config and self.tenant_config.geo_queries:
+            return {"user_query": list(self.tenant_config.geo_queries)}
+        return MONITORING_PROMPTS
+
     async def run_monitoring(self) -> Dict[str, Any]:
         """Run a full monitoring round: each prompt x each AI engine.
 
@@ -259,8 +285,10 @@ class AIVisibilityAgent:
         results: List[Dict[str, Any]] = []
         gaps_created = 0
         run_id = str(uuid.uuid4())[:8]  # short ID to group this run's checks
+        tenant_id = self.tenant_config.tenant_id if self.tenant_config else None
+        prompt_categories = self._build_prompt_categories()
 
-        for category, prompts in MONITORING_PROMPTS.items():
+        for category, prompts in prompt_categories.items():
             for prompt in prompts:
                 # Query all 5 engines for this prompt in parallel
                 engine_items = list(AI_ENGINES.items())
@@ -287,6 +315,8 @@ class AIVisibilityAgent:
                         "full_response": response_text,
                         "checked_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    if tenant_id:
+                        check_data["tenant_id"] = tenant_id
                     try:
                         sb.table("ai_visibility_checks").insert(check_data).execute()
                         logger.info(f"[{run_id}] {engine_name} | {category} | mentioned={analysis['mentioned']}")
@@ -307,6 +337,8 @@ class AIVisibilityAgent:
                             "status": "open",
                             "created_at": datetime.now(timezone.utc).isoformat(),
                         }
+                        if tenant_id:
+                            gap_data["tenant_id"] = tenant_id
                         try:
                             sb.table("ai_visibility_gaps").insert(gap_data).execute()
                             gaps_created += 1

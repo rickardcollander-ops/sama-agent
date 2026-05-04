@@ -85,6 +85,14 @@ class TenantConfig:
         """Alias for competitors."""
         return self.competitors
 
+    @property
+    def geo_queries(self) -> List[str]:
+        """User-configured AI visibility prompts (stored via the dashboard)."""
+        val = self._settings.get("geo_queries")
+        if val and isinstance(val, list):
+            return [q for q in val if isinstance(q, str) and q.strip()]
+        return []
+
     # ── Analytics ─────────────────────────────────────────────────────
 
     @property
