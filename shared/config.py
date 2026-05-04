@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     SAMA_API_URL: str = "https://web-production-5324a.up.railway.app"
 
     # AI Model
-    CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+    CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
     # SEO Config
     GSC_SITE_URL: str = "sc-domain:successifier.com"

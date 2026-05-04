@@ -124,7 +124,7 @@ Return ONLY valid JSON (no markdown, no explanation):
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     response = await asyncio.to_thread(
         client.messages.create,
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2500,
         messages=[{"role": "user", "content": prompt}]
     )

@@ -38,7 +38,7 @@ Always cite data. Always state confidence level. Always provide next action."""
     
     def __init__(self):
         self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-sonnet-4-20250514"
+        self.model = "claude-sonnet-4-6"
     
     async def process_goal(self, goal: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
         """

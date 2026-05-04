@@ -21,7 +21,7 @@ def test_content_agent_initialization(content_agent):
     """Test Content agent initializes correctly"""
     assert content_agent is not None
     assert content_agent.brand_voice is not None
-    assert content_agent.model == "claude-sonnet-4-20250514"
+    assert content_agent.model == "claude-sonnet-4-6"
 
 
 def test_brand_voice_messaging_pillars(brand_voice):
