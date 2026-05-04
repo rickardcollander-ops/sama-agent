@@ -117,14 +117,14 @@ Format as markdown with proper headings.
         def _call():
             return self.client.messages.create(
                 model=self.model,
-                max_tokens=8192,
+                max_tokens=4096,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}]
             )
         response = await asyncio.to_thread(_call)
-        
+
         content = response.content[0].text
-        
+
         # Extract title from content
         lines = content.split('\n')
         title = lines[0].replace('#', '').strip() if lines else topic
@@ -310,7 +310,7 @@ Format as markdown.
         def _call():
             return self.client.messages.create(
                 model=self.model,
-                max_tokens=8192,
+                max_tokens=4096,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}]
             )
@@ -599,7 +599,7 @@ Return ONLY the optimized content in markdown format. Do not include any comment
             def _call():
                 return self.client.messages.create(
                     model=self.model,
-                    max_tokens=8192,
+                    max_tokens=4096,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_prompt}]
                 )

@@ -1335,7 +1335,7 @@ Regler:
             loop_messages = list(messages)  # copy so we can extend
             reply = ""
 
-            for _ in range(15):  # max 15 tool-call rounds (FORGE has many fix tools)
+            for _ in range(5):  # max 5 tool-call rounds — keeps token cost bounded
                 response = client.messages.create(
                     model=settings.CLAUDE_MODEL,
                     max_tokens=2000,
