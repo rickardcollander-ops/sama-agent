@@ -230,30 +230,48 @@ class SiteAuditAgent:
                 pass
             broken_links = await self._check_links(client, pages, base_url, host, max_links_to_check)
 
-            # Compute scores + findings + recommendations.
-            scores = self._compute_scores(pages, robots, llms, sitemap_urls, base_url, broken_links)
-            findings = self._compute_findings(pages, robots, llms, sitemap_urls, base_url, broken_links)
-            recommendations = self._compute_recommendations(findings)
+            # If no audited page actually loaded, the host is unreachable —
+            # we cannot honestly score it. Returning fake "100" scores for
+            # performance/link-health on an empty audit is misleading.
+            successful_pages = [p for p in pages if p.status_code == 200]
+            reachable = bool(successful_pages)
+            meta_files_info = {
+                "robots_txt": robots_info,
+                "llms_txt": llms_info,
+                "sitemap_xml": sitemap_info,
+            }
+
+            if not reachable:
+                scores = {"overall": 0, "technical_seo": 0, "on_page_seo": 0,
+                          "geo_readiness": 0, "link_health": 0, "performance": 0}
+                findings = self._unreachable_findings(pages, base_url, meta_files_info)
+                recommendations = self._compute_recommendations(findings)
+            else:
+                scores = self._compute_scores(successful_pages, robots, llms, sitemap_urls, base_url, broken_links)
+                findings = self._compute_findings(pages, robots, llms, sitemap_urls, base_url, broken_links)
+                recommendations = self._compute_recommendations(findings)
 
             summary = {
                 "pages_analyzed": len(pages),
+                "pages_loaded": len(successful_pages),
+                "pages_failed": len(pages) - len(successful_pages),
+                "reachable": reachable,
                 "total_pages_discovered": len(sitemap_urls) if sitemap_urls else len(pages),
                 "has_robots_txt": robots is not None,
                 "has_sitemap_xml": bool(sitemap_urls),
                 "has_llms_txt": llms is not None,
                 "https": base_url.startswith("https://"),
-                "avg_response_ms": int(sum(p.response_ms for p in pages) / len(pages)) if pages else 0,
-                "total_links_checked": min(max_links_to_check, sum(p.internal_links + p.external_links for p in pages)),
+                "avg_response_ms": (
+                    int(sum(p.response_ms for p in successful_pages) / len(successful_pages))
+                    if successful_pages else 0
+                ),
+                "total_links_checked": min(max_links_to_check, sum(p.internal_links + p.external_links for p in successful_pages)),
                 "broken_links_count": len(broken_links),
                 "audit_duration_ms": int((time.time() - started) * 1000),
                 # Diagnostic detail so the dashboard can distinguish "file not
                 # present" from "we couldn't reach the server" — the latter
                 # should not be presented to users as a missing-file finding.
-                "meta_files": {
-                    "robots_txt": robots_info,
-                    "llms_txt": llms_info,
-                    "sitemap_xml": sitemap_info,
-                },
+                "meta_files": meta_files_info,
             }
 
             return {
@@ -783,6 +801,55 @@ class SiteAuditAgent:
                  "Heading structure is clean across the audited pages.", n)
 
         return findings
+
+    def _unreachable_findings(
+        self,
+        pages: List[PageReport],
+        base_url: str,
+        meta_files: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Findings for the case where no audited page actually loaded.
+
+        We deliberately suppress the usual "robots.txt missing" /
+        "sitemap.xml missing" findings here — they're false negatives when
+        the host itself was unreachable, and would otherwise drown out the
+        real problem in the recommendations panel.
+        """
+        attempted = len(pages) or 1
+        host = urlparse(base_url).hostname or base_url
+        # Pull the most informative error code/string we can from meta-file
+        # attempts to help the user (DNS error, timeout, 5xx, etc.).
+        diag_bits: List[str] = []
+        for label, info in (
+            ("robots.txt", meta_files.get("robots_txt") or {}),
+            ("sitemap.xml", meta_files.get("sitemap_xml") or {}),
+            ("llms.txt", meta_files.get("llms_txt") or {}),
+        ):
+            attempts = info.get("attempts") if isinstance(info, dict) else None
+            samples = attempts if isinstance(attempts, list) else [info]
+            for s in samples or []:
+                if not isinstance(s, dict):
+                    continue
+                err = s.get("error")
+                status = s.get("status")
+                if err:
+                    diag_bits.append(f"{label}: {err}")
+                    break
+                if isinstance(status, int) and status >= 500:
+                    diag_bits.append(f"{label}: HTTP {status}")
+                    break
+        diag = f" Diagnostic: {'; '.join(dict.fromkeys(diag_bits))}." if diag_bits else ""
+        return [{
+            "category": "technical",
+            "severity": "critical",
+            "title": f"Could not reach {host}",
+            "description": (
+                "Every audited URL failed to load, so we have no data to score "
+                "this site. Check that the domain is correct and publicly "
+                "reachable over HTTPS, then re-run the audit." + diag
+            ),
+            "affected_pages": attempted,
+        }]
 
     def _compute_recommendations(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         sev_priority = {"critical": "high", "warning": "medium", "info": "low", "success": "low"}
