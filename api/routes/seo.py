@@ -76,13 +76,22 @@ async def get_seo_stats(request: Request):
 
 
 @router.post("/initialize")
-async def initialize_keywords():
-    """Initialize keyword tracking database"""
+async def initialize_keywords(request: Request):
+    """Initialize keyword tracking database for the requesting tenant.
+
+    Seeds TARGET_KEYWORDS enriched with live GSC metrics so newly inserted
+    rows have real clicks/impressions/position data instead of zeros.
+    """
     try:
-        await seo_agent.initialize_keywords()
+        from shared.tenant_agents import get_seo_agent
+        tenant_id = getattr(request.state, "tenant_id", "default")
+        agent = await get_seo_agent(tenant_id)
+        result = await agent.initialize_keywords()
         return {
             "success": True,
-            "message": f"Initialized {len(seo_agent.TARGET_KEYWORDS)} keywords"
+            "tenant_id": tenant_id,
+            "message": f"Initialized {result.get('inserted', 0)} keywords ({result.get('skipped', 0)} already existed)",
+            **result,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
