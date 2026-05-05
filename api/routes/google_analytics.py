@@ -51,6 +51,7 @@ async def list_ga4_properties(request: Request, tenant_id: Optional[str] = Query
         logger.error(f"GA4 properties: token error for {tid}: {e}")
         raise HTTPException(status_code=500, detail="Could not refresh Google token")
 
+    connected_email = _get_connected_email(tid)
     headers = {"Authorization": f"Bearer {access_token}"}
     properties: List[Dict[str, Any]] = []
 
@@ -67,10 +68,15 @@ async def list_ga4_properties(request: Request, tenant_id: Optional[str] = Query
                     params=params,
                 )
                 if resp.status_code == 403:
+                    who = f" ({connected_email})" if connected_email else ""
                     raise HTTPException(
                         status_code=403,
-                        detail="Connected Google account lacks Analytics Admin access. "
-                               "Reconnect with the correct account or grant access.",
+                        detail=(
+                            f"The connected Google account{who} doesn't have access to any "
+                            "GA4 properties. Either switch to a Google account that has "
+                            "access, or have someone in Google Analytics grant this "
+                            "account at least Viewer access on the property."
+                        ),
                     )
                 if resp.status_code != 200:
                     logger.warning(f"accountSummaries {resp.status_code}: {resp.text[:200]}")
@@ -106,6 +112,7 @@ async def list_ga4_properties(request: Request, tenant_id: Optional[str] = Query
 
     return {
         "tenant_id": tid,
+        "connected_account_email": connected_email,
         "selected_property_id": selected,
         "properties": properties,
         "count": len(properties),
@@ -194,6 +201,29 @@ async def _get_selected_property_id(tenant_id: str) -> Optional[str]:
         )
         if res.data:
             return (res.data.get("settings") or {}).get("ga4_property_id")
+    except Exception:
+        pass
+    return None
+
+
+def _get_connected_email(tenant_id: str) -> Optional[str]:
+    """Best-effort lookup of the Google email the analytics service is linked to.
+
+    Returns None if migration 031 hasn't been applied or the row is missing.
+    """
+    try:
+        sb = get_supabase()
+        res = (
+            sb.table("google_connections")
+            .select("account_email")
+            .eq("tenant_id", tenant_id)
+            .eq("service", "analytics")
+            .single()
+            .execute()
+        )
+        if res.data:
+            email = res.data.get("account_email")
+            return email if isinstance(email, str) and email else None
     except Exception:
         pass
     return None
