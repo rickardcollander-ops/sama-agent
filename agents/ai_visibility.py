@@ -142,9 +142,9 @@ class AIVisibilityAgent:
         )
         self.client = _build_anthropic_client(api_key)
 
-    async def run_cycle(self) -> str:
+    async def run_cycle(self, run_id_for_progress: Optional[str] = None) -> str:
         """Standard cycle entry point used by the trigger endpoint and scheduler."""
-        result = await self.run_monitoring()
+        result = await self.run_monitoring(run_id_for_progress=run_id_for_progress)
         if isinstance(result, dict):
             mention_rate = result.get("mention_rate")
             checks = result.get("total_checks") or len(result.get("results", []))
@@ -308,10 +308,18 @@ class AIVisibilityAgent:
             return {"user_query": list(self.tenant_config.geo_queries)}
         return MONITORING_PROMPTS
 
-    async def run_monitoring(self) -> Dict[str, Any]:
+    async def run_monitoring(self, run_id_for_progress: Optional[str] = None) -> Dict[str, Any]:
         """Run a full monitoring round: each prompt x each AI engine.
 
-        All engines for a given prompt are queried concurrently via asyncio.gather.
+        Within a single prompt, all 5 engines run concurrently and each one
+        writes its own ai_visibility_checks / ai_visibility_gaps row the
+        moment its response lands — the dashboard's GEO panel sees results
+        roll in instead of waiting for the whole batch.
+
+        When ``run_id_for_progress`` is supplied, the matching agent_runs
+        row's ``summary`` field is updated after each prompt completes
+        (e.g. "3/16 prompts checked"). The ActiveRunsBanner reads that, so
+        the user gets live progress instead of a static spinner.
         """
         sb = get_supabase()
         results: List[Dict[str, Any]] = []
@@ -319,63 +327,103 @@ class AIVisibilityAgent:
         run_id = str(uuid.uuid4())[:8]  # short ID to group this run's checks
         tenant_id = self.tenant_config.tenant_id if self.tenant_config else None
         prompt_categories = self._build_prompt_categories()
+        prompts_total = sum(len(p) for p in prompt_categories.values())
+        prompts_done = 0
+
+        def _publish_progress(latest_prompt: Optional[str] = None) -> None:
+            if not run_id_for_progress:
+                return
+            text = f"{prompts_done}/{prompts_total} prompts checked"
+            if latest_prompt:
+                snippet = latest_prompt[:60] + ("…" if len(latest_prompt) > 60 else "")
+                text = f"{text} — latest: {snippet}"
+            try:
+                sb.table("agent_runs").update({"summary": text}).eq("id", run_id_for_progress).execute()
+            except Exception:
+                # Progress is best-effort; never fail the run because of it.
+                pass
+
+        # Initial 0/N so the dashboard sees something other than empty
+        # immediately after kicking off.
+        _publish_progress()
+
+        async def _process_one_engine(
+            prompt_text: str,
+            category_name: str,
+            engine_name: str,
+            engine_config: Dict,
+        ) -> Optional[Dict[str, Any]]:
+            """Query one engine for one prompt, write check + gap rows, return check_data.
+
+            Each invocation runs in its own coroutine, so the DB inserts for
+            the 5 engines happen as soon as each engine returns rather than
+            after all 5 finish. Returns None on empty response.
+            """
+            response_text = await self._query_engine(prompt_text, engine_name, engine_config)
+            if not response_text:
+                return None
+
+            analysis = self._analyze_response(response_text)
+            check_data = {
+                "prompt": prompt_text,
+                "category": category_name,
+                "ai_engine": engine_name,
+                "run_id": run_id,
+                "mentioned": analysis["mentioned"],
+                "rank": analysis["rank"],
+                "competitors_mentioned": analysis["competitors_mentioned"],
+                "sentiment": analysis["sentiment"],
+                "ai_response_excerpt": analysis["ai_response_excerpt"],
+                "full_response": response_text,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if tenant_id:
+                check_data["tenant_id"] = tenant_id
+            try:
+                sb.table("ai_visibility_checks").insert(check_data).execute()
+                logger.info(f"[{run_id}] {engine_name} | {category_name} | mentioned={analysis['mentioned']}")
+            except Exception as e:
+                logger.error(f"[{run_id}] DB insert check FAILED: {e} | data keys: {list(check_data.keys())}")
+
+            if not analysis["mentioned"]:
+                gap_info = self._identify_gap(category_name)
+                gap_data = {
+                    "prompt": prompt_text,
+                    "category": category_name,
+                    "ai_engine": engine_name,
+                    "priority": gap_info["priority"],
+                    "action_type": gap_info["action_type"],
+                    "status": "open",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if tenant_id:
+                    gap_data["tenant_id"] = tenant_id
+                try:
+                    sb.table("ai_visibility_gaps").insert(gap_data).execute()
+                    check_data["_gap_created"] = True
+                except Exception as e:
+                    logger.error(f"[{run_id}] DB insert gap FAILED: {e}")
+
+            return check_data
 
         for category, prompts in prompt_categories.items():
             for prompt in prompts:
-                # Query all 5 engines for this prompt in parallel
                 engine_items = list(AI_ENGINES.items())
-                responses = await asyncio.gather(
-                    *(self._query_engine(prompt, name, cfg) for name, cfg in engine_items)
+                batch = await asyncio.gather(
+                    *(
+                        _process_one_engine(prompt, category, name, cfg)
+                        for name, cfg in engine_items
+                    )
                 )
-
-                for (engine_name, engine_config), response_text in zip(engine_items, responses):
-                    if not response_text:
+                for entry in batch:
+                    if entry is None:
                         continue
+                    if entry.pop("_gap_created", False):
+                        gaps_created += 1
+                    results.append(entry)
 
-                    analysis = self._analyze_response(response_text)
-
-                    check_data = {
-                        "prompt": prompt,
-                        "category": category,
-                        "ai_engine": engine_name,
-                        "run_id": run_id,
-                        "mentioned": analysis["mentioned"],
-                        "rank": analysis["rank"],
-                        "competitors_mentioned": analysis["competitors_mentioned"],
-                        "sentiment": analysis["sentiment"],
-                        "ai_response_excerpt": analysis["ai_response_excerpt"],
-                        "full_response": response_text,
-                        "checked_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    if tenant_id:
-                        check_data["tenant_id"] = tenant_id
-                    try:
-                        sb.table("ai_visibility_checks").insert(check_data).execute()
-                        logger.info(f"[{run_id}] {engine_name} | {category} | mentioned={analysis['mentioned']}")
-                    except Exception as e:
-                        logger.error(f"[{run_id}] DB insert check FAILED: {e} | data keys: {list(check_data.keys())}")
-
-                    results.append(check_data)
-
-                    # Create gap per engine if not mentioned
-                    if not analysis["mentioned"]:
-                        gap_info = self._identify_gap(category)
-                        gap_data = {
-                            "prompt": prompt,
-                            "category": category,
-                            "ai_engine": engine_name,
-                            "priority": gap_info["priority"],
-                            "action_type": gap_info["action_type"],
-                            "status": "open",
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                        if tenant_id:
-                            gap_data["tenant_id"] = tenant_id
-                        try:
-                            sb.table("ai_visibility_gaps").insert(gap_data).execute()
-                            gaps_created += 1
-                        except Exception as e:
-                            logger.error(f"[{run_id}] DB insert gap FAILED: {e}")
+                prompts_done += 1
+                _publish_progress(latest_prompt=prompt)
 
         mentioned = [r for r in results if r["mentioned"]]
         mention_rate = len(mentioned) / len(results) if results else 0
