@@ -301,19 +301,37 @@ domain_strategies and roadmap — never objects keyed by domain or horizon."""
         def _call():
             return self.client.messages.create(
                 model=self.model,
-                max_tokens=3500,
+                # 8192 leaves comfortable headroom for the full document
+                # (headline + summary + per-domain plans + roadmap +
+                # cross-channel priorities + risks). 3500 was getting
+                # truncated mid-string for tenants with several active
+                # domains, which crashed json.loads.
+                max_tokens=8192,
                 system=system,
                 messages=[{"role": "user", "content": user_prompt}],
             )
 
         try:
             response = await asyncio.to_thread(_call)
+            stop_reason = getattr(response, "stop_reason", None)
             text = response.content[0].text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
-            strategy = json.loads(text.strip())
+            text = text.strip()
+            try:
+                strategy = json.loads(text)
+            except json.JSONDecodeError as je:
+                if stop_reason == "max_tokens":
+                    logger.warning(
+                        "[strategy] response truncated by max_tokens — bump max_tokens or reduce prompt size",
+                    )
+                    return {
+                        "error": "Strategin var för stor för att rymmas i ett svar. Försök igen — höj max_tokens på backend om felet upprepas.",
+                    }
+                logger.error(f"[strategy] JSON parse failed (stop_reason={stop_reason}): {je}")
+                return {"error": f"Kunde inte tolka AI-svaret som JSON: {je}"}
         except Exception as e:
             logger.error(f"[strategy] generation failed: {e}")
             return {"error": str(e)}
