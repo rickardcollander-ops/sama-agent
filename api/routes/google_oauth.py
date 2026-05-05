@@ -40,7 +40,15 @@ SERVICE_SCOPES = {
     "ads": "https://www.googleapis.com/auth/adwords",
 }
 
+# Always include openid + email so we can show the user which Google
+# account is actually connected (otherwise users who linked the wrong
+# account have no way to tell, and can't pick a GA4 property because
+# their account has no GA4 access).
+IDENTITY_SCOPES = "openid email"
+
 VALID_SERVICES = set(SERVICE_SCOPES.keys())
+
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 
 def _redirect_uri() -> str:
@@ -66,6 +74,30 @@ def _safe_return_url(candidate: Optional[str]) -> str:
 def _append_query(url: str, params: dict) -> str:
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}{urlencode(params)}"
+
+
+async def _fetch_google_account_email(access_token: str) -> Optional[str]:
+    """Best-effort fetch of the connected Google account's email.
+
+    Returns None on any error — we never want a userinfo glitch to break the
+    OAuth callback. The email is informational (shown in the UI), so a missing
+    value just degrades to "Email unknown".
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"Google userinfo {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json()
+        email = data.get("email")
+        return email if isinstance(email, str) else None
+    except Exception as exc:
+        logger.warning(f"Google userinfo fetch failed: {exc}")
+        return None
 
 
 # ── Connect: redirect to Google consent screen ─────────────────────────────
@@ -95,9 +127,14 @@ async def google_connect(
         "client_id": settings.GOOGLE_CLIENT_ID,
         "redirect_uri": _redirect_uri(),
         "response_type": "code",
-        "scope": SERVICE_SCOPES[service],
+        "scope": f"{SERVICE_SCOPES[service]} {IDENTITY_SCOPES}",
         "access_type": "offline",
-        "prompt": "consent",
+        # `select_account` forces Google to show the account chooser even when
+        # the user is signed in to a single account, so they can deliberately
+        # pick (or switch) which Google account to authorize. `consent` keeps
+        # the consent screen so we always get a refresh_token back.
+        "prompt": "select_account consent",
+        "include_granted_scopes": "true",
         "state": state,
     }
 
@@ -171,6 +208,10 @@ async def google_callback(
     token_expiry = datetime.fromtimestamp(time.time() + expires_in, tz=timezone.utc).isoformat()
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # Resolve the Google account email so the UI can show which account is
+    # connected and offer a "switch account" flow if it's the wrong one.
+    account_email = await _fetch_google_account_email(access_token)
+
     # Store in Supabase
     try:
         sb = get_supabase()
@@ -184,8 +225,20 @@ async def google_callback(
             "connected_at": now_iso,
             "created_at": now_iso,
         }
-        sb.table("google_connections").upsert(row, on_conflict="tenant_id,service").execute()
-        logger.info(f"Google {service} connected for tenant {tenant_id}")
+        if account_email:
+            row["account_email"] = account_email
+        try:
+            sb.table("google_connections").upsert(row, on_conflict="tenant_id,service").execute()
+        except Exception as exc:
+            # Older deployments may not have run migration 031 yet (no
+            # `account_email` column). Retry without it instead of failing
+            # the whole connect flow.
+            if account_email and "account_email" in str(exc):
+                row.pop("account_email", None)
+                sb.table("google_connections").upsert(row, on_conflict="tenant_id,service").execute()
+            else:
+                raise
+        logger.info(f"Google {service} connected for tenant {tenant_id} ({account_email or 'email unknown'})")
     except Exception as exc:
         logger.error(f"Failed to store Google tokens: {exc}")
         return RedirectResponse(url=_append_query(return_url, {"google_error": "storage_failed"}))
@@ -219,23 +272,38 @@ async def google_disconnect(
 
 @router.get("/status")
 async def google_status(tenant_id: str = Query("default")):
-    """Return connection status for each Google service."""
+    """Return connection status for each Google service.
+
+    Includes the connected Google account's email when available so the
+    dashboard can show "Connected as alice@example.com — switch account".
+    """
     status = {svc: {"connected": False} for svc in VALID_SERVICES}
 
     try:
         sb = get_supabase()
-        result = (
-            sb.table("google_connections")
-            .select("service, connected_at")
-            .eq("tenant_id", tenant_id)
-            .execute()
-        )
+        # Try the new column first; fall back to the older shape if migration
+        # 031 hasn't been applied to this environment yet.
+        try:
+            result = (
+                sb.table("google_connections")
+                .select("service, connected_at, account_email")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+        except Exception:
+            result = (
+                sb.table("google_connections")
+                .select("service, connected_at")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
         for row in result.data or []:
             svc = row.get("service")
             if svc in status:
                 status[svc] = {
                     "connected": True,
                     "connected_at": row.get("connected_at"),
+                    "account_email": row.get("account_email"),
                 }
     except Exception as exc:
         logger.error(f"google_status error: {exc}")
