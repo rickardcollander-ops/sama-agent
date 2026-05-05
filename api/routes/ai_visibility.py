@@ -25,14 +25,14 @@ class GapUpdateRequest(BaseModel):
     status: str  # open | in_progress | resolved
 
 
-# ── Status ─────────────────────────────────────────────────────────────────────
+# ── Status ───────────────────────────────────────────────────────────────────────────
 
 @router.get("/status")
 async def get_status():
     return {"agent": "ai_visibility", "status": "operational"}
 
 
-# ── Summary ────────────────────────────────────────────────────────────────────
+# ── Summary ──────────────────────────────────────────────────────────────────────────
 
 @router.get("/summary")
 async def get_summary(request: Request):
@@ -43,7 +43,7 @@ async def get_summary(request: Request):
     return ai_visibility_agent.get_summary()
 
 
-# ── Checks ─────────────────────────────────────────────────────────────────────
+# ── Checks ───────────────────────────────────────────────────────────────────────────
 
 @router.get("/checks")
 async def get_checks(request: Request, limit: int = 50):
@@ -61,7 +61,7 @@ async def get_checks(request: Request, limit: int = 50):
         return {"checks": []}
 
 
-# ── Gaps ───────────────────────────────────────────────────────────────────────
+# ── Gaps ──────────────────────────────────────────────────────────────────────────────
 
 @router.get("/gaps")
 async def get_gaps():
@@ -86,7 +86,7 @@ async def get_gaps():
         return {"gaps": []}
 
 
-# ── Run check ──────────────────────────────────────────────────────────────────
+# ── Run check ─────────────────────────────────────────────────────────────────────────
 
 def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: Optional[str] = None) -> None:
     """Update the agent_runs row when the monitoring thread finishes.
@@ -112,7 +112,11 @@ def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: 
 def _run_check_thread(agent: AIVisibilityAgent, label: str, run_id: Optional[str]):
     try:
         logger.info(f"AI Visibility monitoring thread started for {label} (run_id={run_id})")
-        result = asyncio.run(agent.run_monitoring())
+        # Pass run_id so run_monitoring writes per-prompt progress to
+        # agent_runs.summary as it goes — the dashboard banner reads that
+        # field and shows live "X/N prompts checked" instead of a static
+        # spinner.
+        result = asyncio.run(agent.run_monitoring(run_id_for_progress=run_id))
         logger.info(f"AI Visibility monitoring done for {label}: {result}")
         if isinstance(result, dict):
             checks = result.get("checks_run", 0)
@@ -178,7 +182,7 @@ async def run_check(request: Request):
     }
 
 
-# ── Update gap ─────────────────────────────────────────────────────────────────
+# ── Update gap ─────────────────────────────────────────────────────────────────────────
 
 @router.post("/gaps/update")
 async def update_gap(req: GapUpdateRequest):
@@ -194,7 +198,7 @@ async def update_gap(req: GapUpdateRequest):
         return {"error": str(e)}
 
 
-# ── Clear data ─────────────────────────────────────────────────────────────────
+# ── Clear data ─────────────────────────────────────────────────────────────────────────
 
 @router.post("/clear")
 async def clear_data():
@@ -209,7 +213,7 @@ async def clear_data():
         return {"error": str(e)}
 
 
-# ── Debug: single sync test ────────────────────────────────────────────────────
+# ── Debug: single sync test ───────────────────────────────────────────────────────────────────
 
 @router.get("/test")
 async def test_single():
@@ -245,7 +249,7 @@ async def test_single():
         return {"ok": False, "error": str(e), "error_type": type(e).__name__}
 
 
-# ── Strategic Analysis ─────────────────────────────────────────────────────────
+# ── Strategic Analysis ──────────────────────────────────────────────────────────────────────
 
 @router.post("/strategic-analysis")
 async def strategic_analysis():
@@ -254,7 +258,7 @@ async def strategic_analysis():
     return result
 
 
-# ── GEO Recommendations ────────────────────────────────────────────────────────
+# ── GEO Recommendations ───────────────────────────────────────────────────────────────────
 
 @router.post("/recommendations")
 async def generate_recommendations():
