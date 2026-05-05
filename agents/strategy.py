@@ -356,17 +356,36 @@ domain_strategies and roadmap — never objects keyed by domain or horizon."""
             "contributing_agents": enabled,
             "status": "active",
         }
+        # Insert FIRST, archive previous actives only after insert succeeds.
+        # Doing it in the other order — and silently swallowing insert
+        # errors — left the tenant with no active strategy at all when the
+        # insert failed (e.g. RLS, schema mismatch). The dashboard then
+        # showed "Ingen strategi än" right after a "successful" run.
         try:
-            # Archive previous active strategy so only the latest is "active".
-            sb.table("marketing_strategies").update({"status": "archived"}).eq(
-                "tenant_id", self.tenant_id
-            ).eq("status", "active").execute()
             ins = sb.table("marketing_strategies").insert(record).execute()
-            if ins.data:
-                return ins.data[0]
         except Exception as e:
-            logger.warning(f"[strategy] could not persist strategy: {e}")
-        return record
+            logger.error(f"[strategy] insert failed: {e}", exc_info=True)
+            return {"error": f"insert failed: {e}"}
+        if not ins.data:
+            logger.error("[strategy] insert returned no row")
+            return {"error": "insert returned no row"}
+        new_row = ins.data[0]
+        new_id = new_row.get("id")
+        try:
+            archive_q = (
+                sb.table("marketing_strategies")
+                .update({"status": "archived"})
+                .eq("tenant_id", self.tenant_id)
+                .eq("status", "active")
+            )
+            if new_id:
+                archive_q = archive_q.neq("id", new_id)
+            archive_q.execute()
+        except Exception as e:
+            # Non-fatal: the new row is saved; cleanup of older actives can
+            # happen on the next run.
+            logger.warning(f"[strategy] could not archive previous actives: {e}")
+        return new_row
 
     async def get_current(self) -> Optional[Dict[str, Any]]:
         sb = get_supabase()
