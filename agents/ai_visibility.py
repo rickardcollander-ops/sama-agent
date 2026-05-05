@@ -22,10 +22,29 @@ from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
 
+# Per-LLM-call deadlines. wait_for cancels our coroutine when exceeded; the
+# Anthropic SDK's own timeout/retries (set on the client) bound how long the
+# underlying request thread keeps running after that.
+CLAUDE_CALL_TIMEOUT_S = 60.0          # standard monitoring call (max_tokens=800)
+CLAUDE_ANALYSIS_TIMEOUT_S = 120.0     # strategic analysis (max_tokens=3000)
+ANTHROPIC_REQUEST_TIMEOUT_S = 45.0    # individual HTTP request inside the SDK
+ANTHROPIC_MAX_RETRIES = 2
+
+
+def _build_anthropic_client(api_key: Optional[str]) -> Optional[Anthropic]:
+    if not api_key:
+        return None
+    return Anthropic(
+        api_key=api_key,
+        timeout=ANTHROPIC_REQUEST_TIMEOUT_S,
+        max_retries=ANTHROPIC_MAX_RETRIES,
+    )
+
+
 # Module-level fallback client used by legacy callers that still touch the
 # default `ai_visibility_agent` singleton. Per-tenant runs use `self.client`
 # constructed in __init__ from tenant_config.
-client = Anthropic(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
+client = _build_anthropic_client(settings.ANTHROPIC_API_KEY)
 
 # ── AI Engine personas ─────────────────────────────────────────────────────────
 # Each engine gets a different system prompt to simulate its characteristic style.
@@ -121,7 +140,7 @@ class AIVisibilityAgent:
             if tenant_config and tenant_config.anthropic_api_key
             else settings.ANTHROPIC_API_KEY
         )
-        self.client = Anthropic(api_key=api_key) if api_key else None
+        self.client = _build_anthropic_client(api_key)
 
     async def run_cycle(self) -> str:
         """Standard cycle entry point used by the trigger endpoint and scheduler."""
@@ -170,16 +189,29 @@ class AIVisibilityAgent:
             return ""
 
     async def _query_engine_via_claude(self, prompt: str, engine_name: str, engine_config: Dict) -> str:
-        """Simulate an engine response via Claude (used as proxy when direct API access is unavailable)."""
+        """Simulate an engine response via Claude (used as proxy when direct API access is unavailable).
+
+        Wrapped in asyncio.wait_for so a single hung Anthropic call can't keep
+        the cycle alive past its budget. The SDK's own timeout/max_retries
+        bound the still-running thread after we return.
+        """
+        if not self.client:
+            return ""
         try:
-            msg = await asyncio.to_thread(
-                self.client.messages.create,
-                model=settings.CLAUDE_MODEL,
-                max_tokens=800,
-                system=engine_config["system"],
-                messages=[{"role": "user", "content": prompt}],
+            msg = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.messages.create,
+                    model=settings.CLAUDE_MODEL,
+                    max_tokens=800,
+                    system=engine_config["system"],
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=CLAUDE_CALL_TIMEOUT_S,
             )
             return msg.content[0].text
+        except asyncio.TimeoutError:
+            logger.error(f"Claude API timeout (>{CLAUDE_CALL_TIMEOUT_S}s) for engine {engine_name}")
+            return ""
         except Exception as e:
             logger.error(f"Claude API error for engine {engine_name}: {e}")
             return ""
@@ -566,12 +598,21 @@ Be specific to THIS data. No generic GEO advice. Reference actual numbers, engin
 
 Respond ONLY with valid JSON (no markdown fences).
 """
+        if not self.client:
+            return {
+                "analysis": "Anthropic API key not configured.",
+                "verdict": "unknown",
+                "priority_actions": [],
+            }
         try:
-            msg = await asyncio.to_thread(
-                self.client.messages.create,
-                model=settings.CLAUDE_MODEL,
-                max_tokens=3000,
-                messages=[{"role": "user", "content": prompt}],
+            msg = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.messages.create,
+                    model=settings.CLAUDE_MODEL,
+                    max_tokens=3000,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=CLAUDE_ANALYSIS_TIMEOUT_S,
             )
             text = msg.content[0].text.strip()
             # Strip markdown fences if present
@@ -580,6 +621,13 @@ Respond ONLY with valid JSON (no markdown fences).
                 if text.startswith("json"):
                     text = text[4:]
             return json.loads(text.strip())
+        except asyncio.TimeoutError:
+            logger.error(f"generate_strategic_analysis timeout (>{CLAUDE_ANALYSIS_TIMEOUT_S}s)")
+            return {
+                "analysis": "Strategic analysis timed out — please retry.",
+                "verdict": "unknown",
+                "priority_actions": [],
+            }
         except Exception as e:
             logger.error(f"generate_strategic_analysis error: {e}")
             return {
@@ -623,12 +671,17 @@ Respond ONLY as a JSON array with objects having these fields:
 - action_type (create_content/optimize_page/build_reviews/forum_engagement)
 - effort (low/medium/high)
 """
+        if not self.client:
+            return []
         try:
-            msg = await asyncio.to_thread(
-                self.client.messages.create,
-                model=settings.CLAUDE_MODEL,
-                max_tokens=1200,
-                messages=[{"role": "user", "content": prompt}],
+            msg = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.messages.create,
+                    model=settings.CLAUDE_MODEL,
+                    max_tokens=1200,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=CLAUDE_CALL_TIMEOUT_S,
             )
             text = msg.content[0].text.strip()
             if text.startswith("```"):
@@ -636,6 +689,9 @@ Respond ONLY as a JSON array with objects having these fields:
                 if text.startswith("json"):
                     text = text[4:]
             return json.loads(text.strip())
+        except asyncio.TimeoutError:
+            logger.error(f"generate_geo_recommendations timeout (>{CLAUDE_CALL_TIMEOUT_S}s)")
+            return []
         except Exception as e:
             logger.error(f"generate_geo_recommendations error: {e}")
             return []
