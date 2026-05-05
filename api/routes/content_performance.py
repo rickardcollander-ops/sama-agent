@@ -78,19 +78,27 @@ async def piece_performance(piece_id: str, request: Request) -> Dict[str, Any]:
     keywords = _piece_keywords(piece)
 
     # ── SEO performance ────────────────────────────────────────────────────
+    # The seo_keywords table stores values in `current_*` columns; we
+    # normalise to the names the dashboard renders.
     seo: Dict[str, Any] = {"keywords": []}
     try:
         for kw in keywords:
             kw_res = (
                 sb.table("seo_keywords")
-                .select("keyword,position,clicks,impressions,ctr")
+                .select("keyword,current_position,current_clicks,current_impressions,current_ctr")
                 .eq("tenant_id", tenant_id)
                 .ilike("keyword", f"%{kw}%")
                 .limit(5)
                 .execute()
             )
             for row in (kw_res.data or []):
-                seo["keywords"].append(row)
+                seo["keywords"].append({
+                    "keyword": row.get("keyword"),
+                    "position": row.get("current_position"),
+                    "clicks": row.get("current_clicks"),
+                    "impressions": row.get("current_impressions"),
+                    "ctr": row.get("current_ctr"),
+                })
         # Dedupe by keyword
         deduped: List[Dict[str, Any]] = []
         seen: set[str] = set()
@@ -187,7 +195,7 @@ class RefineRequest(BaseModel):
     text: str
     intent: str = "grammar"  # one of REFINE_INTENTS
     target_keyword: Optional[str] = None
-    audience: Optional[str] = None
+    audience: Optional[str] = None  # supplied by the dashboard from user_settings
 
 
 @router.post("/pieces/{piece_id}/refine")

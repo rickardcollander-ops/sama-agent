@@ -456,7 +456,7 @@ Respond ONLY with valid JSON (no markdown fences)."""
                 # SEO position for keywords containing this topic
                 seo = (
                     sb.table("seo_keywords")
-                    .select("keyword,position,clicks,impressions")
+                    .select("keyword,current_position,current_clicks,current_impressions")
                     .eq("tenant_id", self.tenant_id)
                     .ilike("keyword", f"%{topic}%")
                     .limit(20)
@@ -464,11 +464,14 @@ Respond ONLY with valid JSON (no markdown fences)."""
                 )
                 seo_rows = seo.data or []
                 if seo_rows:
-                    positions = [r.get("position") for r in seo_rows if r.get("position") and r["position"] > 0]
+                    positions = [
+                        r.get("current_position") for r in seo_rows
+                        if r.get("current_position") and r["current_position"] > 0
+                    ]
                     entry["seo_keywords"] = len(seo_rows)
                     if positions:
                         entry["seo_avg_position"] = round(sum(positions) / len(positions), 1)
-                    entry["seo_total_clicks"] = sum(r.get("clicks") or 0 for r in seo_rows)
+                    entry["seo_total_clicks"] = sum(r.get("current_clicks") or 0 for r in seo_rows)
             except Exception:
                 pass
 
