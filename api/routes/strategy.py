@@ -120,7 +120,20 @@ def _flatten_strategy_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
     every field at the top level."""
     if not row:
         return None
-    inner = row.get("strategy") if isinstance(row.get("strategy"), dict) else {}
+    raw_inner = row.get("strategy")
+    if isinstance(raw_inner, dict):
+        inner = raw_inner
+    elif isinstance(raw_inner, str):
+        # Some Supabase client paths return JSONB as a string — parse it
+        # rather than dropping every field on the floor.
+        try:
+            import json as _json
+            parsed = _json.loads(raw_inner)
+            inner = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            inner = {}
+    else:
+        inner = {}
     return {
         "id": row.get("id"),
         "generated_at": row.get("generated_at"),
@@ -210,6 +223,17 @@ def _generate_strategy_thread(agent: StrategyAgent, horizon: str, run_id: Option
         result = asyncio.run(agent.generate_strategy(horizon=horizon))
         if isinstance(result, dict) and "error" in result:
             _finalize_run(run_id, "failed", error=str(result["error"]))
+            return
+        # No `id` means the row never made it into the DB even if
+        # generation itself succeeded — surface that as a failed run so
+        # the dashboard doesn't show a "completed" banner over an empty
+        # strategy section.
+        if not isinstance(result, dict) or not result.get("id"):
+            _finalize_run(
+                run_id,
+                "failed",
+                error="Strategin genererades men kunde inte sparas. Kontrollera Supabase-loggarna.",
+            )
             return
         flat = _flatten_strategy_row(result) or {}
         headline = (flat.get("headline") or "Strategy generated")[:200]
