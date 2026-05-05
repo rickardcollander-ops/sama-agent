@@ -25,6 +25,34 @@ logger = logging.getLogger(__name__)
 
 DOMAINS = ["seo", "content", "ads", "social", "reviews", "analytics", "geo"]
 
+# Each domain has one or more sub-agents that write under their own
+# agent_name (e.g. seo_serp, social_linkedin, review_scraper). Filtering
+# agent_actions/agent_reports on just the top-level domain name dropped
+# every sub-agent's activity from the strategy prompt — which is most of
+# the recent activity for tenants that have specialist sub-agents enabled.
+DOMAIN_AGENT_NAMES: Dict[str, List[str]] = {
+    "seo": [
+        "seo",
+        "seo_serp",
+        "seo_indexing",
+        "seo_internal_linking",
+        "seo_schema",
+        "site_audit",
+    ],
+    "content": ["content", "content_advanced", "content_analytics", "brand_voice"],
+    "ads": ["ads", "ads_advanced", "ads_budget_optimizer"],
+    "social": ["social", "social_linkedin", "social_reddit"],
+    "reviews": [
+        "reviews",
+        "review_competitor",
+        "review_prospect_finder",
+        "review_scraper",
+        "review_sla",
+    ],
+    "analytics": ["analytics", "analytics_anomaly"],
+    "geo": ["ai_visibility"],
+}
+
 
 def _flatten_strategy_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
@@ -195,21 +223,29 @@ class StrategyAgent:
         All queries are scoped to ``self.tenant_id`` — without this scoping
         the synthesis prompt would see every tenant's data and produce a
         generic strategy unrelated to this account.
+
+        ``agent_name`` is the top-level domain (``seo``, ``content`` etc.).
+        Activity from sub-agents that store under their own name (e.g.
+        ``seo_serp``, ``social_linkedin``, ``review_scraper``) is fanned in
+        via :data:`DOMAIN_AGENT_NAMES`. Each sub-query is wrapped in its
+        own try/except so a single missing column or table doesn't drop
+        the whole snapshot for the domain.
         """
         sb = get_supabase()
         since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         snapshot: Dict[str, Any] = {"agent": agent_name}
         tid = self.tenant_id
+        agent_names = DOMAIN_AGENT_NAMES.get(agent_name, [agent_name])
 
         try:
             actions = (
                 sb.table("agent_actions")
-                .select("action_type,title,status,priority")
-                .eq("agent_name", agent_name)
+                .select("agent_name,action_type,title,status,priority")
+                .in_("agent_name", agent_names)
                 .eq("tenant_id", tid)
                 .gte("created_at", since)
                 .order("created_at", desc=True)
-                .limit(20)
+                .limit(30)
                 .execute()
             )
             snapshot["recent_actions"] = actions.data or []
@@ -217,53 +253,291 @@ class StrategyAgent:
             snapshot["recent_actions"] = []
 
         try:
-            report = (
+            reports = (
                 sb.table("agent_reports")
-                .select("summary,improvements,generated_at")
-                .eq("agent_name", agent_name)
+                .select("agent_name,summary,improvements,generated_at")
+                .in_("agent_name", agent_names)
                 .eq("tenant_id", tid)
                 .order("generated_at", desc=True)
-                .limit(1)
+                .limit(len(agent_names))
                 .execute()
             )
-            snapshot["latest_report"] = (report.data or [None])[0]
+            # Keep one report per sub-agent so the prompt sees the most
+            # recent state of each specialist instead of only the loudest.
+            seen: set[str] = set()
+            latest: List[Dict[str, Any]] = []
+            for row in reports.data or []:
+                name = row.get("agent_name") or agent_name
+                if name in seen:
+                    continue
+                seen.add(name)
+                latest.append(row)
+            snapshot["latest_reports"] = latest
         except Exception:
-            snapshot["latest_report"] = None
+            snapshot["latest_reports"] = []
 
-        # Domain-specific extras
-        try:
-            if agent_name == "seo":
+        # Domain-specific extras — every domain gets at least one tenant-scoped
+        # data table beyond agent_actions/agent_reports so the synthesis prompt
+        # has something concrete to ground its diagnosis in.
+        if agent_name == "seo":
+            try:
                 kw = (
                     sb.table("seo_keywords")
-                    .select("keyword,search_volume,position")
+                    .select("keyword,search_volume,position,current_position,current_clicks,current_impressions")
                     .eq("tenant_id", tid)
-                    .limit(15)
+                    .limit(20)
                     .execute()
                 )
                 snapshot["top_keywords"] = kw.data or []
-            elif agent_name == "content":
-                cp = (
-                    sb.table("content_pieces")
-                    .select("title,status,platform")
+            except Exception:
+                pass
+            try:
+                audits = (
+                    sb.table("site_audits")
+                    .select("domain,pages_analyzed,overall_score,status,started_at,completed_at")
                     .eq("tenant_id", tid)
-                    .limit(15)
+                    .order("started_at", desc=True)
+                    .limit(3)
                     .execute()
                 )
-                snapshot["recent_content"] = cp.data or []
-            elif agent_name == "geo":
-                checks = (
-                    sb.table("ai_visibility_checks")
-                    .select("ai_engine,mentioned,sentiment")
+                snapshot["recent_site_audits"] = audits.data or []
+            except Exception:
+                pass
+        elif agent_name == "content":
+            try:
+                cp = (
+                    sb.table("content_pieces")
+                    .select("title,status,platform,target_keyword,published_at,created_at")
                     .eq("tenant_id", tid)
                     .order("created_at", desc=True)
                     .limit(20)
                     .execute()
                 )
+                snapshot["recent_content"] = cp.data or []
+            except Exception:
+                pass
+        elif agent_name == "ads":
+            # ad_creatives and ad_platform_credentials are tenant-scoped
+            # (migration 021). Without these the strategy thinks the ads
+            # channel is dormant whenever no agent_actions were logged.
+            try:
+                creatives = (
+                    sb.table("ad_creatives")
+                    .select("platform,format,headline,cta,is_manual,created_at")
+                    .eq("tenant_id", tid)
+                    .order("created_at", desc=True)
+                    .limit(15)
+                    .execute()
+                )
+                snapshot["recent_ad_creatives"] = creatives.data or []
+            except Exception:
+                pass
+            try:
+                creds = (
+                    sb.table("ad_platform_credentials")
+                    .select("platform,is_connected,connected_at")
+                    .eq("tenant_id", tid)
+                    .execute()
+                )
+                snapshot["ad_platforms"] = creds.data or []
+            except Exception:
+                pass
+        elif agent_name == "social":
+            # social_posts is queried with a tenant_id filter; if the
+            # column doesn't exist on this deployment yet, the inner
+            # except falls back to an unfiltered query so the prompt
+            # still sees the recent post stream.
+            posts: List[Dict[str, Any]] = []
+            try:
+                res = (
+                    sb.table("social_posts")
+                    .select("platform,content_type,topic,status,scheduled_for,published_at,created_at")
+                    .eq("tenant_id", tid)
+                    .order("created_at", desc=True)
+                    .limit(20)
+                    .execute()
+                )
+                posts = res.data or []
+            except Exception:
+                try:
+                    res = (
+                        sb.table("social_posts")
+                        .select("platform,content_type,topic,status,scheduled_for,published_at,created_at")
+                        .order("created_at", desc=True)
+                        .limit(20)
+                        .execute()
+                    )
+                    posts = res.data or []
+                except Exception:
+                    posts = []
+            snapshot["recent_social_posts"] = posts
+        elif agent_name == "reviews":
+            reviews_rows: List[Dict[str, Any]] = []
+            try:
+                res = (
+                    sb.table("reviews")
+                    .select("platform,rating,sentiment,responded,created_at")
+                    .eq("tenant_id", tid)
+                    .order("created_at", desc=True)
+                    .limit(30)
+                    .execute()
+                )
+                reviews_rows = res.data or []
+            except Exception:
+                try:
+                    res = (
+                        sb.table("reviews")
+                        .select("platform,rating,sentiment,responded,created_at")
+                        .order("created_at", desc=True)
+                        .limit(30)
+                        .execute()
+                    )
+                    reviews_rows = res.data or []
+                except Exception:
+                    reviews_rows = []
+            snapshot["recent_reviews"] = reviews_rows
+            try:
+                resp = (
+                    sb.table("review_responses")
+                    .select("platform,sentiment,status,created_at,published_at")
+                    .order("created_at", desc=True)
+                    .limit(15)
+                    .execute()
+                )
+                snapshot["recent_review_responses"] = resp.data or []
+            except Exception:
+                pass
+        elif agent_name == "analytics":
+            # daily_metrics is the canonical analytics surface but does
+            # not always carry a tenant_id column; query without it and
+            # let the dashboard layer interpret the rows as global if no
+            # tenant column exists on this deployment.
+            metrics: List[Dict[str, Any]] = []
+            try:
+                res = (
+                    sb.table("daily_metrics")
+                    .select("date,channel,total_sessions,total_conversions,total_revenue,total_ad_spend,avg_position,total_clicks,total_impressions")
+                    .eq("tenant_id", tid)
+                    .gte("date", since[:10])
+                    .order("date", desc=True)
+                    .limit(60)
+                    .execute()
+                )
+                metrics = res.data or []
+            except Exception:
+                try:
+                    res = (
+                        sb.table("daily_metrics")
+                        .select("date,channel,total_sessions,total_conversions,total_revenue,total_ad_spend,avg_position,total_clicks,total_impressions")
+                        .gte("date", since[:10])
+                        .order("date", desc=True)
+                        .limit(60)
+                        .execute()
+                    )
+                    metrics = res.data or []
+                except Exception:
+                    metrics = []
+            snapshot["recent_daily_metrics"] = metrics
+        elif agent_name == "geo":
+            try:
+                checks = (
+                    sb.table("ai_visibility_checks")
+                    .select("ai_engine,mentioned,sentiment,prompt,checked_at,created_at")
+                    .eq("tenant_id", tid)
+                    .order("created_at", desc=True)
+                    .limit(30)
+                    .execute()
+                )
                 snapshot["recent_geo_checks"] = checks.data or []
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         return snapshot
+
+    async def _gather_tenant_context(self) -> Dict[str, Any]:
+        """Pull the tenant-wide context that anchors the strategy.
+
+        Without this the prompt only sees per-channel activity and ends up
+        recommending generic plays — brand voice, ICP, the operator's
+        approval queue, and the latest unified analysis run never reach the
+        synthesis step. Each lookup is best-effort so a single missing
+        table doesn't blank out the rest of the context.
+        """
+        sb = get_supabase()
+        tid = self.tenant_id
+        ctx: Dict[str, Any] = {}
+
+        cfg = self.tenant_config
+        if cfg is not None:
+            try:
+                ctx["brand"] = {
+                    "name": getattr(cfg, "brand_name", None),
+                    "domain": getattr(cfg, "domain", None),
+                    "voice_tone": getattr(cfg, "brand_voice_tone", "") or "",
+                    "messaging_pillars": getattr(cfg, "messaging_pillars", []) or [],
+                    "proof_points": getattr(cfg, "proof_points", {}) or {},
+                    "competitors": getattr(cfg, "competitors", []) or [],
+                    "geo_queries": getattr(cfg, "geo_queries", []) or [],
+                }
+            except Exception:
+                pass
+
+        try:
+            icp = (
+                sb.table("gtm_icp_analyses")
+                .select("analysis,created_at")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            ctx["latest_icp"] = (icp.data or [None])[0]
+        except Exception:
+            ctx["latest_icp"] = None
+
+        try:
+            sig = (
+                sb.table("gtm_signals")
+                .select("signals,created_at")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            ctx["latest_gtm_signals"] = (sig.data or [None])[0]
+        except Exception:
+            ctx["latest_gtm_signals"] = None
+
+        try:
+            approvals = (
+                sb.table("pending_approvals")
+                .select("kind,channel,status")
+                .eq("tenant_id", tid)
+                .limit(200)
+                .execute()
+            )
+            buckets: Dict[str, Dict[str, int]] = {}
+            for row in approvals.data or []:
+                kind = row.get("kind") or "unknown"
+                status = row.get("status") or "unknown"
+                buckets.setdefault(kind, {})
+                buckets[kind][status] = buckets[kind].get(status, 0) + 1
+            ctx["pending_approvals_by_kind"] = buckets
+        except Exception:
+            ctx["pending_approvals_by_kind"] = {}
+
+        try:
+            run = (
+                sb.table("analysis_runs")
+                .select("brand_name,domain,status,query_count,platform_count,started_at,completed_at")
+                .eq("tenant_id", tid)
+                .order("started_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            ctx["latest_analysis_run"] = (run.data or [None])[0]
+        except Exception:
+            ctx["latest_analysis_run"] = None
+
+        return ctx
 
     # ── Strategy synthesis ───────────────────────────────────────────────────
 
@@ -273,10 +547,16 @@ class StrategyAgent:
             return {"error": "ANTHROPIC_API_KEY not configured"}
 
         enabled = await self._enabled_agents()
-        snapshots = await asyncio.gather(
-            *(self._gather_domain_snapshot(d) for d in enabled)
+        # Run domain snapshots and the tenant-wide context lookup
+        # concurrently — they hit different tables and each one is
+        # a few round-trips against Supabase.
+        snapshot_results, tenant_ctx = await asyncio.gather(
+            asyncio.gather(*(self._gather_domain_snapshot(d) for d in enabled)),
+            self._gather_tenant_context(),
         )
+        snapshots = list(snapshot_results)
         domain_blob = json.dumps(snapshots, ensure_ascii=False, default=str)[:14000]
+        tenant_blob = json.dumps(tenant_ctx, ensure_ascii=False, default=str)[:6000]
 
         brand_name = (
             getattr(self.tenant_config, "brand_name", None) if self.tenant_config else None
@@ -304,7 +584,14 @@ class StrategyAgent:
 Planeringshorisont: {horizon}
 Aktiva marknadskanaler (endast dessa ska beaktas): {', '.join(enabled)}
 
-Aktivitet och rapporter per kanal (senaste 30 dagarna), endast för detta varumärke:
+Tenant-övergripande kontext (varumärkesröst, ICP, GTM-signaler, väntande
+godkännanden, senaste analyskörning) — använd detta för att förankra
+strategin i varumärkets identitet och pågående arbete:
+{tenant_blob}
+
+Aktivitet och rapporter per kanal (senaste 30 dagarna, inklusive
+specialist-sub-agenter som t.ex. seo_serp, social_linkedin, review_scraper),
+endast för detta varumärke:
 {domain_blob}
 
 Skapa en sammanhållen marknadsstrategi som JSON med EXAKT dessa nycklar.
