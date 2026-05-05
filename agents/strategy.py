@@ -144,6 +144,10 @@ class StrategyAgent:
             "No generic advice."
         )
 
+        # Shapes here mirror the dashboard's TypeScript interface
+        # (app/c/strategy/page.tsx) — domain_strategies and roadmap MUST be
+        # arrays so the UI can iterate with .map(); object-keyed shapes break
+        # the rendering completely.
         user_prompt = f"""Brand: {brand_name}
 Planning horizon: {horizon}
 Active marketing domains (only consider these): {', '.join(enabled)}
@@ -156,15 +160,19 @@ Produce a unified marketing strategy as JSON with EXACTLY these keys:
 1. "headline" (string, max 18 words) — bold one-line summary of the plan.
 2. "verdict" (string) — one of "critical", "weak", "improving", "strong".
 3. "executive_summary" (string, 3-5 sentences) — what's working, what isn't, where to push.
-4. "domain_strategies" (object) — one key per active domain ({', '.join(enabled)}). Each value:
-     {{"diagnosis": "...", "objective": "...", "key_actions": ["...","..."], "kpi": "..."}}
-5. "cross_channel_priorities" (array of 3-5 objects) — initiatives that span multiple domains:
-     {{"title": "...", "domains": ["seo","content",...], "rationale": "...", "impact": "high|medium|low"}}
-6. "roadmap" (object) — keys "30_days", "60_days", "90_days", each an array of 2-4 milestone strings.
+4. "domain_strategies" (ARRAY, one entry per active domain in {enabled!r}):
+     [{{"domain": "seo", "diagnosis": "...", "goal": "...", "key_actions": ["...","..."], "kpi": "..."}}, ...]
+5. "cross_channel_priorities" (array of 3-5 objects) — initiatives spanning multiple domains:
+     [{{"title": "...", "domains": ["seo","content"], "description": "...", "impact": "high|medium|low"}}, ...]
+6. "roadmap" (ARRAY of exactly 3 milestone objects, in order 30d → 60d → 90d):
+     [{{"horizon": "30d", "title": "...", "description": "...", "items": ["...","..."]}},
+      {{"horizon": "60d", "title": "...", "description": "...", "items": ["...","..."]}},
+      {{"horizon": "90d", "title": "...", "description": "...", "items": ["...","..."]}}]
 7. "risks" (array of 2-4 strings) — what could derail the plan.
-8. "north_star_metric" (string) — the single metric to optimise.
+8. "north_star_metric" (object) — {{"name": "...", "target": "...", "current": "..."}}.
 
-Respond ONLY with valid JSON (no markdown fences)."""
+Respond ONLY with valid JSON (no markdown fences). Use ARRAYS for
+domain_strategies and roadmap — never objects keyed by domain or horizon."""
 
         def _call():
             return self.client.messages.create(
