@@ -190,16 +190,23 @@ class StrategyAgent:
             return list(DOMAINS)
 
     async def _gather_domain_snapshot(self, agent_name: str) -> Dict[str, Any]:
-        """Pull a small snapshot of recent activity for *agent_name*."""
+        """Pull a small snapshot of recent activity for *agent_name*.
+
+        All queries are scoped to ``self.tenant_id`` — without this scoping
+        the synthesis prompt would see every tenant's data and produce a
+        generic strategy unrelated to this account.
+        """
         sb = get_supabase()
         since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         snapshot: Dict[str, Any] = {"agent": agent_name}
+        tid = self.tenant_id
 
         try:
             actions = (
                 sb.table("agent_actions")
                 .select("action_type,title,status,priority")
                 .eq("agent_name", agent_name)
+                .eq("tenant_id", tid)
                 .gte("created_at", since)
                 .order("created_at", desc=True)
                 .limit(20)
@@ -214,6 +221,7 @@ class StrategyAgent:
                 sb.table("agent_reports")
                 .select("summary,improvements,generated_at")
                 .eq("agent_name", agent_name)
+                .eq("tenant_id", tid)
                 .order("generated_at", desc=True)
                 .limit(1)
                 .execute()
@@ -225,15 +233,28 @@ class StrategyAgent:
         # Domain-specific extras
         try:
             if agent_name == "seo":
-                kw = sb.table("seo_keywords").select("keyword,search_volume,position").limit(15).execute()
+                kw = (
+                    sb.table("seo_keywords")
+                    .select("keyword,search_volume,position")
+                    .eq("tenant_id", tid)
+                    .limit(15)
+                    .execute()
+                )
                 snapshot["top_keywords"] = kw.data or []
             elif agent_name == "content":
-                cp = sb.table("content_pieces").select("title,status,platform").limit(15).execute()
+                cp = (
+                    sb.table("content_pieces")
+                    .select("title,status,platform")
+                    .eq("tenant_id", tid)
+                    .limit(15)
+                    .execute()
+                )
                 snapshot["recent_content"] = cp.data or []
             elif agent_name == "geo":
                 checks = (
                     sb.table("ai_visibility_checks")
                     .select("ai_engine,mentioned,sentiment")
+                    .eq("tenant_id", tid)
                     .order("created_at", desc=True)
                     .limit(20)
                     .execute()
@@ -262,41 +283,52 @@ class StrategyAgent:
         ) or "the brand"
 
         system = (
-            "You are the Chief Marketing Strategist for an autonomous marketing system. "
-            "You synthesise raw activity from specialist agents into a single, coherent "
-            "cross-channel marketing strategy. Be specific, prioritised and data-driven. "
-            "No generic advice."
+            "Du är marknadsstrateg för ett autonomt marknadsföringssystem. "
+            "Du syntetiserar rådata från specialist-agenter till en enda, "
+            "sammanhängande marknadsstrategi över alla kanaler. "
+            "Skriv konkret, prioriterat och datadrivet — inga generella råd. "
+            "All text ska vara på svenska och i ett språk som är lätt att förstå "
+            "för en icke-teknisk läsare. Undvik buzzwords och engelska facktermer "
+            "när det går — säg t.ex. 'sökord' istället för 'keyword', 'omnämnanden' "
+            "istället för 'mentions'. Basera ALLT du skriver på data som hör till "
+            "detta specifika varumärke nedan; uppfinn inte information som inte "
+            "finns i indatan."
         )
 
         # Shapes here mirror the dashboard's TypeScript interface
         # (app/c/strategy/page.tsx) — domain_strategies and roadmap MUST be
         # arrays so the UI can iterate with .map(); object-keyed shapes break
-        # the rendering completely.
-        user_prompt = f"""Brand: {brand_name}
-Planning horizon: {horizon}
-Active marketing domains (only consider these): {', '.join(enabled)}
+        # the rendering completely. Field names (keys) stay in English because
+        # the UI reads them; field VALUES must be in Swedish.
+        user_prompt = f"""Varumärke: {brand_name}
+Planeringshorisont: {horizon}
+Aktiva marknadskanaler (endast dessa ska beaktas): {', '.join(enabled)}
 
-Per-domain activity & reports (last 30 days):
+Aktivitet och rapporter per kanal (senaste 30 dagarna), endast för detta varumärke:
 {domain_blob}
 
-Produce a unified marketing strategy as JSON with EXACTLY these keys:
+Skapa en sammanhållen marknadsstrategi som JSON med EXAKT dessa nycklar.
+Alla VÄRDEN ska vara på svenska och skrivna i ett enkelt, konkret språk.
+Nycklarna ska däremot stå exakt som nedan (på engelska).
 
-1. "headline" (string, max 18 words) — bold one-line summary of the plan.
-2. "verdict" (string) — one of "critical", "weak", "improving", "strong".
-3. "executive_summary" (string, 3-5 sentences) — what's working, what isn't, where to push.
-4. "domain_strategies" (ARRAY, one entry per active domain in {enabled!r}):
+1. "headline" (sträng, max 18 ord) — en fet enradig sammanfattning av planen.
+2. "verdict" (sträng) — en av "critical", "weak", "improving", "strong".
+3. "executive_summary" (sträng, 3–5 meningar) — vad som fungerar, vad som inte gör det, och var ni ska trycka på.
+4. "domain_strategies" (ARRAY, ett objekt per aktiv kanal i {enabled!r}):
      [{{"domain": "seo", "diagnosis": "...", "goal": "...", "key_actions": ["...","..."], "kpi": "..."}}, ...]
-5. "cross_channel_priorities" (array of 3-5 objects) — initiatives spanning multiple domains:
+5. "cross_channel_priorities" (array med 3–5 objekt) — initiativ som spänner över flera kanaler:
      [{{"title": "...", "domains": ["seo","content"], "description": "...", "impact": "high|medium|low"}}, ...]
-6. "roadmap" (ARRAY of exactly 3 milestone objects, in order 30d → 60d → 90d):
+6. "roadmap" (ARRAY med exakt 3 milstolpar, i ordningen 30d → 60d → 90d):
      [{{"horizon": "30d", "title": "...", "description": "...", "items": ["...","..."]}},
       {{"horizon": "60d", "title": "...", "description": "...", "items": ["...","..."]}},
       {{"horizon": "90d", "title": "...", "description": "...", "items": ["...","..."]}}]
-7. "risks" (array of 2-4 strings) — what could derail the plan.
-8. "north_star_metric" (object) — {{"name": "...", "target": "...", "current": "..."}}.
+7. "risks" (array med 2–4 strängar) — det som kan välta planen.
+8. "north_star_metric" (objekt) — {{"name": "...", "target": "...", "current": "..."}}.
 
-Respond ONLY with valid JSON (no markdown fences). Use ARRAYS for
-domain_strategies and roadmap — never objects keyed by domain or horizon."""
+Svara ENDAST med giltig JSON (inga markdown-fences). Använd ARRAYS för
+domain_strategies och roadmap — aldrig objekt med domän- eller tidsnycklar.
+Om indatan ovan är tom eller mycket tunn för en kanal: säg det rakt ut
+i diagnosen istället för att hitta på siffror."""
 
         def _call():
             return self.client.messages.create(
