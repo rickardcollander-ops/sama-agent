@@ -487,7 +487,7 @@ async def reap_orphaned_runs_on_startup() -> int:
             .update({
                 "status": "failed",
                 "completed_at": now_iso,
-                "error": "Run interrupted by service restart",
+                "error": "Service was restarted before the run finished — please run the check again.",
             })
             .eq("status", "running")
             .execute()
