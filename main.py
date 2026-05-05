@@ -52,6 +52,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.info("✅ Supabase connected")
     except Exception as e:
         logger.warning(f"⚠️ Supabase not configured: {e}")
+
+    # Reap any agent_runs orphaned by the previous container exit. A daemon
+    # thread or task that was mid-cycle when the previous process died is
+    # gone the moment we boot, so leaving those rows as 'running' just makes
+    # the dashboard wait 15+ min for the watchdog to reap them.
+    try:
+        from api.routes.tenant_activation import reap_orphaned_runs_on_startup
+        reaped = await reap_orphaned_runs_on_startup()
+        if reaped:
+            logger.info(f"✅ Reaped {reaped} orphaned agent_runs on startup")
+    except Exception as e:
+        logger.warning(f"⚠️ Startup reap failed: {e}")
     
     # Initialize event bus (Redis with local fallback)
     event_bus = None

@@ -32,9 +32,19 @@ DEFAULT_SCHEDULES = {
     "strategy": "weekly",
 }
 
-# A single agent cycle should never legitimately take longer than this.
-# Anything past it is treated as orphaned (process restart, deadlock, etc.).
-STALE_RUN_AFTER = timedelta(minutes=15)
+# Per-agent maximum durations. Anything past this is treated as orphaned
+# (process restart, deadlock, hung upstream call). GEO does ~80 sequential
+# LLM calls per cycle so the default 15 min is unrealistically tight.
+STALE_RUN_AFTER_DEFAULT = timedelta(minutes=15)
+STALE_RUN_AFTER_BY_AGENT = {
+    "geo": timedelta(minutes=30),
+    "ai_visibility": timedelta(minutes=30),
+    "strategy": timedelta(minutes=20),
+}
+
+
+def _stale_after(agent_name: Optional[str]) -> timedelta:
+    return STALE_RUN_AFTER_BY_AGENT.get(agent_name or "", STALE_RUN_AFTER_DEFAULT)
 
 
 # ── POST /activate — Initial setup for a new tenant ─────────────────────────
@@ -414,29 +424,78 @@ async def get_agent_run(run_id: str, request: Request):
 
 async def reap_stale_runs() -> int:
     """
-    Mark agent_runs rows that have been "running" for longer than STALE_RUN_AFTER
-    as failed. Called on startup and periodically by the scheduler so a process
-    crash mid-cycle doesn't leave the dashboard stuck on a spinner.
+    Mark agent_runs rows that have been "running" longer than the per-agent
+    stale timeout as failed. Called periodically by the scheduler so a
+    process crash mid-cycle doesn't leave the dashboard stuck on a spinner.
     Returns the number of rows updated.
     """
     sb = get_supabase()
-    cutoff = (datetime.now(timezone.utc) - STALE_RUN_AFTER).isoformat()
+    now = datetime.now(timezone.utc)
+    try:
+        result = (
+            sb.table("agent_runs")
+            .select("id, agent_name, started_at")
+            .eq("status", "running")
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(f"reap_stale_runs query failed: {e}")
+        return 0
+
+    updated = 0
+    for row in rows:
+        started_raw = row.get("started_at")
+        if not started_raw:
+            continue
+        try:
+            started = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if now - started < _stale_after(row.get("agent_name")):
+            continue
+        try:
+            sb.table("agent_runs").update({
+                "status": "failed",
+                "completed_at": now.isoformat(),
+                "error": "Run did not complete within timeout",
+            }).eq("id", row["id"]).execute()
+            updated += 1
+        except Exception as e:
+            logger.warning(f"reap_stale_runs update failed for {row.get('id')}: {e}")
+
+    if updated:
+        logger.warning(f"Watchdog marked {updated} stale agent_runs as failed")
+    return updated
+
+
+async def reap_orphaned_runs_on_startup() -> int:
+    """
+    Mark every "running" row as failed when the service starts. A daemon
+    thread or asyncio task that was mid-cycle when the previous container
+    exited is dead the moment a new container starts, so leaving those rows
+    as "running" just makes the dashboard wait for the watchdog to catch up.
+
+    Must run inside the lifespan startup, before the API accepts requests,
+    so it can never race with a legitimate in-flight run.
+    """
+    sb = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
     try:
         result = (
             sb.table("agent_runs")
             .update({
                 "status": "failed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "error": "Run did not complete within timeout",
+                "completed_at": now_iso,
+                "error": "Run interrupted by service restart",
             })
             .eq("status", "running")
-            .lt("started_at", cutoff)
             .execute()
         )
         n = len(result.data or [])
         if n:
-            logger.warning(f"Watchdog marked {n} stale agent_runs as failed")
+            logger.warning(f"Reaped {n} orphaned agent_runs on startup")
         return n
     except Exception as e:
-        logger.warning(f"reap_stale_runs failed: {e}")
+        logger.warning(f"reap_orphaned_runs_on_startup failed: {e}")
         return 0
