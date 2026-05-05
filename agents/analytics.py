@@ -100,7 +100,9 @@ class AnalyticsAgent:
     async def run_cycle(self) -> str:
         """Run an analytics cycle: collect daily metrics."""
         result = await self.collect_daily_metrics()
-        channels = len(result.get("channels", {}))
+        channels = result.get("total_channels")
+        if channels is None:
+            channels = len(result.get("channels_upserted") or [])
         return f"Collected metrics across {channels} channels"
 
     # ── Data fetchers (one per channel) ───────────────────────────────
