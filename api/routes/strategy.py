@@ -4,16 +4,20 @@ Strategy API — exposes the cross-channel StrategyAgent.
 Endpoints:
 - GET  /api/strategy/current   — latest active strategy for the tenant
 - GET  /api/strategy/history   — recent strategies (metadata only)
-- POST /api/strategy/generate  — synthesise a new strategy now
+- POST /api/strategy/generate  — kick off generation in background, return run_id
 """
 
+import asyncio
 import logging
+import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from agents.strategy import StrategyAgent
+from shared.database import get_supabase
 from shared.tenant import get_tenant_config
 
 router = APIRouter()
@@ -130,13 +134,80 @@ async def get_strategy_history(request: Request, limit: int = 10):
     return {"strategies": await agent.list_history(limit=limit)}
 
 
+def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: Optional[str] = None) -> None:
+    if not run_id:
+        return
+    try:
+        sb = get_supabase()
+        update: Dict[str, Any] = {
+            "status": status,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+        }
+        if error:
+            update["error"] = error[:500]
+        sb.table("agent_runs").update(update).eq("id", run_id).execute()
+    except Exception:
+        logger.warning(f"Could not update agent_runs {run_id}", exc_info=True)
+
+
+def _generate_strategy_thread(agent: StrategyAgent, horizon: str, run_id: Optional[str]) -> None:
+    try:
+        result = asyncio.run(agent.generate_strategy(horizon=horizon))
+        if isinstance(result, dict) and "error" in result:
+            _finalize_run(run_id, "failed", error=str(result["error"]))
+            return
+        flat = _flatten_strategy_row(result) or {}
+        headline = (flat.get("headline") or "Strategy generated")[:200]
+        _finalize_run(run_id, "completed", summary=headline)
+    except Exception as e:
+        logger.error(f"[strategy] background generation failed: {e}", exc_info=True)
+        _finalize_run(run_id, "failed", error=str(e))
+
+
 @router.post("/generate")
 async def generate_strategy(payload: GenerateRequest, request: Request):
-    agent = await _agent_for_request(request)
+    """Kick off strategy generation in a background thread.
+
+    Returns immediately with a run_id so the dashboard can poll
+    /api/tenant/agent-runs/{run_id} for completion. The Claude call
+    routinely takes 60-90s, which exceeds proxy/fetch timeouts when run
+    inline — keeping it inline made the UI silently revert after a long
+    wait with no user feedback.
+    """
     horizon = payload.horizon or "quarterly"
     if horizon not in {"monthly", "quarterly", "annual"}:
         raise HTTPException(status_code=400, detail="horizon must be monthly|quarterly|annual")
-    result = await agent.generate_strategy(horizon=horizon)
-    if "error" in result:
-        raise HTTPException(status_code=502, detail=result["error"])
-    return {"strategy": _flatten_strategy_row(result)}
+
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    agent = await _agent_for_request(request)
+
+    run_id: Optional[str] = None
+    if tenant_id and tenant_id != "default":
+        try:
+            sb = get_supabase()
+            insert = sb.table("agent_runs").insert({
+                "tenant_id": tenant_id,
+                "agent_name": "strategy",
+                "status": "running",
+            }).execute()
+            if insert.data:
+                run_id = insert.data[0].get("id")
+        except Exception:
+            logger.warning("Could not insert agent_runs row for strategy generation", exc_info=True)
+
+    t = threading.Thread(
+        target=_generate_strategy_thread,
+        args=(agent, horizon, run_id),
+        daemon=True,
+        name=f"strategy-gen-{tenant_id}",
+    )
+    t.start()
+    logger.info(f"[strategy] background generation started (tenant={tenant_id}, run_id={run_id}, horizon={horizon})")
+
+    return {
+        "status": "started",
+        "run_id": run_id,
+        "horizon": horizon,
+        "message": "Strategy generation started. Poll /api/tenant/agent-runs/{run_id} for completion.",
+    }
