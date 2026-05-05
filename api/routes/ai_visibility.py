@@ -6,6 +6,8 @@ GEO (Generative Engine Optimization) monitoring endpoints
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -109,13 +111,45 @@ async def get_gaps():
 
 # ── Run check ──────────────────────────────────────────────────────────────────
 
-def _run_check_thread(agent: AIVisibilityAgent, label: str):
+def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: Optional[str] = None) -> None:
+    """Update the agent_runs row when the monitoring thread finishes.
+
+    Safe to call without a run_id (no-op) so callers don't have to branch.
+    """
+    if not run_id:
+        return
     try:
-        logger.info(f"AI Visibility monitoring thread started for {label}")
+        sb = get_supabase()
+        update = {
+            "status": status,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+        }
+        if error:
+            update["error"] = error[:500]
+        sb.table("agent_runs").update(update).eq("id", run_id).execute()
+    except Exception:
+        logger.warning(f"Could not update agent_runs {run_id}", exc_info=True)
+
+
+def _run_check_thread(agent: AIVisibilityAgent, label: str, run_id: Optional[str]):
+    try:
+        logger.info(f"AI Visibility monitoring thread started for {label} (run_id={run_id})")
         result = asyncio.run(agent.run_monitoring())
         logger.info(f"AI Visibility monitoring done for {label}: {result}")
+        if isinstance(result, dict):
+            checks = result.get("checks_run", 0)
+            mention_rate = result.get("mention_rate")
+            if mention_rate is not None:
+                summary_text = f"{checks} checks, {round(mention_rate * 100)}% mention rate"
+            else:
+                summary_text = f"{checks} checks completed"
+        else:
+            summary_text = "GEO check completed"
+        _finalize_run(run_id, "completed", summary=summary_text)
     except Exception as e:
         logger.error(f"AI Visibility monitoring thread error for {label}: {e}", exc_info=True)
+        _finalize_run(run_id, "failed", error=str(e))
 
 
 @router.post("/check")
@@ -124,6 +158,11 @@ async def run_check(request: Request):
 
     For tenant requests, build a per-tenant agent so the run uses the
     user's saved geo_queries, brand name and competitors.
+
+    An agent_runs row is inserted up front so the dashboard's
+    useActiveRuns hook can match the trigger to a backend run via the
+    returned run_id; the background thread updates the same row when
+    the monitoring finishes.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
     if tenant_id and tenant_id != "default":
@@ -136,10 +175,30 @@ async def run_check(request: Request):
         agent = ai_visibility_agent
         label = "default"
 
-    t = threading.Thread(target=_run_check_thread, args=(agent, label), daemon=True)
+    # Record the run so the dashboard can poll for status. Persisted only for
+    # real tenants — anonymous/default runs don't need to show up in history.
+    run_id: Optional[str] = None
+    if tenant_id and tenant_id != "default":
+        try:
+            sb = get_supabase()
+            insert = sb.table("agent_runs").insert({
+                "tenant_id": tenant_id,
+                "agent_name": "ai_visibility",
+                "status": "running",
+            }).execute()
+            if insert.data:
+                run_id = insert.data[0].get("id")
+        except Exception:
+            logger.warning("Could not insert agent_runs row for AI visibility check", exc_info=True)
+
+    t = threading.Thread(target=_run_check_thread, args=(agent, label, run_id), daemon=True)
     t.start()
-    logger.info(f"AI Visibility monitoring thread started: {t.name} ({label})")
-    return {"status": "started", "message": "Monitoring thread started. Results appear as checks complete."}
+    logger.info(f"AI Visibility monitoring thread started: {t.name} ({label}, run_id={run_id})")
+    return {
+        "status": "started",
+        "run_id": run_id,
+        "message": "Monitoring thread started. Results appear as checks complete.",
+    }
 
 
 # ── Update gap ─────────────────────────────────────────────────────────────────
