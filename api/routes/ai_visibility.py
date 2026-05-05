@@ -39,30 +39,7 @@ async def get_summary(request: Request):
     """Mention rate, avg rank, top competitors, trend"""
     tenant_id = getattr(request.state, "tenant_id", "default")
     if tenant_id and tenant_id != "default":
-        # Non-default tenants: return data from DB filtered by tenant
-        try:
-            sb = get_supabase()
-            data = sb.table("ai_visibility_checks").select("*").eq("tenant_id", tenant_id).execute()
-            checks = data.data or []
-            if not checks:
-                return {"mention_rate": 0, "avg_rank": None, "total_checks": 0, "open_gaps": 0,
-                        "top_competitors": [], "trend": "flat", "last_check_at": None, "engine_stats": {}}
-            mentioned = [c for c in checks if c.get("mentioned")]
-            ranks = [c["rank"] for c in mentioned if c.get("rank")]
-            return {
-                "mention_rate": len(mentioned) / len(checks) if checks else 0,
-                "avg_rank": round(sum(ranks) / len(ranks), 1) if ranks else None,
-                "total_checks": len(checks),
-                "open_gaps": 0,
-                "top_competitors": [],
-                "trend": "flat",
-                "last_check_at": checks[0].get("checked_at") if checks else None,
-                "engine_stats": {},
-            }
-        except Exception as e:
-            logger.error(f"get_summary tenant error: {e}")
-            return {"mention_rate": 0, "avg_rank": None, "total_checks": 0, "open_gaps": 0,
-                    "top_competitors": [], "trend": "flat", "last_check_at": None, "engine_stats": {}}
+        return ai_visibility_agent.get_summary(tenant_id=tenant_id)
     return ai_visibility_agent.get_summary()
 
 

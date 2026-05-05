@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
 import httpx
@@ -367,11 +367,16 @@ class AIVisibilityAgent:
             "top_competitors": top_competitors,
         }
 
-    def get_summary(self) -> Dict[str, Any]:
+    def get_summary(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
         sb = get_supabase()
         try:
-            checks = sb.table("ai_visibility_checks").select("*").order("checked_at", desc=True).limit(500).execute().data or []
-            gaps_res = sb.table("ai_visibility_gaps").select("*").eq("status", "open").execute().data or []
+            checks_q = sb.table("ai_visibility_checks").select("*").order("checked_at", desc=True).limit(500)
+            gaps_q = sb.table("ai_visibility_gaps").select("*").eq("status", "open")
+            if tenant_id:
+                checks_q = checks_q.eq("tenant_id", tenant_id)
+                gaps_q = gaps_q.eq("tenant_id", tenant_id)
+            checks = checks_q.execute().data or []
+            gaps_res = gaps_q.execute().data or []
 
             if not checks:
                 return {
