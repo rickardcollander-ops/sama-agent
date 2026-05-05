@@ -110,6 +110,31 @@ async def create_content_piece(request: Request, payload: ContentPieceCreate):
         return {"success": False, "error": str(e)}
 
 
+# ── Get single ───────────────────────────────────────────────────────────────
+
+@router.get("/pieces/{piece_id}")
+async def get_content_piece(piece_id: str, request: Request):
+    """Fetch a single content piece (used by edit/refine flows)."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("content_pieces")
+            .select("*")
+            .eq("id", piece_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return {"piece": None, "error": "not_found"}
+        return {"piece": _ensure_numeric(rows[0])}
+    except Exception as e:
+        logger.error(f"get_content_piece error: {e}")
+        return {"piece": None, "error": str(e)}
+
+
 # ── Update ───────────────────────────────────────────────────────────────────
 
 @router.patch("/pieces/{piece_id}")

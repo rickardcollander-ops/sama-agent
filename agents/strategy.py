@@ -26,6 +26,130 @@ logger = logging.getLogger(__name__)
 DOMAINS = ["seo", "content", "ads", "social", "reviews", "analytics", "geo"]
 
 
+def _flatten_strategy_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Spread the JSONB ``strategy`` payload onto the top-level row so the
+    dashboard can read ``executive_summary``, ``domain_strategies`` etc.
+    directly off the returned object.
+    """
+    if not row:
+        return row
+    payload = row.get("strategy") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    flat = dict(row)
+    for key, value in payload.items():
+        # Don't overwrite columns that are also stored at top level (headline,
+        # verdict, horizon) — the column copy is the source of truth.
+        if key in flat and flat.get(key) is not None:
+            continue
+        flat[key] = value
+    # Normalise roadmap shape: when stored as {"30_days": [...], "60_days": [...]}
+    # we expose it as a list so the frontend RoadmapTimeline can map it directly.
+    if isinstance(flat.get("roadmap"), dict):
+        flat["roadmap"] = _normalise_roadmap_dict(flat["roadmap"])
+    # Normalise domain_strategies shape: dict -> list with "domain" key.
+    if isinstance(flat.get("domain_strategies"), dict):
+        flat["domain_strategies"] = [
+            {"domain": k, **(v if isinstance(v, dict) else {"diagnosis": str(v)})}
+            for k, v in flat["domain_strategies"].items()
+        ]
+    return flat
+
+
+def _normalise_roadmap_dict(roadmap: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert {"30_days": [...]} → [{"horizon": "30d", "items": [...]}, ...]."""
+    mapping = [
+        ("30_days", "30d"),
+        ("60_days", "60d"),
+        ("90_days", "90d"),
+        ("30d", "30d"),
+        ("60d", "60d"),
+        ("90d", "90d"),
+    ]
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for key, horizon in mapping:
+        items = roadmap.get(key)
+        if items is None or horizon in seen:
+            continue
+        seen.add(horizon)
+        if isinstance(items, list):
+            out.append({"horizon": horizon, "items": [str(x) for x in items if x]})
+    # Fall back to any remaining keys we didn't recognise — keep the data
+    # visible rather than losing it.
+    for key, value in roadmap.items():
+        if isinstance(value, list) and not any(o["horizon"] == key for o in out):
+            out.append({"horizon": key, "items": [str(x) for x in value if x]})
+    return out
+
+
+def _extract_strategy_topics(current: Dict[str, Any]) -> List[str]:
+    """Pull a flat list of topics from the latest strategy."""
+    topics: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any):
+        if not isinstance(value, str):
+            return
+        v = value.strip()
+        if 2 <= len(v) <= 80 and v.lower() not in seen:
+            seen.add(v.lower())
+            topics.append(v)
+
+    # Cross-channel priorities titles
+    for p in current.get("cross_channel_priorities") or []:
+        if isinstance(p, dict):
+            add(p.get("title"))
+    # Roadmap items
+    roadmap = current.get("roadmap") or []
+    if isinstance(roadmap, list):
+        for milestone in roadmap:
+            if isinstance(milestone, dict):
+                add(milestone.get("title"))
+                for item in milestone.get("items") or []:
+                    add(item)
+    # Domain strategies key actions
+    ds = current.get("domain_strategies") or []
+    if isinstance(ds, list):
+        for d in ds:
+            if isinstance(d, dict):
+                for a in d.get("key_actions") or []:
+                    add(a)
+    return topics[:20]
+
+
+def _classify_topic_outcome(entry: Dict[str, Any]) -> str:
+    """
+    Tag a topic as 'winning', 'mixed', 'lagging', or 'untracked' based on
+    the metrics that are available.
+    """
+    ai = entry.get("ai_mention_rate")
+    pos = entry.get("seo_avg_position")
+    pieces = entry.get("content_pieces") or 0
+
+    have_signal = ai is not None or pos is not None or pieces > 0
+    if not have_signal:
+        return "untracked"
+
+    score = 0
+    if ai is not None:
+        score += 1 if ai >= 0.4 else -1
+    if pos is not None:
+        score += 1 if pos <= 15 else -1
+    if pieces and (entry.get("content_published") or 0) > 0:
+        score += 1
+
+    if score >= 2:
+        return "winning"
+    if score <= -1:
+        return "lagging"
+    return "mixed"
+
+
 class StrategyAgent:
     """Generates an overarching marketing strategy from per-agent activity."""
 
@@ -238,9 +362,154 @@ domain_strategies and roadmap — never objects keyed by domain or horizon."""
                 .limit(1)
                 .execute()
             )
-            return (res.data or [None])[0]
+            row = (res.data or [None])[0]
+            return _flatten_strategy_row(row)
         except Exception:
             return None
+
+    async def update_section(self, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Update fields on the active strategy row. Top-level columns
+        (headline, verdict, horizon) are written as columns; everything else
+        is merged into the strategy JSONB.
+        """
+        sb = get_supabase()
+        try:
+            current = (
+                sb.table("marketing_strategies")
+                .select("id,strategy,headline,verdict,horizon")
+                .eq("tenant_id", self.tenant_id)
+                .eq("status", "active")
+                .order("generated_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = current.data or []
+            if not rows:
+                return None
+            row = rows[0]
+
+            updates: Dict[str, Any] = {}
+            COLUMN_FIELDS = {"headline", "verdict", "horizon"}
+            new_strategy = dict(row.get("strategy") or {})
+
+            for key, value in patch.items():
+                if key in COLUMN_FIELDS:
+                    updates[key] = value
+                else:
+                    new_strategy[key] = value
+
+            if not updates and not patch:
+                return _flatten_strategy_row(row)
+
+            updates["strategy"] = new_strategy
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+            res = (
+                sb.table("marketing_strategies")
+                .update(updates)
+                .eq("id", row["id"])
+                .execute()
+            )
+            updated = (res.data or [None])[0]
+            return _flatten_strategy_row(updated)
+        except Exception as e:
+            logger.warning(f"[strategy] update_section failed: {e}")
+            return None
+
+    async def evaluate(self) -> Dict[str, Any]:
+        """
+        Outcome correlation: for the latest strategy, return per-topic
+        outcome metrics so we can answer "is what we wrote about helping?".
+
+        v1 heuristic — for each topic, find:
+          - mention_rate trend across recent ai_visibility checks that
+            include the topic substring in the prompt
+          - keyword position trend for the topic across seo_keywords
+          - count of content pieces tied to the topic via target_keyword
+        """
+        current = await self.get_current()
+        if not current:
+            return {"strategy_id": None, "topics": []}
+
+        topics = _extract_strategy_topics(current)
+        if not topics:
+            return {"strategy_id": current.get("id"), "topics": []}
+
+        sb = get_supabase()
+        topic_rows: List[Dict[str, Any]] = []
+
+        for topic in topics:
+            entry: Dict[str, Any] = {"topic": topic}
+            try:
+                # AI mention rate for this topic
+                ai = (
+                    sb.table("ai_visibility_checks")
+                    .select("mentioned,prompt,checked_at")
+                    .eq("tenant_id", self.tenant_id)
+                    .ilike("prompt", f"%{topic}%")
+                    .order("checked_at", desc=True)
+                    .limit(50)
+                    .execute()
+                )
+                ai_rows = ai.data or []
+                if ai_rows:
+                    mentions = sum(1 for r in ai_rows if r.get("mentioned"))
+                    entry["ai_checks"] = len(ai_rows)
+                    entry["ai_mention_rate"] = round(mentions / len(ai_rows), 3) if ai_rows else None
+            except Exception:
+                pass
+
+            try:
+                # SEO position for keywords containing this topic
+                seo = (
+                    sb.table("seo_keywords")
+                    .select("keyword,current_position,current_clicks,current_impressions")
+                    .eq("tenant_id", self.tenant_id)
+                    .ilike("keyword", f"%{topic}%")
+                    .limit(20)
+                    .execute()
+                )
+                seo_rows = seo.data or []
+                if seo_rows:
+                    positions = [
+                        r.get("current_position") for r in seo_rows
+                        if r.get("current_position") and r["current_position"] > 0
+                    ]
+                    entry["seo_keywords"] = len(seo_rows)
+                    if positions:
+                        entry["seo_avg_position"] = round(sum(positions) / len(positions), 1)
+                    entry["seo_total_clicks"] = sum(r.get("current_clicks") or 0 for r in seo_rows)
+            except Exception:
+                pass
+
+            try:
+                # Content pieces tagged with this topic
+                content = (
+                    sb.table("content_pieces")
+                    .select("id,status")
+                    .eq("tenant_id", self.tenant_id)
+                    .ilike("target_keyword", f"%{topic}%")
+                    .limit(20)
+                    .execute()
+                )
+                content_rows = content.data or []
+                if content_rows:
+                    entry["content_pieces"] = len(content_rows)
+                    entry["content_published"] = sum(
+                        1 for r in content_rows if (r.get("status") or "").lower() == "published"
+                    )
+            except Exception:
+                pass
+
+            entry["status"] = _classify_topic_outcome(entry)
+            topic_rows.append(entry)
+
+        return {
+            "strategy_id": current.get("id"),
+            "generated_at": current.get("generated_at"),
+            "topics": topic_rows,
+        }
 
     async def list_history(self, limit: int = 10) -> List[Dict[str, Any]]:
         sb = get_supabase()
