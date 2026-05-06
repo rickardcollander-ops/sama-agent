@@ -6,6 +6,7 @@ Aggregates real data from SEO, Ads, Reviews, and Content agents.
 
 import asyncio
 import logging
+import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from anthropic import Anthropic
@@ -647,19 +648,46 @@ class AnalyticsAgent:
                 "total_clicks": row.get("total_clicks", 0),
                 "total_impressions": row.get("total_impressions", 0),
             }
-            try:
-                sb.table(DAILY_METRICS_TABLE).upsert(
-                    record,
-                    on_conflict="date,channel",
-                ).execute()
-                upserted.append(channel)
-            except Exception as e:
+            # Resilient upsert: if PostgREST reports a missing column (PGRST204
+            # — usually because a migration hasn't run on this Supabase yet),
+            # drop that field from the payload and retry. We never strip
+            # "date" or "channel" since those are the upsert key.
+            payload = dict(record)
+            last_error: Optional[Exception] = None
+            for _attempt in range(len(payload)):
+                try:
+                    sb.table(DAILY_METRICS_TABLE).upsert(
+                        payload,
+                        on_conflict="date,channel",
+                    ).execute()
+                    upserted.append(channel)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e)
+                    m = re.search(r"Could not find the '(\w+)' column", err_str)
+                    if m and m.group(1) in payload and m.group(1) not in ("date", "channel"):
+                        missing = m.group(1)
+                        payload.pop(missing)
+                        logger.warning(
+                            f"daily_metrics is missing column '{missing}' on this "
+                            f"Supabase — retrying upsert without it. Run "
+                            f"migrations/009_daily_metrics_add_avg_position.sql "
+                            f"to restore the column."
+                        )
+                        continue
+                    break
+            if last_error is not None:
                 logger.error(
                     f"daily_metrics upsert failed for channel={channel}: "
-                    f"{type(e).__name__}: {e}",
+                    f"{type(last_error).__name__}: {last_error}",
                     exc_info=True,
                 )
-                errors.append({"channel": channel, "error": f"{type(e).__name__}: {e}"[:240]})
+                errors.append({
+                    "channel": channel,
+                    "error": f"{type(last_error).__name__}: {last_error}"[:240],
+                })
 
         # SEO channel
         _upsert_channel("seo", {
