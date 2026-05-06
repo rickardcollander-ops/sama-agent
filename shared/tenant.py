@@ -103,7 +103,8 @@ class TenantConfig:
 
     @property
     def anthropic_api_key(self) -> str:
-        return self._get("anthropic_api_key", self._get("ANTHROPIC_API_KEY", ""))
+        # Always use the system Anthropic key. Customers no longer supply their own.
+        return getattr(settings, "ANTHROPIC_API_KEY", "") or ""
 
     @property
     def semrush_api_key(self) -> str:
