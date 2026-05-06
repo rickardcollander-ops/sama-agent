@@ -106,8 +106,12 @@ async def create_content_piece(request: Request, payload: ContentPieceCreate):
         }
     try:
         sb = get_supabase()
+        # Drop None values so optional columns added in later migrations
+        # (e.g. 032_content_source_links) don't break inserts in
+        # environments where the migration hasn't been applied yet.
+        payload_dict = {k: v for k, v in payload.model_dump().items() if v is not None}
         data = {
-            **payload.model_dump(),
+            **payload_dict,
             "tenant_id": tenant_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
