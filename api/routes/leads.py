@@ -37,7 +37,6 @@ async def capture_lead(request: Request):
     Capture a lead from a form submission.
     Accepts both JSON and form-encoded data (for HTML form action).
     """
-    # Parse body — support both JSON and form data
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         data = await request.json()
@@ -49,14 +48,22 @@ async def capture_lead(request: Request):
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email is required")
 
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
     try:
         from shared.database import get_supabase
         sb = get_supabase()
 
-        # Check for existing lead with same email
-        existing = sb.table("leads").select("id,score,status").eq("email", email).execute()
+        existing = (
+            sb.table("leads")
+            .select("id,score,status")
+            .eq("email", email)
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
 
         lead_data = {
+            "tenant_id": tenant_id,
             "email": email,
             "name": data.get("name", ""),
             "company": data.get("company", ""),
@@ -73,7 +80,6 @@ async def capture_lead(request: Request):
         }
 
         if existing.data:
-            # Update existing lead — keep higher score, update touchpoint
             lead_id = existing.data[0]["id"]
             sb.table("leads").update({
                 "name": data.get("name") or existing.data[0].get("name", ""),
@@ -82,11 +88,9 @@ async def capture_lead(request: Request):
                 "updated_at": datetime.utcnow().isoformat(),
             }).eq("id", lead_id).execute()
         else:
-            # Create new lead
             result = sb.table("leads").insert(lead_data).execute()
             lead_id = result.data[0]["id"] if result.data else None
 
-        # Record touchpoint
         if lead_id:
             sb.table("lead_touchpoints").insert({
                 "lead_id": lead_id,
@@ -98,7 +102,6 @@ async def capture_lead(request: Request):
                 "created_at": datetime.utcnow().isoformat(),
             }).execute()
 
-        # Score the lead
         try:
             from shared.lead_scoring import score_lead
             score = await score_lead(lead_id)
@@ -106,7 +109,6 @@ async def capture_lead(request: Request):
         except Exception as e:
             logger.warning(f"Lead scoring failed: {e}")
 
-        # Publish lead_captured event
         try:
             from shared.event_bus_registry import get_event_bus
             bus = get_event_bus()
@@ -121,7 +123,6 @@ async def capture_lead(request: Request):
         except Exception:
             pass
 
-        # Send notification
         try:
             from shared.notifications import notification_service
             await notification_service.notify(
@@ -133,9 +134,8 @@ async def capture_lead(request: Request):
         except Exception:
             pass
 
-        logger.info(f"Lead captured: {email} from {data.get('source_url', 'direct')}")
+        logger.info(f"Lead captured: {email} for tenant {tenant_id}")
 
-        # Return HTML redirect for form submissions, JSON for API calls
         if "application/json" in content_type:
             return {"success": True, "lead_id": lead_id}
         else:
@@ -159,16 +159,24 @@ async def capture_lead(request: Request):
 
 @router.get("/leads")
 async def get_leads(
+    request: Request,
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ):
-    """Get leads with optional status filter."""
+    """Get leads for the calling tenant, with optional status filter."""
     try:
         from shared.database import get_supabase
         sb = get_supabase()
 
-        query = sb.table("leads").select("*").order("created_at", desc=True)
+        tenant_id = getattr(request.state, "tenant_id", "default")
+
+        query = (
+            sb.table("leads")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+        )
         if status:
             query = query.eq("status", status)
         query = query.range(offset, offset + limit - 1)
@@ -224,17 +232,19 @@ async def get_lead_stats(request: Request):
 
 
 @router.patch("/leads/{lead_id}")
-async def update_lead(lead_id: str, updates: Dict[str, Any]):
-    """Update a lead's status or data."""
+async def update_lead(lead_id: str, updates: Dict[str, Any], request: Request):
+    """Update a lead's status or data — verified against calling tenant."""
     try:
         from shared.database import get_supabase
         sb = get_supabase()
+
+        tenant_id = getattr(request.state, "tenant_id", "default")
 
         allowed_fields = {"status", "score", "name", "company", "phone", "notes"}
         filtered = {k: v for k, v in updates.items() if k in allowed_fields}
         filtered["updated_at"] = datetime.utcnow().isoformat()
 
-        sb.table("leads").update(filtered).eq("id", lead_id).execute()
+        sb.table("leads").update(filtered).eq("id", lead_id).eq("tenant_id", tenant_id).execute()
         return {"success": True, "lead_id": lead_id}
     except Exception as e:
         logger.error(f"Failed to update lead: {e}")
@@ -242,13 +252,32 @@ async def update_lead(lead_id: str, updates: Dict[str, Any]):
 
 
 @router.get("/leads/{lead_id}/touchpoints")
-async def get_lead_touchpoints(lead_id: str):
-    """Get all touchpoints for a lead."""
+async def get_lead_touchpoints(lead_id: str, request: Request):
+    """Get all touchpoints for a lead — verified against calling tenant."""
     try:
         from shared.database import get_supabase
         sb = get_supabase()
 
-        result = sb.table("lead_touchpoints").select("*").eq("lead_id", lead_id).order("created_at", desc=True).execute()
+        tenant_id = getattr(request.state, "tenant_id", "default")
+
+        # Verify the lead belongs to this tenant before returning touchpoints
+        lead_check = (
+            sb.table("leads")
+            .select("id")
+            .eq("id", lead_id)
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
+        if not lead_check.data:
+            return {"success": False, "touchpoints": [], "error": "Lead not found"}
+
+        result = (
+            sb.table("lead_touchpoints")
+            .select("*")
+            .eq("lead_id", lead_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
         return {"success": True, "touchpoints": result.data or []}
     except Exception as e:
         return {"success": False, "touchpoints": [], "error": str(e)}

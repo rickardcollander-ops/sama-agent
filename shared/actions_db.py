@@ -19,7 +19,6 @@ async def _classify_and_handle(agent_name: str, action: Dict[str, Any], db_id: s
 
         if tier == DecisionTier.AUTO_EXECUTE:
             logger.info(f"[autonomy] Auto-executing: {action.get('title', '')[:50]}")
-            # Mark as auto-executed
             sb = get_supabase()
             sb.table("agent_actions").update({
                 "status": "auto_executed",
@@ -33,7 +32,6 @@ async def _classify_and_handle(agent_name: str, action: Dict[str, Any], db_id: s
                 "status": "auto_executed",
                 "execution_result": {"auto": True, "tier": tier.value},
             }).eq("id", db_id).execute()
-            # Send notification
             try:
                 from shared.notifications import notification_service
                 await notification_service.notify(
@@ -78,8 +76,8 @@ async def _publish_chain_events(agent_name: str, action: Dict[str, Any]):
         logger.debug(f"[chains] Event publish skipped: {e}")
 
 
-async def clear_pending_actions(agent_name: str) -> int:
-    """Delete all pending actions for an agent and return deleted count."""
+async def clear_pending_actions(agent_name: str, tenant_id: str = "default") -> int:
+    """Delete all pending actions for an agent+tenant and return deleted count."""
     sb = get_supabase()
 
     try:
@@ -87,40 +85,46 @@ async def clear_pending_actions(agent_name: str) -> int:
             sb.table("agent_actions")
             .delete()
             .eq("agent_name", agent_name)
+            .eq("tenant_id", tenant_id)
             .eq("status", "pending")
             .execute()
         )
         deleted_count = len(result.data or [])
-        logger.info(f"🧹 Cleared {deleted_count} pending {agent_name} actions before saving new analysis")
+        logger.info(f"ð§¹ Cleared {deleted_count} pending {agent_name} actions for tenant {tenant_id}")
         return deleted_count
     except Exception as e:
         logger.error(f"❌ Failed to clear pending actions for {agent_name}: {e}")
         return 0
 
 
-async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[str]:
+async def save_actions(
+    agent_name: str,
+    actions: List[Dict[str, Any]],
+    tenant_id: str = "default",
+) -> List[str]:
     """
-    Save actions to database with deduplication
-    
+    Save actions to database with deduplication.
+
     Args:
         agent_name: Name of the agent (seo, ads, content, social, reviews)
         actions: List of action dicts from /analyze
-    
+        tenant_id: Tenant this action belongs to
+
     Returns:
         List of created action IDs
     """
     sb = get_supabase()
     created_ids = []
 
-    # Replace queue on each analysis run to avoid stale/duplicated pending actions.
-    await clear_pending_actions(agent_name)
-    
+    # Replace queue on each analysis run — scoped to this tenant only.
+    await clear_pending_actions(agent_name, tenant_id)
+
     for action in actions:
         try:
             action_id = action.get("id", "")
-            
-            # Prepare action for database
+
             db_action = {
+                "tenant_id": tenant_id,
                 "agent_name": agent_name,
                 "action_id": action_id,
                 "action_type": action.get("type", ""),
@@ -135,21 +139,17 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
                 "platform": action.get("platform"),
                 "target_page": action.get("target_page"),
                 "expected_outcome": action.get("expected_outcome"),
-                "status": "pending"
+                "status": "pending",
             }
-            
-            # Insert into database
+
             result = sb.table("agent_actions").insert(db_action).execute()
-            
+
             if result.data:
                 db_id = result.data[0]["id"]
                 created_ids.append(db_id)
                 logger.info(f"✅ Saved action: {action.get('title', '')[:50]}")
 
-                # Classify and auto-execute if applicable
                 await _classify_and_handle(agent_name, action, db_id)
-
-                # Publish chain events for downstream agents
                 await _publish_chain_events(agent_name, action)
 
         except Exception as e:
@@ -162,34 +162,39 @@ async def save_actions(agent_name: str, actions: List[Dict[str, Any]]) -> List[s
 async def get_actions(
     agent_name: Optional[str] = None,
     status: Optional[str] = None,
-    limit: int = 100
+    limit: int = 100,
+    tenant_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Get actions from database
-    
+    Get actions from database.
+
     Args:
         agent_name: Filter by agent name
         status: Filter by status (pending, executing, completed, failed)
         limit: Max number of actions to return
-    
+        tenant_id: Restrict to this tenant (required for multi-tenant safety)
+
     Returns:
         List of actions
     """
     sb = get_supabase()
-    
+
     try:
         query = sb.table("agent_actions").select("*")
-        
+
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+
         if agent_name:
             query = query.eq("agent_name", agent_name)
-        
+
         if status:
             query = query.eq("status", status)
-        
+
         result = query.order("created_at", desc=True).limit(limit).execute()
-        
+
         return result.data or []
-    
+
     except Exception as e:
         logger.error(f"❌ Failed to get actions: {e}")
         return []
@@ -199,40 +204,40 @@ async def update_action_status(
     action_id: str,
     status: str,
     execution_result: Optional[Dict[str, Any]] = None,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
 ) -> bool:
     """
-    Update action status and execution result
-    
+    Update action status and execution result.
+
     Args:
         action_id: UUID of the action
         status: New status (executing, completed, failed)
         execution_result: Result data from execution
         error_message: Error message if failed
-    
+
     Returns:
         True if successful
     """
     sb = get_supabase()
-    
+
     try:
         update_data = {"status": status}
-        
+
         if status == "executing":
             from datetime import datetime
             update_data["executed_at"] = datetime.utcnow().isoformat()
-        
+
         if execution_result:
             update_data["execution_result"] = execution_result
-        
+
         if error_message:
             update_data["error_message"] = error_message
-        
+
         result = sb.table("agent_actions").update(update_data).eq("id", action_id).execute()
-        
+
         logger.info(f"✅ Updated action {action_id} to status: {status}")
         return True
-    
+
     except Exception as e:
         logger.error(f"❌ Failed to update action: {e}")
         return False
@@ -240,24 +245,31 @@ async def update_action_status(
 
 async def get_action_by_action_id(action_id: str) -> Optional[Dict[str, Any]]:
     """
-    Get a single action by its action_id (not UUID)
-    
+    Get a single action by its action_id (not UUID).
+
     Args:
         action_id: The action_id field (e.g., 'ads-cpa-campaign-name')
-    
+
     Returns:
         Action dict or None
     """
     sb = get_supabase()
-    
+
     try:
-        result = sb.table("agent_actions").select("*").eq("action_id", action_id).order("created_at", desc=True).limit(1).execute()
-        
+        result = (
+            sb.table("agent_actions")
+            .select("*")
+            .eq("action_id", action_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
         if result.data:
             return result.data[0]
-        
+
         return None
-    
+
     except Exception as e:
         logger.error(f"❌ Failed to get action: {e}")
         return None
@@ -265,7 +277,7 @@ async def get_action_by_action_id(action_id: str) -> Optional[Dict[str, Any]]:
 
 async def delete_action(action_uuid: str) -> bool:
     """
-    Delete an action from the database by its UUID
+    Delete an action from the database by its UUID.
 
     Args:
         action_uuid: UUID of the action (the 'id' column)
@@ -277,7 +289,7 @@ async def delete_action(action_uuid: str) -> bool:
 
     try:
         sb.table("agent_actions").delete().eq("id", action_uuid).execute()
-        logger.info(f"🗑️ Deleted action {action_uuid}")
+        logger.info(f"ð§ Deleted action {action_uuid}")
         return True
 
     except Exception as e:
@@ -285,11 +297,18 @@ async def delete_action(action_uuid: str) -> bool:
         return False
 
 
-async def get_pending_actions(agent_name: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all pending actions, optionally filtered by agent"""
-    return await get_actions(agent_name=agent_name, status="pending")
+async def get_pending_actions(
+    agent_name: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Get all pending actions, optionally filtered by agent and tenant."""
+    return await get_actions(agent_name=agent_name, status="pending", tenant_id=tenant_id)
 
 
-async def get_completed_actions(agent_name: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
-    """Get completed actions, optionally filtered by agent"""
-    return await get_actions(agent_name=agent_name, status="completed", limit=limit)
+async def get_completed_actions(
+    agent_name: Optional[str] = None,
+    limit: int = 50,
+    tenant_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Get completed actions, optionally filtered by agent and tenant."""
+    return await get_actions(agent_name=agent_name, status="completed", limit=limit, tenant_id=tenant_id)

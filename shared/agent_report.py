@@ -17,58 +17,68 @@ logger = logging.getLogger(__name__)
 AGENT_NAMES = ["seo", "content", "ads", "social", "reviews", "analytics"]
 
 
-async def _fetch_agent_activity(agent_name: str, since: str) -> Dict[str, Any]:
-    """Fetch raw activity data for an agent from the last 24h."""
+async def _fetch_agent_activity(
+    agent_name: str, since: str, tenant_id: str = "default"
+) -> Dict[str, Any]:
+    """Fetch raw activity data for an agent+tenant from the last 24h."""
     sb = get_supabase()
     activity: Dict[str, Any] = {"agent": agent_name}
 
-    # Actions (created or executed)
     try:
-        actions = sb.table("agent_actions") \
-            .select("action_type,title,status,priority,created_at,executed_at,error_message") \
-            .eq("agent_name", agent_name) \
-            .gte("created_at", since) \
-            .order("created_at", desc=True) \
-            .limit(50) \
+        actions = (
+            sb.table("agent_actions")
+            .select("action_type,title,status,priority,created_at,executed_at,error_message")
+            .eq("agent_name", agent_name)
+            .eq("tenant_id", tenant_id)
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(50)
             .execute()
+        )
         activity["actions"] = actions.data or []
     except Exception:
         activity["actions"] = []
 
-    # OODA cycles
     try:
-        cycles = sb.table("agent_cycles") \
-            .select("status,created_at,completed_at,error_message") \
-            .eq("agent_name", agent_name) \
-            .gte("created_at", since) \
-            .order("created_at", desc=True) \
-            .limit(10) \
+        cycles = (
+            sb.table("agent_cycles")
+            .select("status,created_at,completed_at,error_message")
+            .eq("agent_name", agent_name)
+            .eq("tenant_id", tenant_id)
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(10)
             .execute()
+        )
         activity["cycles"] = cycles.data or []
     except Exception:
         activity["cycles"] = []
 
-    # Alerts generated
     try:
-        alerts = sb.table("alerts") \
-            .select("type,severity,title,message,status") \
-            .eq("agent", agent_name) \
-            .gte("created_at", since) \
-            .order("created_at", desc=True) \
-            .limit(20) \
+        alerts = (
+            sb.table("alerts")
+            .select("type,severity,title,message,status")
+            .eq("agent", agent_name)
+            .eq("tenant_id", tenant_id)
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(20)
             .execute()
+        )
         activity["alerts"] = alerts.data or []
     except Exception:
         activity["alerts"] = []
 
-    # Learnings
     try:
-        learnings = sb.table("agent_learnings") \
-            .select("learning_type,context,confidence_score") \
-            .eq("agent_name", agent_name) \
-            .gte("created_at", since) \
-            .limit(10) \
+        learnings = (
+            sb.table("agent_learnings")
+            .select("learning_type,context,confidence_score")
+            .eq("agent_name", agent_name)
+            .eq("tenant_id", tenant_id)
+            .gte("created_at", since)
+            .limit(10)
             .execute()
+        )
         activity["learnings"] = learnings.data or []
     except Exception:
         activity["learnings"] = []
@@ -76,15 +86,16 @@ async def _fetch_agent_activity(agent_name: str, since: str) -> Dict[str, Any]:
     return activity
 
 
-async def generate_agent_report(agent_name: str) -> Dict[str, Any]:
+async def generate_agent_report(
+    agent_name: str, tenant_id: str = "default"
+) -> Dict[str, Any]:
     """
     Generate a self-report for one agent using Claude.
     Returns: {agent, summary, actions_summary, improvements, generated_at}
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    activity = await _fetch_agent_activity(agent_name, since)
+    activity = await _fetch_agent_activity(agent_name, since, tenant_id)
 
-    # Count stats
     actions = activity.get("actions", [])
     cycles = activity.get("cycles", [])
     alerts = activity.get("alerts", [])
@@ -108,7 +119,6 @@ async def generate_agent_report(agent_name: str) -> Dict[str, Any]:
         "learnings_recorded": len(learnings),
     }
 
-    # Build prompt for Claude
     action_lines = []
     for a in actions[:20]:
         line = f"- [{a.get('status', '?')}] {a.get('title', 'No title')} (type: {a.get('action_type', '?')}, priority: {a.get('priority', '?')})"
@@ -158,7 +168,6 @@ Svara i JSON-format:
 
 Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föreslå förbättringar ändå baserat på din roll."""
 
-    # Call Claude
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -169,7 +178,6 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
         )
         import json
         text = response.content[0].text
-        # Extract JSON from response
         start = text.find("{")
         end = text.rfind("}") + 1
         if start >= 0 and end > start:
@@ -178,13 +186,13 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
             report_data = {"summary": text, "highlights": [], "problems": [], "improvements": [], "ux_suggestions": []}
     except Exception as e:
         logger.warning(f"[agent-report] Claude call failed for {agent_name}: {e}")
-        # Fallback: generate a basic report from stats
         report_data = _fallback_report(agent_name, stats, errors)
 
     now = datetime.now(timezone.utc).isoformat()
     report = {
         "agent": agent_name,
         "agent_name": agent_name,
+        "tenant_id": tenant_id,
         "stats": stats,
         "summary": report_data.get("summary", ""),
         "highlights": report_data.get("highlights", []),
@@ -195,8 +203,7 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
         "created_at": now,
     }
 
-    # Persist to Supabase
-    saved = await _save_report(report)
+    saved = await _save_report(report, tenant_id)
     report["saved"] = saved
     if not saved:
         report.setdefault("problems", []).append(
@@ -236,7 +243,7 @@ def _fallback_report(agent_name: str, stats: Dict, errors: List) -> Dict:
     }
 
 
-async def _save_report(report: Dict[str, Any]) -> bool:
+async def _save_report(report: Dict[str, Any], tenant_id: str = "default") -> bool:
     """Save report to Supabase for history and dev agent consumption."""
     from uuid import uuid4
     try:
@@ -244,6 +251,7 @@ async def _save_report(report: Dict[str, Any]) -> bool:
         row = {
             "id": str(uuid4()),
             "agent_name": report["agent"],
+            "tenant_id": tenant_id,
             "summary": report.get("summary", ""),
             "highlights": report.get("highlights", []),
             "problems": report.get("problems", []),
@@ -252,28 +260,28 @@ async def _save_report(report: Dict[str, Any]) -> bool:
             "stats": report.get("stats", {}),
         }
         result = sb.table("agent_reports").insert(row).execute()
-        logger.info(f"[agent-report] Saved report for {report['agent']}")
+        logger.info(f"[agent-report] Saved report for {report['agent']} (tenant={tenant_id})")
         return True
     except Exception as e:
         logger.warning(f"[agent-report] FAILED to save report for {report.get('agent', '?')}: {e}")
-        # Store the error on the report so frontend can see it
         report["_save_error"] = str(e)
         return False
 
 
-async def generate_all_reports() -> List[Dict[str, Any]]:
-    """Generate reports for all agents."""
+async def generate_all_reports(tenant_id: str = "default") -> List[Dict[str, Any]]:
+    """Generate reports for all agents for a specific tenant."""
     reports = []
     for agent_name in AGENT_NAMES:
         try:
-            report = await generate_agent_report(agent_name)
+            report = await generate_agent_report(agent_name, tenant_id)
             reports.append(report)
-            logger.info(f"[agent-report] Generated report for {agent_name}")
+            logger.info(f"[agent-report] Generated report for {agent_name} (tenant={tenant_id})")
         except Exception as e:
             logger.warning(f"[agent-report] Failed to generate report for {agent_name}: {e}")
             reports.append({
                 "agent": agent_name,
                 "agent_name": agent_name,
+                "tenant_id": tenant_id,
                 "summary": f"Kunde inte generera rapport: {e}",
                 "highlights": [],
                 "problems": [str(e)],
@@ -285,18 +293,21 @@ async def generate_all_reports() -> List[Dict[str, Any]]:
     return reports
 
 
-async def get_latest_reports() -> List[Dict[str, Any]]:
-    """Get the most recent report for each agent from Supabase."""
+async def get_latest_reports(tenant_id: str = "default") -> List[Dict[str, Any]]:
+    """Get the most recent report for each agent from Supabase, scoped to tenant."""
     reports = []
     try:
         sb = get_supabase()
         for agent_name in AGENT_NAMES:
-            result = sb.table("agent_reports") \
-                .select("*") \
-                .eq("agent_name", agent_name) \
-                .order("created_at", desc=True) \
-                .limit(1) \
+            result = (
+                sb.table("agent_reports")
+                .select("*")
+                .eq("agent_name", agent_name)
+                .eq("tenant_id", tenant_id)
+                .order("created_at", desc=True)
+                .limit(1)
                 .execute()
+            )
             if result.data:
                 reports.append(result.data[0])
     except Exception as e:
@@ -304,12 +315,12 @@ async def get_latest_reports() -> List[Dict[str, Any]]:
     return reports
 
 
-async def get_all_improvements() -> List[Dict[str, str]]:
+async def get_all_improvements(tenant_id: str = "default") -> List[Dict[str, str]]:
     """
-    Get all improvement suggestions from the latest reports.
+    Get all improvement suggestions from the latest reports for a tenant.
     Used by the dev agent to pick up what needs fixing.
     """
-    reports = await get_latest_reports()
+    reports = await get_latest_reports(tenant_id)
     improvements = []
     for r in reports:
         agent = r.get("agent_name", "unknown")
