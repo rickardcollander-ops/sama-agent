@@ -170,13 +170,18 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
         }
 
     async def _run_site_audit(self) -> Optional[Dict[str, Any]]:
-        """Crawl the tenant domain and produce a full SEO/GEO site report."""
+        """Crawl the tenant domain and produce a full SEO/GEO site report.
+
+        Calls SiteAuditAgent with the proper (tenant_config, domain) split —
+        the previous `SiteAuditAgent(domain=...)` / `.run()` call did not
+        match the actual class signature and silently failed.
+        """
         if not self.domain:
             return None
         try:
             from agents.site_audit import SiteAuditAgent
-            audit = SiteAuditAgent(domain=self.domain)
-            return await audit.run()
+            audit = SiteAuditAgent(tenant_config=self.tenant_config)
+            return await audit.audit_domain(self.domain)
         except Exception as e:
             logger.warning(f"site audit failed for {self.domain}: {e}")
             return None
