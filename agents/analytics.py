@@ -236,6 +236,151 @@ class AnalyticsAgent:
 
         return channel_data
 
+    async def _fetch_seo_daily(self, date_range: int = 30) -> List[Dict[str, Any]]:
+        """Per-day GSC clicks/impressions for the current tenant.
+
+        Returns a list of {date, clicks, impressions} sorted ascending. Empty
+        list on any failure — the caller decides how to surface that.
+        """
+        tenant_id = (
+            getattr(self.tenant_config, "tenant_id", None)
+            if self.tenant_config else None
+        )
+        site_url = (
+            getattr(self.tenant_config, "gsc_site_url", None)
+            if self.tenant_config else None
+        ) or settings.GSC_SITE_URL or ""
+        if not site_url:
+            return []
+
+        try:
+            access_token: Optional[str] = None
+            if tenant_id:
+                try:
+                    access_token = await get_google_access_token(tenant_id, "search_console")
+                except ValueError:
+                    access_token = None
+            if not access_token:
+                access_token = await get_access_token("gsc")
+            if not access_token:
+                return []
+
+            end_date = datetime.utcnow().strftime("%Y-%m-%d")
+            start_date = (datetime.utcnow() - timedelta(days=date_range)).strftime("%Y-%m-%d")
+            encoded_site = site_url.replace(":", "%3A").replace("/", "%2F")
+            url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "dimensions": ["date"],
+                        "rowLimit": 1000,
+                    },
+                )
+            if resp.status_code != 200:
+                logger.warning(f"GSC daily error {resp.status_code}: {resp.text[:160]}")
+                return []
+            rows = (resp.json() or {}).get("rows", []) or []
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                keys = row.get("keys") or []
+                if not keys:
+                    continue
+                out.append({
+                    "date": keys[0],
+                    "clicks": int(row.get("clicks", 0) or 0),
+                    "impressions": int(row.get("impressions", 0) or 0),
+                })
+            out.sort(key=lambda d: d["date"])
+            return out
+        except Exception as e:
+            logger.warning(f"SEO daily fetch failed: {e}")
+            return []
+
+    async def _fetch_ga4_daily(self, date_range: int = 30) -> List[Dict[str, Any]]:
+        """Per-day GA4 sessions/pageviews for the current tenant.
+
+        Returns a list of {date, clicks, impressions} where clicks=sessions
+        and impressions=pageviews — same mapping the overview chart uses.
+        """
+        tenant_property_id = (
+            getattr(self.tenant_config, "ga4_property_id", None)
+            if self.tenant_config else None
+        )
+        raw_property_id = tenant_property_id or settings.GA4_PROPERTY_ID
+        if not raw_property_id:
+            return []
+
+        try:
+            access_token: Optional[str] = None
+            tenant_id = getattr(self.tenant_config, "tenant_id", None) if self.tenant_config else None
+            if tenant_id:
+                try:
+                    access_token = await get_google_access_token(tenant_id, "analytics")
+                except ValueError:
+                    access_token = None
+            if not access_token:
+                access_token = await get_access_token("gsc")
+            if not access_token:
+                return []
+
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=date_range)
+            prop_id = raw_property_id
+            if not prop_id.startswith("properties/"):
+                prop_id = f"properties/{prop_id}"
+
+            url = f"https://analyticsdata.googleapis.com/v1beta/{prop_id}:runReport"
+            payload = {
+                "dateRanges": [{
+                    "startDate": start_date.strftime("%Y-%m-%d"),
+                    "endDate": end_date.strftime("%Y-%m-%d"),
+                }],
+                "dimensions": [{"name": "date"}],
+                "metrics": [
+                    {"name": "sessions"},
+                    {"name": "screenPageViews"},
+                ],
+                "orderBys": [{"dimension": {"dimensionName": "date"}}],
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            if resp.status_code != 200:
+                logger.warning(f"GA4 daily error {resp.status_code}: {resp.text[:160]}")
+                return []
+            rows = (resp.json() or {}).get("rows", []) or []
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                dim_values = row.get("dimensionValues") or []
+                metric_values = row.get("metricValues") or []
+                if not dim_values or len(metric_values) < 2:
+                    continue
+                # GA4 returns YYYYMMDD, convert to YYYY-MM-DD
+                ymd = dim_values[0].get("value") or ""
+                date_iso = f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}" if len(ymd) == 8 else ymd
+                out.append({
+                    "date": date_iso,
+                    "clicks": int(metric_values[0].get("value") or 0),
+                    "impressions": int(metric_values[1].get("value") or 0),
+                })
+            out.sort(key=lambda d: d["date"])
+            return out
+        except Exception as e:
+            logger.warning(f"GA4 daily fetch failed: {e}")
+            return []
+
     async def _fetch_ga4_data(self, date_range: int = 30) -> Dict[str, Any]:
         """Fetch site-wide traffic data from Google Analytics 4 Data API.
 

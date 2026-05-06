@@ -50,6 +50,15 @@ async def _safe_live(name: str, coro_factory) -> Dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
+async def _safe_daily(name: str, coro_factory) -> List[Dict[str, Any]]:
+    try:
+        result = await coro_factory()
+        return result if isinstance(result, list) else []
+    except Exception as e:
+        logger.warning(f"Daily fetch {name} failed: {e}")
+        return []
+
+
 def _live_to_channel(channel: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Convert a live-fetch result to the overview channel shape.
 
@@ -105,16 +114,20 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
 
     # ── 1. Live fetch ─────────────────────────────────────────────────
     live_channels: Dict[str, Dict[str, Any]] = {}
+    seo_daily_live: List[Dict[str, Any]] = []
+    ga4_daily_live: List[Dict[str, Any]] = []
     try:
         config = await get_tenant_config(tenant_id)
         agent = AnalyticsAgent(tenant_config=config)
 
-        seo_r, ads_r, reviews_r, content_r, ga4_r = await asyncio.gather(
+        seo_r, ads_r, reviews_r, content_r, ga4_r, seo_daily_r, ga4_daily_r = await asyncio.gather(
             _safe_live("seo", lambda: agent._fetch_seo_data(date_range=days)),
             _safe_live("ads", lambda: agent._fetch_ads_data(date_range=days)),
             _safe_live("reviews", agent._fetch_reviews_data),
             _safe_live("content", agent._fetch_content_data),
             _safe_live("ga4", lambda: agent._fetch_ga4_data(date_range=days)),
+            _safe_daily("seo_daily", lambda: agent._fetch_seo_daily(date_range=days)),
+            _safe_daily("ga4_daily", lambda: agent._fetch_ga4_daily(date_range=days)),
         )
 
         for ch, raw in (
@@ -127,6 +140,9 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
             entry = _live_to_channel(ch, raw)
             if entry:
                 live_channels[ch] = entry
+
+        seo_daily_live = seo_daily_r or []
+        ga4_daily_live = ga4_daily_r or []
 
         logger.info(
             f"overview live fetch: {len(live_channels)}/{5} channels have data"
@@ -190,16 +206,23 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
         entry["clicks"] += r.get("total_clicks") or 0
         entry["impressions"] += r.get("total_impressions") or 0
 
-    if not daily_map and live_channels:
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
-        total_clicks = sum(c["clicks"] for c in live_channels.values())
-        total_impressions = sum(c["impressions"] for c in live_channels.values())
-        if total_clicks or total_impressions:
-            daily_map[today_str] = {
-                "date": today_str,
-                "clicks": total_clicks,
-                "impressions": total_impressions,
-            }
+    # If DB gave us no daily rows, build the daily series from live per-day
+    # GSC + GA4 fetches so the chart shows real history, not just today.
+    if not daily_map:
+        for row in seo_daily_live:
+            d = row.get("date")
+            if not d:
+                continue
+            entry = daily_map.setdefault(d, {"date": d, "clicks": 0, "impressions": 0})
+            entry["clicks"] += int(row.get("clicks") or 0)
+            entry["impressions"] += int(row.get("impressions") or 0)
+        for row in ga4_daily_live:
+            d = row.get("date")
+            if not d:
+                continue
+            entry = daily_map.setdefault(d, {"date": d, "clicks": 0, "impressions": 0})
+            entry["clicks"] += int(row.get("clicks") or 0)
+            entry["impressions"] += int(row.get("impressions") or 0)
 
     daily = sorted(daily_map.values(), key=lambda d: d["date"])
 
@@ -220,6 +243,7 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
         "channels": channels,
         "daily": daily,
         "totals": totals,
+        "seo_daily": seo_daily_live,
     }
 
     if compare:
