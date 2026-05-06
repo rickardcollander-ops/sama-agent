@@ -34,6 +34,19 @@ def _tenant_id(request: Request, fallback: Optional[str] = None) -> str:
     return getattr(request.state, "tenant_id", None) or fallback or "default"
 
 
+def _extract_google_error(resp: httpx.Response) -> Optional[str]:
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    err = body.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg:
+            return msg
+    return None
+
+
 @router.get("/properties")
 async def list_ga4_properties(request: Request, tenant_id: Optional[str] = Query(None)):
     """List GA4 properties accessible to the tenant's connected Google account.
@@ -69,20 +82,40 @@ async def list_ga4_properties(request: Request, tenant_id: Optional[str] = Query
                 )
                 if resp.status_code == 403:
                     who = f" ({connected_email})" if connected_email else ""
+                    google_msg = _extract_google_error(resp)
+                    # A 403 from accountSummaries can mean either "no GA4
+                    # access" or "Analytics Admin API not enabled in this GCP
+                    # project". Surface Google's own message so the dashboard
+                    # can tell which it is instead of always blaming permissions.
+                    if google_msg and ("has not been used" in google_msg or "is disabled" in google_msg):
+                        raise HTTPException(
+                            status_code=403,
+                            detail=(
+                                "Google Analytics Admin API is not enabled in the "
+                                "Google Cloud project that owns the OAuth client. "
+                                "Enable it at "
+                                "https://console.cloud.google.com/apis/library/"
+                                "analyticsadmin.googleapis.com and retry. "
+                                f"(Google said: {google_msg})"
+                            ),
+                        )
+                    extra = f" (Google said: {google_msg})" if google_msg else ""
                     raise HTTPException(
                         status_code=403,
                         detail=(
                             f"The connected Google account{who} doesn't have access to any "
                             "GA4 properties. Either switch to a Google account that has "
                             "access, or have someone in Google Analytics grant this "
-                            "account at least Viewer access on the property."
+                            f"account at least Viewer access on the property.{extra}"
                         ),
                     )
                 if resp.status_code != 200:
                     logger.warning(f"accountSummaries {resp.status_code}: {resp.text[:200]}")
+                    google_msg = _extract_google_error(resp)
+                    extra = f": {google_msg}" if google_msg else ""
                     raise HTTPException(
                         status_code=502,
-                        detail=f"Google Analytics Admin API error {resp.status_code}",
+                        detail=f"Google Analytics Admin API error {resp.status_code}{extra}",
                     )
                 data = resp.json()
                 for account in data.get("accountSummaries", []):
