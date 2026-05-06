@@ -49,32 +49,55 @@ class TenantConfig:
         return default
 
     # ── Brand / Domain ────────────────────────────────────────────────
+    #
+    # Tenant-identifying fields are read ONLY from the per-tenant settings
+    # blob. Falling back to global env vars (BRAND_NAME, SUCCESSIFIER_*)
+    # caused cross-tenant bleed: a tenant with no explicit brand_name in
+    # their settings would inherit "Successifier" / successifier.com from
+    # the legacy single-tenant deploy and the LLM would generate
+    # Successifier-flavoured suggestions for them.
+
+    @staticmethod
+    def _str_or_empty(val: Any) -> str:
+        return val.strip() if isinstance(val, str) and val.strip() else ""
 
     @property
     def brand_name(self) -> str:
-        return self._get("brand_name", self._get("BRAND_NAME", "Successifier"))
+        return self._str_or_empty(self._settings.get("brand_name"))
 
     @property
     def domain(self) -> str:
-        return self._get("domain", self._get("SUCCESSIFIER_DOMAIN", "successifier.com"))
+        return self._str_or_empty(self._settings.get("domain"))
 
     @property
     def site_url(self) -> str:
-        return self._get("site_url", self._get("SUCCESSIFIER_SITE_URL", f"https://{self.domain}"))
+        explicit = self._str_or_empty(self._settings.get("site_url"))
+        if explicit:
+            return explicit
+        domain = self.domain
+        return f"https://{domain}" if domain else ""
 
     @property
     def cms_api_url(self) -> str:
-        return self._get("cms_api_url", self._get("SUCCESSIFIER_CMS_API_URL", f"https://{self.domain}/api"))
+        explicit = self._str_or_empty(self._settings.get("cms_api_url"))
+        if explicit:
+            return explicit
+        domain = self.domain
+        return f"https://{domain}/api" if domain else ""
 
     @property
     def cms_api_key(self) -> str:
-        return self._get("cms_api_key", self._get("SUCCESSIFIER_CMS_API_KEY", ""))
+        return self._str_or_empty(self._settings.get("cms_api_key"))
 
     # ── SEO ───────────────────────────────────────────────────────────
 
     @property
     def gsc_site_url(self) -> str:
-        return self._get("gsc_site_url", self._get("GSC_SITE_URL", f"sc-domain:{self.domain}"))
+        explicit = self._str_or_empty(self._settings.get("gsc_site_url"))
+        if explicit:
+            return explicit
+        domain = self.domain
+        return f"sc-domain:{domain}" if domain else ""
 
     @property
     def competitors(self) -> List[str]:
@@ -242,15 +265,17 @@ async def get_tenant_config(
     Load (or return cached) TenantConfig for the given tenant identity.
 
     Backwards compatible: callers that only have ``tenant_id`` keep working —
-    the function looks up user_settings by ``user_id = tenant_id`` exactly as
-    before. Newer callers can pass ``account_id`` and ``site_id`` so the cache
-    partitions correctly when a single account owns multiple sites.
+    the function looks up the per-site settings exactly as before. Newer
+    callers can pass ``account_id`` and ``site_id`` so the cache partitions
+    correctly when a single account owns multiple sites.
 
-    Lookup order for the underlying user_settings row:
-      1. ``user_id = site_id`` (per-site override, when the dashboard has
-         provisioned one)
-      2. ``user_id = account_id`` (workspace-level defaults)
-      3. ``user_id = tenant_id`` (legacy single-tenant rows)
+    Lookup order for the underlying settings row:
+      1. ``user_sites.id`` matching site_id / account_id / tenant_id
+         (current source of truth — the dashboard writes per-site brand
+         context to user_sites.settings keyed by site id)
+      2. ``user_settings.user_id`` matching site_id / account_id / tenant_id
+         (legacy single-tenant rows; preserved for old installs that
+         haven't migrated to user_sites yet)
 
     Results are cached for 5 minutes to minimise DB round-trips. The cache
     key is the (account, site) pair so two sites under one account don't
@@ -278,28 +303,56 @@ async def get_tenant_config(
         if key and key not in lookup_keys:
             lookup_keys.append(key)
 
+    # 1. user_sites.id (current dashboard storage). The dashboard's
+    # X-Tenant-ID is the user_sites.id, so this hits on any tenant that has
+    # gone through the multi-site migration — which is everyone created
+    # after the migration shipped, plus all view-as targets.
+    matched_via = None
     for key in lookup_keys:
         try:
             result = (
-                sb.table("user_settings")
+                sb.table("user_sites")
                 .select("settings")
-                .eq("user_id", key)
+                .eq("id", key)
                 .single()
                 .execute()
             )
         except Exception as e:
-            logger.debug(f"user_settings lookup failed for {key}: {e}")
+            logger.debug(f"user_sites lookup failed for {key}: {e}")
             continue
-        if result.data:
-            tenant_settings = result.data.get("settings", {}) or {}
-            logger.debug(
-                "Loaded tenant config (key=%s) for account=%s site=%s",
-                key, cache_account, cache_site,
-            )
+        if result.data and isinstance(result.data.get("settings"), dict):
+            tenant_settings = result.data["settings"] or {}
+            matched_via = ("user_sites.id", key)
             break
+
+    # 2. user_settings.user_id (legacy single-tenant table). Only consulted
+    # when the per-site lookup found nothing.
+    if not tenant_settings:
+        for key in lookup_keys:
+            try:
+                result = (
+                    sb.table("user_settings")
+                    .select("settings")
+                    .eq("user_id", key)
+                    .single()
+                    .execute()
+                )
+            except Exception as e:
+                logger.debug(f"user_settings lookup failed for {key}: {e}")
+                continue
+            if result.data:
+                tenant_settings = result.data.get("settings", {}) or {}
+                matched_via = ("user_settings.user_id", key)
+                break
+
+    if matched_via:
+        logger.debug(
+            "Loaded tenant config from %s=%s for account=%s site=%s",
+            matched_via[0], matched_via[1], cache_account, cache_site,
+        )
     else:
         logger.debug(
-            "No user_settings row for account=%s site=%s — using defaults",
+            "No user_sites or user_settings row for account=%s site=%s — using defaults",
             cache_account, cache_site,
         )
 

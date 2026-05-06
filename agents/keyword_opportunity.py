@@ -82,7 +82,11 @@ class KeywordOpportunityAgent:
 
     def __init__(self, tenant_config: Any = None):
         self.tenant_config = tenant_config
-        self.brand_name = (getattr(tenant_config, "brand_name", None) or "Brand")
+        # Empty default — never invent a brand name. A literal fallback like
+        # "Brand" or "Successifier" leaks across tenants when settings are
+        # missing and biases LLM suggestions toward whatever the fallback
+        # implies.
+        self.brand_name = (getattr(tenant_config, "brand_name", None) or "").strip()
         self.competitors: List[str] = list(
             getattr(tenant_config, "competitors", []) or []
         )
@@ -103,6 +107,9 @@ class KeywordOpportunityAgent:
     ) -> Dict[str, Any]:
         # Step 1: extract what the site already targets.
         current_keywords = self._extract_current_keywords(pages)
+        # Empty primary_seed is fine: _related_searches short-circuits, and
+        # the dashboard renders the "Related searches" panel without a
+        # quoted brand. Better than leaking a sibling tenant's brand name.
         primary_seed = current_keywords[0]["phrase"] if current_keywords else self.brand_name
 
         # Step 2: pull SERP signal for the primary seed in parallel with the
@@ -292,7 +299,7 @@ class KeywordOpportunityAgent:
 
         prompt = f"""You are an SEO strategist. Analyse this site and propose 20 keyword opportunities the brand could realistically rank for to grow organic and AI-assistant traffic.
 
-Brand: {self.brand_name}
+Brand: {self.brand_name or "—"}
 Domain: {host}
 Brand description: {description or "—"}
 Target audience: {audience or "—"}
@@ -360,7 +367,14 @@ Avoid duplicates of phrases the site already targets unless extending into a lon
     ) -> List[Dict[str, Any]]:
         """Deterministic suggestion set when no LLM is available. Builds
         long-tail variants from the already-extracted phrases."""
-        seeds = [k["phrase"] for k in current_keywords[:6]] or [self.brand_name.lower()]
+        seeds = [k["phrase"] for k in current_keywords[:6]]
+        if not seeds and self.brand_name:
+            seeds = [self.brand_name.lower()]
+        if not seeds:
+            # No keywords extracted and no tenant brand to seed from.
+            # Returning an empty list is preferable to fabricating a list
+            # like "how to use ", "what is " from an empty seed.
+            return []
         templates_info = [
             ("how to use {seed}", "informational", "low"),
             ("what is {seed}", "informational", "low"),
