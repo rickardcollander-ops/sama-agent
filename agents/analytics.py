@@ -726,69 +726,116 @@ class AnalyticsAgent:
                 "total_clicks": row.get("total_clicks", 0),
                 "total_impressions": row.get("total_impressions", 0),
             }
-            # Resilient upsert: production Supabase environments don't always
-            # have every migration applied. We tolerate two common failures:
-            #   PGRST204 — "Could not find the 'X' column": drop the field, retry.
-            #   42P10    — "no unique or exclusion constraint matching ON CONFLICT":
-            #              fall back to a manual select → update-or-insert path.
-            # We never strip "date" or "channel" since those are the upsert key.
-            payload = dict(record)
-            last_error: Optional[Exception] = None
-            for _attempt in range(len(payload) + 1):
-                try:
-                    sb.table(DAILY_METRICS_TABLE).upsert(
-                        payload,
-                        on_conflict="date,channel",
-                    ).execute()
-                    upserted.append(channel)
-                    last_error = None
-                    break
-                except Exception as e:
-                    err_str = str(e)
-                    last_error = e
+            # Resilient writer for production Supabase environments where
+            # migrations may not all have run. Two failure modes we recover
+            # from automatically:
+            #   PGRST204 — "Could not find the 'X' column": drop the field
+            #              and retry. This MUST run on every DB call we
+            #              make (upsert, select, update, insert), not just
+            #              the first one — older fix only handled the
+            #              outer upsert, leaving INSERT/UPDATE in the
+            #              42P10 fallback path uncovered, which is why
+            #              4/5 channels were still failing.
+            #   42P10    — "no unique or exclusion constraint matching
+            #              ON CONFLICT": fall back to manual select →
+            #              update-or-insert.
+            # `date` and `channel` are never stripped; they are the
+            # logical upsert key and the table cannot work without them.
+            KEY_FIELDS = ("date", "channel")
 
-                    m = re.search(r"Could not find the '(\w+)' column", err_str)
-                    if m and m.group(1) in payload and m.group(1) not in ("date", "channel"):
-                        missing = m.group(1)
-                        payload.pop(missing)
-                        logger.warning(
-                            f"daily_metrics is missing column '{missing}' on this "
-                            f"Supabase — retrying upsert without it. Run "
-                            f"migrations/009_daily_metrics_add_avg_position.sql "
-                            f"to restore the column."
-                        )
-                        continue
-
-                    if "42P10" in err_str or "no unique or exclusion constraint" in err_str:
-                        # Constraint is missing; emulate upsert by hand.
-                        try:
-                            existing = (
-                                sb.table(DAILY_METRICS_TABLE)
-                                .select("id")
-                                .eq("date", payload["date"])
-                                .eq("channel", payload["channel"])
-                                .limit(1)
-                                .execute()
-                            )
-                            if existing.data:
-                                row_id = existing.data[0]["id"]
-                                sb.table(DAILY_METRICS_TABLE).update(payload).eq(
-                                    "id", row_id
-                                ).execute()
-                            else:
-                                sb.table(DAILY_METRICS_TABLE).insert(payload).execute()
-                            upserted.append(channel)
-                            last_error = None
+            def _exec_drop_unknown(builder, p):
+                """Run builder(payload).execute(), dropping unknown columns
+                reported by PostgREST and retrying. Returns
+                (success, error, final_payload)."""
+                cur = dict(p)
+                err = None
+                for _ in range(len(cur) + 1):
+                    try:
+                        builder(cur).execute()
+                        return True, None, cur
+                    except Exception as exc:
+                        err_msg = str(exc)
+                        match = re.search(r"Could not find the '(\w+)' column", err_msg)
+                        if match and match.group(1) in cur and match.group(1) not in KEY_FIELDS:
+                            dropped = match.group(1)
+                            cur.pop(dropped)
                             logger.warning(
-                                "daily_metrics has no UNIQUE(date,channel) constraint "
-                                "on this Supabase — wrote via select+update/insert. "
-                                "Run migrations/008_daily_metrics.sql to restore it."
+                                f"daily_metrics is missing column '{dropped}' on this "
+                                f"Supabase — retrying without it."
                             )
-                        except Exception as e2:
-                            last_error = e2
+                            continue
+                        err = exc
                         break
+                return False, err, cur
 
-                    break
+            # Fast path: upsert with ON CONFLICT.
+            ok, err, payload = _exec_drop_unknown(
+                lambda p: sb.table(DAILY_METRICS_TABLE).upsert(p, on_conflict="date,channel"),
+                record,
+            )
+            if ok:
+                upserted.append(channel)
+                return
+
+            # If the failure isn't the missing-constraint case, give up.
+            err_str = str(err) if err is not None else ""
+            if "42P10" not in err_str and "no unique or exclusion constraint" not in err_str:
+                logger.error(
+                    f"daily_metrics upsert failed for channel={channel}: "
+                    f"{type(err).__name__}: {err}",
+                    exc_info=True,
+                )
+                errors.append({
+                    "channel": channel,
+                    "error": f"{type(err).__name__}: {err}"[:240],
+                })
+                return
+
+            # 42P10 fallback: SELECT existing row, then UPDATE or INSERT.
+            try:
+                existing = (
+                    sb.table(DAILY_METRICS_TABLE)
+                    .select("id")
+                    .eq("date", payload["date"])
+                    .eq("channel", payload["channel"])
+                    .limit(1)
+                    .execute()
+                )
+            except Exception as e_sel:
+                logger.error(
+                    f"daily_metrics fallback SELECT failed for channel={channel}: "
+                    f"{type(e_sel).__name__}: {e_sel}",
+                    exc_info=True,
+                )
+                errors.append({
+                    "channel": channel,
+                    "error": f"{type(e_sel).__name__}: {e_sel}"[:240],
+                })
+                return
+
+            if existing.data:
+                row_id = existing.data[0]["id"]
+                op_builder = lambda p: sb.table(DAILY_METRICS_TABLE).update(p).eq("id", row_id)
+            else:
+                op_builder = lambda p: sb.table(DAILY_METRICS_TABLE).insert(p)
+
+            ok, err, _ = _exec_drop_unknown(op_builder, payload)
+            if ok:
+                upserted.append(channel)
+                logger.warning(
+                    "daily_metrics has no UNIQUE(date,channel) constraint on this "
+                    "Supabase — wrote via select+update/insert."
+                )
+            else:
+                logger.error(
+                    f"daily_metrics fallback write failed for channel={channel}: "
+                    f"{type(err).__name__}: {err}",
+                    exc_info=True,
+                )
+                errors.append({
+                    "channel": channel,
+                    "error": f"{type(err).__name__}: {err}"[:240],
+                })
 
             if last_error is not None:
                 logger.error(
