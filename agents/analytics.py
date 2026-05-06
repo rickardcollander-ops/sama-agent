@@ -103,6 +103,14 @@ class AnalyticsAgent:
         channels = result.get("total_channels")
         if channels is None:
             channels = len(result.get("channels_upserted") or [])
+        errors = result.get("errors") or []
+        if errors and channels == 0:
+            # Surface the first upsert error verbatim so the dashboard's
+            # "agent reported" diagnosis tells the user what to fix.
+            first = errors[0].get("error") or "unknown error"
+            return f"Collected metrics across 0 channels — upsert failed: {first[:160]}"
+        if errors:
+            return f"Collected metrics across {channels} channels ({len(errors)} failed)"
         return f"Collected metrics across {channels} channels"
 
     # ── Data fetchers (one per channel) ───────────────────────────────
@@ -646,8 +654,12 @@ class AnalyticsAgent:
                 ).execute()
                 upserted.append(channel)
             except Exception as e:
-                logger.warning(f"Upsert failed for {channel}: {e}")
-                errors.append({"channel": channel, "error": str(e)})
+                logger.error(
+                    f"daily_metrics upsert failed for channel={channel}: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                errors.append({"channel": channel, "error": f"{type(e).__name__}: {e}"[:240]})
 
         # SEO channel
         _upsert_channel("seo", {

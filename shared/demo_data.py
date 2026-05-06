@@ -55,29 +55,18 @@ DEMO_SOCIAL_POSTS = [
 # ── Analytics Overview (30 days) ─────────────────────────────────────────────
 
 DEMO_ANALYTICS_OVERVIEW = {
-    "period": "last_30_days",
-    "summary": {
-        "total_sessions": 28400,
-        "total_pageviews": 68200,
-        "total_clicks": 3250,
-        "total_impressions": 89000,
-        "avg_position": 6.2,
-        "bounce_rate": 42.1,
-        "avg_session_duration": 185,
-        "conversion_rate": 2.8,
-        "total_conversions": 795,
-    },
-    "channels": {
-        "organic_search": {"sessions": 14200, "conversions": 425, "revenue": 42500},
-        "social": {"sessions": 6800, "conversions": 170, "revenue": 17000},
-        "paid_search": {"sessions": 4100, "conversions": 123, "revenue": 12300},
-        "direct": {"sessions": 2100, "conversions": 52, "revenue": 5200},
-        "referral": {"sessions": 1200, "conversions": 25, "revenue": 2500},
-    },
-    "trends": [
-        {"date": _date_ago(i), "sessions": 800 + (i % 7) * 80, "clicks": 90 + (i % 5) * 15, "impressions": 2500 + (i % 3) * 300, "conversions": 20 + (i % 4) * 5}
-        for i in range(30)
+    "channels": [
+        {"channel": "organic_search", "clicks": 1420, "impressions": 42100, "conversions": 425, "spend": 0.0},
+        {"channel": "social", "clicks": 680, "impressions": 19800, "conversions": 170, "spend": 0.0},
+        {"channel": "paid_search", "clicks": 410, "impressions": 12500, "conversions": 123, "spend": 4200.0},
+        {"channel": "direct", "clicks": 210, "impressions": 6300, "conversions": 52, "spend": 0.0},
+        {"channel": "referral", "clicks": 120, "impressions": 3500, "conversions": 25, "spend": 0.0},
     ],
+    "daily": [
+        {"date": _date_ago(i), "clicks": 90 + (i % 5) * 15, "impressions": 2500 + (i % 3) * 300}
+        for i in range(29, -1, -1)
+    ],
+    "totals": {"clicks": 2840, "impressions": 84200, "conversions": 795, "spend": 4200.0},
 }
 
 # ── Ad Creatives ─────────────────────────────────────────────────────────────
