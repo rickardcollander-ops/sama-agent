@@ -298,15 +298,71 @@ class AIVisibilityAgent:
         }
 
     def _build_prompt_categories(self) -> Dict[str, List[str]]:
-        """Return the prompts to monitor.
+        """Return the prompts to monitor for this tenant's brand.
 
-        When the tenant has saved GEO queries via the dashboard, those drive
-        the run (categorised as ``user_query``). Otherwise we fall back to the
-        legacy hard-coded MONITORING_PROMPTS so default/test runs still work.
+        Order of preference:
+          1. Saved GEO queries from the dashboard (per-site).
+          2. Auto-generated queries built from the tenant's brand_name,
+             domain and competitors. We build them per-tenant so a customer
+             on ``onlinesverige.se`` doesn't see runs for "Successifier vs
+             Notion" — that was the failure mode reported in the GEO panel
+             when no saved queries existed and the agent fell back to
+             MONITORING_PROMPTS.
+          3. ``MONITORING_PROMPTS`` only when there is no tenant_config
+             at all (legacy default-tenant runs). For any real tenant
+             without configured queries we'd rather generate from the
+             brand context than leak someone else's competitor names.
         """
         if self.tenant_config and self.tenant_config.geo_queries:
             return {"user_query": list(self.tenant_config.geo_queries)}
+
+        if self.tenant_config:
+            generated = self._generate_default_queries()
+            if generated:
+                return {"user_query": generated}
+
         return MONITORING_PROMPTS
+
+    def _generate_default_queries(self) -> List[str]:
+        """Build a small starter set of monitoring prompts from tenant context.
+
+        We avoid the global MONITORING_PROMPTS list because those reference
+        Successifier's competitive set (Gainsight, ChurnZero, …). Instead we
+        derive prompts from this tenant's brand, domain and competitors so
+        the GEO check is actually relevant to their market.
+        """
+        cfg = self.tenant_config
+        if not cfg:
+            return []
+
+        brand = (getattr(cfg, "brand_name", "") or "").strip()
+        domain = (getattr(cfg, "domain", "") or "").strip()
+        competitors = list(getattr(cfg, "competitors", None) or [])
+        category = (cfg.get_raw("business_type", "") or "").strip()
+        if not brand:
+            # Nothing to anchor the prompts on — let the caller decide what
+            # to do (the dashboard typically prompts the user to add saved
+            # queries before running).
+            return []
+
+        descriptor = category or "tools"
+        queries: List[str] = [
+            f"What does {brand} do?",
+            f"Is {brand} a good choice for {descriptor}?",
+            f"Best {descriptor} for small businesses",
+        ]
+        if domain:
+            queries.append(f"Tell me about {domain}")
+        for competitor in competitors[:3]:
+            queries.append(f"{brand} vs {competitor}")
+        # De-duplicate while preserving order.
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for q in queries:
+            if q not in seen:
+                seen.add(q)
+                deduped.append(q)
+        return deduped
 
     async def run_monitoring(self, run_id_for_progress: Optional[str] = None) -> Dict[str, Any]:
         """Run a full monitoring round: each prompt x each AI engine.

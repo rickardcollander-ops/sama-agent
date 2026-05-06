@@ -7,15 +7,18 @@ with fallback to global environment-variable settings.
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from shared.config import settings
 from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache: tenant_id -> (TenantConfig, expiry_timestamp)
-_tenant_cache: Dict[str, tuple] = {}
+# In-memory cache keyed by (account_id, site_id) so a single workspace owning
+# multiple sites doesn't collide on a single cached config. The historical
+# single-key path remains available — when only tenant_id is supplied we
+# treat it as both the account and the site dimension.
+_tenant_cache: Dict[Tuple[str, str], tuple] = {}
 _CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
@@ -229,51 +232,107 @@ class TenantConfig:
 
 # ── Public API ──────────────────────────────────────────────────────────
 
-async def get_tenant_config(tenant_id: str) -> TenantConfig:
+async def get_tenant_config(
+    tenant_id: str,
+    *,
+    account_id: Optional[str] = None,
+    site_id: Optional[str] = None,
+) -> TenantConfig:
     """
-    Load (or return cached) TenantConfig for the given tenant_id.
+    Load (or return cached) TenantConfig for the given tenant identity.
 
-    The tenant_id maps to user_id in the user_settings table.
-    Results are cached for 5 minutes to minimise DB round-trips.
+    Backwards compatible: callers that only have ``tenant_id`` keep working —
+    the function looks up user_settings by ``user_id = tenant_id`` exactly as
+    before. Newer callers can pass ``account_id`` and ``site_id`` so the cache
+    partitions correctly when a single account owns multiple sites.
+
+    Lookup order for the underlying user_settings row:
+      1. ``user_id = site_id`` (per-site override, when the dashboard has
+         provisioned one)
+      2. ``user_id = account_id`` (workspace-level defaults)
+      3. ``user_id = tenant_id`` (legacy single-tenant rows)
+
+    Results are cached for 5 minutes to minimise DB round-trips. The cache
+    key is the (account, site) pair so two sites under one account don't
+    share a single cached blob.
     """
     now = time.time()
 
+    cache_account = account_id or tenant_id
+    cache_site = site_id or tenant_id
+    cache_key = (cache_account, cache_site)
+
     # Check cache
-    if tenant_id in _tenant_cache:
-        cached_config, expiry = _tenant_cache[tenant_id]
+    if cache_key in _tenant_cache:
+        cached_config, expiry = _tenant_cache[cache_key]
         if now < expiry:
             return cached_config
 
-    # Load from Supabase
+    # Load from Supabase. Try the most specific lookup first and fall back
+    # to broader keys so legacy installs (where only tenant_id == user_id is
+    # populated) keep working.
     tenant_settings: Dict[str, Any] = {}
-    try:
-        sb = get_supabase()
-        result = (
-            sb.table("user_settings")
-            .select("settings")
-            .eq("user_id", tenant_id)
-            .single()
-            .execute()
-        )
+    sb = get_supabase()
+    lookup_keys: List[str] = []
+    for key in (site_id, account_id, tenant_id):
+        if key and key not in lookup_keys:
+            lookup_keys.append(key)
+
+    for key in lookup_keys:
+        try:
+            result = (
+                sb.table("user_settings")
+                .select("settings")
+                .eq("user_id", key)
+                .single()
+                .execute()
+            )
+        except Exception as e:
+            logger.debug(f"user_settings lookup failed for {key}: {e}")
+            continue
         if result.data:
             tenant_settings = result.data.get("settings", {}) or {}
-            logger.debug(f"Loaded tenant config for {tenant_id} from DB")
-        else:
-            logger.debug(f"No tenant settings found for {tenant_id}, using defaults")
-    except Exception as e:
-        logger.warning(f"Failed to load tenant config for {tenant_id}: {e}. Using defaults.")
+            logger.debug(
+                "Loaded tenant config (key=%s) for account=%s site=%s",
+                key, cache_account, cache_site,
+            )
+            break
+    else:
+        logger.debug(
+            "No user_settings row for account=%s site=%s — using defaults",
+            cache_account, cache_site,
+        )
 
-    config = TenantConfig(tenant_id, tenant_settings)
+    config = TenantConfig(cache_site, tenant_settings)
 
     # Cache it
-    _tenant_cache[tenant_id] = (config, now + _CACHE_TTL_SECONDS)
+    _tenant_cache[cache_key] = (config, now + _CACHE_TTL_SECONDS)
 
     return config
 
 
-def invalidate_tenant_cache(tenant_id: Optional[str] = None) -> None:
-    """Remove cached config for a tenant, or all tenants if tenant_id is None."""
-    if tenant_id is None:
+def invalidate_tenant_cache(
+    tenant_id: Optional[str] = None,
+    *,
+    account_id: Optional[str] = None,
+    site_id: Optional[str] = None,
+) -> None:
+    """Remove cached config for a tenant, or all tenants if everything is None.
+
+    Pass ``site_id`` to drop a single site's entry; pass ``account_id`` to drop
+    every site cached under that account. With nothing supplied (or just the
+    legacy ``tenant_id``) the historical "single key" semantics are preserved.
+    """
+    if tenant_id is None and account_id is None and site_id is None:
         _tenant_cache.clear()
-    else:
-        _tenant_cache.pop(tenant_id, None)
+        return
+
+    if account_id and not site_id:
+        # Drop every cached site under this account.
+        for key in [k for k in _tenant_cache if k[0] == account_id]:
+            _tenant_cache.pop(key, None)
+        return
+
+    cache_account = account_id or tenant_id
+    cache_site = site_id or tenant_id
+    _tenant_cache.pop((cache_account, cache_site), None)

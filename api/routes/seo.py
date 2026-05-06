@@ -142,14 +142,98 @@ async def track_keywords():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _normalize_ctr_fraction(value: Any) -> float:
+    """Return CTR as a fraction in [0, 1] regardless of how it was stored.
+
+    Historical inconsistency: some ingest paths wrote the raw GSC fraction
+    (0–1) into ``current_ctr`` while others wrote a percentage (0–100).
+    The frontend multiplies by 100 to render — so a row stored as ``0.41``
+    rendered correctly as ``41%`` but a row stored as ``41.1`` rendered as
+    ``4110%``. That's the 4111% bug on the successifier row.
+
+    Convention: **the API returns CTR as a fraction (0–1)** so the existing
+    frontend ``value * 100`` math is correct. Anything > 1 in the DB is
+    treated as a percentage and divided down; anything ≤ 1 is left as is.
+    Result is clamped to [0, 1] and rounded to 4 decimals (enough to
+    represent 0.01% precision after the frontend scales up).
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if v > 1.0:
+        v = v / 100.0
+    if v < 0.0:
+        v = 0.0
+    if v > 1.0:
+        v = 1.0
+    return round(v, 4)
+
+
+async def _has_active_gsc_sync(sb, tenant_id: str) -> bool:
+    """True iff this tenant has a Search Console connection that has synced.
+
+    The dashboard's "GSC: Not connected, Last sync: Never" state still showed
+    82 keywords because /keywords returned every row regardless of whether
+    the customer had ever connected GSC. We gate the response on a real
+    last_synced_at timestamp so a tenant with no connection sees an empty
+    list instead of stale or migrated data from another account.
+    """
+    try:
+        result = (
+            sb.table("google_connections")
+            .select("last_synced_at")
+            .eq("tenant_id", tenant_id)
+            .eq("service", "search_console")
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        # If the column hasn't been migrated yet (last_synced_at is added in
+        # migration 035) we fall back to "row exists" semantics so we don't
+        # break existing customers mid-rollout.
+        try:
+            result = (
+                sb.table("google_connections")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .eq("service", "search_console")
+                .limit(1)
+                .execute()
+            )
+            return bool(result.data)
+        except Exception:
+            return False
+    rows = result.data or []
+    if not rows:
+        return False
+    return bool(rows[0].get("last_synced_at"))
+
+
 @router.get("/keywords")
 async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
-    """Get all tracked keywords for the tenant."""
+    """Get all tracked keywords for the tenant.
+
+    Returns an empty list (with ``gsc_connected=false``) when the tenant has
+    never synced Search Console — otherwise stale rows from a prior
+    migration leak through and the dashboard shows "82 keywords" alongside
+    "GSC: Not connected".
+    """
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         sb = get_supabase()
+
+        gsc_connected = await _has_active_gsc_sync(sb, tenant_id)
+        if not gsc_connected and tenant_id != "default":
+            return {
+                "total": 0,
+                "tenant_id": tenant_id,
+                "gsc_connected": False,
+                "keywords": [],
+            }
+
         result = (
             sb.table("seo_keywords")
             .select("*")
@@ -163,6 +247,7 @@ async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
         return {
             "total": len(keywords),
             "tenant_id": tenant_id,
+            "gsc_connected": gsc_connected,
             "keywords": [
                 {
                     "id": kw.get("id"),
@@ -173,11 +258,11 @@ async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
                     "current_position": kw.get("current_position") or 0,
                     "current_clicks": kw.get("current_clicks") or 0,
                     "current_impressions": kw.get("current_impressions") or 0,
-                    "current_ctr": kw.get("current_ctr") or 0.0,
+                    "current_ctr": _normalize_ctr_fraction(kw.get("current_ctr")),
                     "position": kw.get("current_position") or 0,
                     "clicks": kw.get("current_clicks") or 0,
                     "impressions": kw.get("current_impressions") or 0,
-                    "ctr": kw.get("current_ctr") or 0.0,
+                    "ctr": _normalize_ctr_fraction(kw.get("current_ctr")),
                     "position_change": kw.get("position_change") or 0,
                     "position_trend": kw.get("position_trend") or "stable",
                     "last_checked_at": kw.get("last_checked_at"),
@@ -371,6 +456,66 @@ async def delete_keyword(keyword: str, request: Request):
         return {"success": True, "message": f'Removed "{keyword}"'}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/admin/wipe-tenant")
+async def admin_wipe_tenant(request: Request, account_id: Optional[str] = None):
+    """Delete every SEO/AI-visibility/agent row for a tenant.
+
+    Guard rails:
+    - Requires an internal admin token in the ``X-Sama-Admin-Token`` header
+      that matches the ``SAMA_ADMIN_TOKEN`` env var (rejects 403 otherwise).
+    - The ``account_id`` query param identifies which tenant's data to wipe.
+
+    This is the cleanup hatch for the GSC-data-leak case — when a customer
+    shows "82 keywords / GSC not connected" because rows were tagged with
+    the wrong account_id during the multi-tenancy rollout, an operator can
+    rerun this to drop the misattributed rows without touching healthy
+    tenants. Tenants whose rows are simply tagged as 'default' are migrated
+    en masse via the SQL backfill in migration 035 instead.
+    """
+    import os
+    expected = (os.getenv("SAMA_ADMIN_TOKEN") or "").strip()
+    supplied = (request.headers.get("X-Sama-Admin-Token") or "").strip()
+    if not expected or supplied != expected:
+        raise HTTPException(status_code=403, detail="admin token required")
+
+    target = (account_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="account_id query param required")
+    if target == "default":
+        raise HTTPException(
+            status_code=400,
+            detail="refusing to wipe the legacy 'default' tenant via this endpoint",
+        )
+
+    from shared.database import get_supabase
+    sb = get_supabase()
+    deleted: Dict[str, int] = {}
+
+    # Best-effort delete across the tables that carry tenant_id today. We
+    # don't fail the whole request when one table is missing on this
+    # install — just record 0.
+    targets = [
+        "seo_keywords",
+        "seo_audits",
+        "seo_strategies",
+        "agent_actions",
+        "ai_visibility_checks",
+        "ai_visibility_gaps",
+        "content_pieces",
+        "agent_runs",
+        "agent_reports",
+    ]
+    for table in targets:
+        try:
+            res = sb.table(table).delete().eq("tenant_id", target).execute()
+            deleted[table] = len(res.data or [])
+        except Exception as e:
+            logger.warning(f"wipe-tenant: skipped {table}: {e}")
+            deleted[table] = 0
+
+    return {"success": True, "account_id": target, "deleted": deleted}
 
 
 def _build_fingerprint(keywords: list) -> str:
