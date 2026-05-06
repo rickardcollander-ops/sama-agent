@@ -64,18 +64,33 @@ class PageReport:
     word_count: int = 0
     images_total: int = 0
     images_missing_alt: int = 0
+    images_missing_dimensions: int = 0
+    images_missing_lazy: int = 0
     canonical: Optional[str] = None
     has_schema: bool = False
     schema_types: List[str] = field(default_factory=list)
     has_open_graph: bool = False
     has_viewport: bool = False
     has_lang: bool = False
+    has_hreflang: bool = False
     internal_links: int = 0
     external_links: int = 0
+    # Body keywords per page so the keyword opportunity layer can build
+    # site-wide topic clusters without re-fetching.
+    h1_text: Optional[str] = None
+    h2_texts: List[str] = field(default_factory=list)
+    body_text_sample: Optional[str] = None
+    # Security headers captured from the HTTP response — used for the
+    # technical-SEO score and to surface concrete fix instructions.
+    security_headers: Dict[str, bool] = field(default_factory=dict)
     issues: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return self.__dict__.copy()
+        # body_text_sample is captured for keyword extraction but is too
+        # noisy to ship over the wire; strip it from the page payload.
+        d = self.__dict__.copy()
+        d.pop("body_text_sample", None)
+        return d
 
 
 @dataclass
@@ -83,6 +98,28 @@ class BrokenLink:
     url: str
     status_code: int
     found_on: List[str]
+
+
+# Security headers we surface in the audit. Keys are the response-header names
+# (case-insensitive lookup), values are short labels and the fix snippet shown
+# to users when missing.
+SECURITY_HEADERS: List[Tuple[str, str, str]] = [
+    ("strict-transport-security",
+     "HSTS",
+     'Add `Strict-Transport-Security: max-age=31536000; includeSubDomains` to force HTTPS.'),
+    ("content-security-policy",
+     "CSP",
+     'Add a `Content-Security-Policy` header restricting script/style sources.'),
+    ("x-content-type-options",
+     "X-Content-Type-Options",
+     'Add `X-Content-Type-Options: nosniff` to block MIME-sniffing attacks.'),
+    ("referrer-policy",
+     "Referrer-Policy",
+     'Add `Referrer-Policy: strict-origin-when-cross-origin` to limit referrer leakage.'),
+    ("x-frame-options",
+     "X-Frame-Options",
+     'Add `X-Frame-Options: SAMEORIGIN` (or use CSP `frame-ancestors`) to prevent clickjacking.'),
+]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -199,7 +236,7 @@ class SiteAuditAgent:
             if sitemap_urls:
                 pages_to_audit = sitemap_urls[:max_pages]
             else:
-                home_html, home_status, home_ms = await self._fetch_html(client, base_url + "/")
+                home_html, home_status, home_ms, _home_headers = await self._fetch_html(client, base_url + "/")
                 if home_html:
                     home_links = self._extract_links(base_url, home_html, host, internal_only=True)
                     pages_to_audit = [base_url + "/"] + home_links[: max_pages - 1]
@@ -251,6 +288,17 @@ class SiteAuditAgent:
                 findings = self._compute_findings(pages, robots, llms, sitemap_urls, base_url, broken_links)
                 recommendations = self._compute_recommendations(findings)
 
+            # Group recommendations by execution profile so the dashboard
+            # can render quick-wins / strategic / technical-debt buckets
+            # instead of a flat top-N list.
+            recommendation_groups = self._group_recommendations(recommendations)
+
+            # Keyword opportunities — best-effort. We pass the already-crawled
+            # pages so the keyword agent doesn't refetch the site.
+            keyword_opportunities = await self._build_keyword_opportunities(
+                client, host, base_url, successful_pages
+            )
+
             summary = {
                 "pages_analyzed": len(pages),
                 "pages_loaded": len(successful_pages),
@@ -283,7 +331,57 @@ class SiteAuditAgent:
                 "broken_links": [bl.__dict__ for bl in broken_links],
                 "findings": findings,
                 "recommendations": recommendations,
+                "recommendation_groups": recommendation_groups,
+                "keyword_opportunities": keyword_opportunities,
             }
+
+    # ── Recommendation grouping + keyword opportunities ─────────────────────
+
+    @staticmethod
+    def _group_recommendations(recs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """Bucket recommendations by their `group` field. A recommendation
+        with no group is treated as technical-debt by default."""
+        groups: Dict[str, List[Dict[str, Any]]] = {
+            "quick_win": [],
+            "strategic": [],
+            "technical_debt": [],
+            "monitoring": [],
+        }
+        for r in recs:
+            g = r.get("group") or "technical_debt"
+            groups.setdefault(g, []).append(r)
+        return groups
+
+    async def _build_keyword_opportunities(
+        self,
+        client: httpx.AsyncClient,
+        host: str,
+        base_url: str,
+        pages: List[PageReport],
+    ) -> Optional[Dict[str, Any]]:
+        """Run the keyword opportunity agent against the audited pages.
+
+        Returns None when there's no data to analyse or the agent fails — the
+        dashboard treats a missing field as "feature unavailable" rather than
+        an error, so this stays best-effort.
+        """
+        if not pages:
+            return None
+        try:
+            from agents.keyword_opportunity import KeywordOpportunityAgent
+        except Exception as e:
+            logger.info(f"keyword_opportunity import skipped: {e}")
+            return None
+        try:
+            agent = KeywordOpportunityAgent(
+                tenant_config=getattr(self, "tenant_config", None)
+            )
+            return await agent.build(
+                host=host, base_url=base_url, pages=pages, client=client,
+            )
+        except Exception as e:
+            logger.warning(f"keyword opportunities failed for {host}: {e}")
+            return None
 
     # ── Network primitives ──────────────────────────────────────────────────
 
@@ -345,18 +443,25 @@ class SiteAuditAgent:
 
     async def _fetch_html(
         self, client: httpx.AsyncClient, url: str
-    ) -> Tuple[Optional[str], int, int]:
+    ) -> Tuple[Optional[str], int, int, Dict[str, str]]:
+        """Returns (html, status, ms, response_headers).
+
+        Headers are returned even on non-HTML or error responses so callers can
+        still inspect things like security headers when a page is reachable
+        but renders no body (e.g. a CDN edge response).
+        """
         start = time.time()
         try:
             r = await client.get(url)
             ms = int((time.time() - start) * 1000)
-            ctype = r.headers.get("content-type", "").lower()
+            headers = {k.lower(): v for k, v in r.headers.items()}
+            ctype = headers.get("content-type", "").lower()
             if r.status_code < 400 and ("html" in ctype or not ctype):
-                return r.text, r.status_code, ms
-            return None, r.status_code, ms
+                return r.text, r.status_code, ms, headers
+            return None, r.status_code, ms, headers
         except Exception as e:
             logger.debug(f"fetch_html {url}: {e}")
-            return None, 0, int((time.time() - start) * 1000)
+            return None, 0, int((time.time() - start) * 1000), {}
 
     # ── Sitemap discovery ───────────────────────────────────────────────────
 
@@ -428,13 +533,16 @@ class SiteAuditAgent:
     async def _audit_page(
         self, client: httpx.AsyncClient, url: str, host: str
     ) -> Optional[PageReport]:
-        html, status, ms = await self._fetch_html(client, url)
+        html, status, ms, headers = await self._fetch_html(client, url)
+        sec_headers = self._inspect_security_headers(headers)
         if html is None:
             return PageReport(url=url, status_code=status, response_ms=ms,
+                              security_headers=sec_headers,
                               issues=["fetch_failed"])
 
         soup = BeautifulSoup(html, "lxml")
-        report = PageReport(url=url, status_code=status, response_ms=ms)
+        report = PageReport(url=url, status_code=status, response_ms=ms,
+                            security_headers=sec_headers)
 
         # Title
         if soup.title and soup.title.string:
@@ -447,10 +555,19 @@ class SiteAuditAgent:
             report.meta_description = md["content"].strip()
             report.meta_description_length = len(report.meta_description)
 
-        # Headings
-        report.h1_count = len(soup.find_all("h1"))
-        report.h2_count = len(soup.find_all("h2"))
+        # Headings — also keep the actual H1/H2 text so the keyword
+        # opportunity layer can extract topic targeting per page.
+        h1_tags = soup.find_all("h1")
+        h2_tags = soup.find_all("h2")
+        report.h1_count = len(h1_tags)
+        report.h2_count = len(h2_tags)
         report.h3_count = len(soup.find_all("h3"))
+        if h1_tags:
+            report.h1_text = (h1_tags[0].get_text(" ", strip=True) or None)
+        report.h2_texts = [
+            (h.get_text(" ", strip=True) or "")
+            for h in h2_tags[:10] if h.get_text(strip=True)
+        ]
 
         # Schema.org JSON-LD — extract BEFORE stripping <script> tags below.
         for s in soup.find_all("script", type=lambda v: v and "ld+json" in v.lower()):
@@ -463,17 +580,32 @@ class SiteAuditAgent:
                 if t and t not in report.schema_types:
                     report.schema_types.append(t)
 
-        # Word count (rough — strip script/style after we've consumed them)
+        # Word count + body sample (rough — strip script/style first).
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
-        report.word_count = _word_count(soup.get_text(" ", strip=True))
+        body_text = soup.get_text(" ", strip=True)
+        report.word_count = _word_count(body_text)
+        # Keep first ~6k chars for keyword extraction; full body text would
+        # blow up the JSON payload but a sample captures the page's topic.
+        report.body_text_sample = body_text[:6000] if body_text else None
 
-        # Images
+        # Images — alt, dimensions (CLS), and lazy-loading.
         imgs = soup.find_all("img")
         report.images_total = len(imgs)
         report.images_missing_alt = sum(
             1 for i in imgs if not (i.get("alt") and i["alt"].strip())
         )
+        report.images_missing_dimensions = sum(
+            1 for i in imgs if not (i.get("width") and i.get("height"))
+        )
+        # Only flag missing lazy-loading when the page has enough images that
+        # below-the-fold lazy-loading actually matters. The first ~3 images
+        # are typically above the fold, so we exclude them.
+        if len(imgs) > 3:
+            report.images_missing_lazy = sum(
+                1 for i in imgs[3:]
+                if (i.get("loading") or "").strip().lower() != "lazy"
+            )
 
         # Canonical
         canon = soup.find("link", rel=lambda v: v and "canonical" in (v if isinstance(v, list) else [v]))
@@ -490,6 +622,12 @@ class SiteAuditAgent:
         # <html lang>
         html_tag = soup.find("html")
         report.has_lang = bool(html_tag and html_tag.get("lang"))
+
+        # Hreflang — important for international SEO. We only require it on
+        # sites that actually have multilingual variants, but we still record
+        # presence so the site-level finding can decide whether to flag it.
+        report.has_hreflang = bool(soup.find("link", rel=lambda v: v and "alternate" in (v if isinstance(v, list) else [v]),
+                                              hreflang=True))
 
         # Links
         all_links = soup.find_all("a", href=True)
@@ -523,6 +661,10 @@ class SiteAuditAgent:
             report.issues.append("thin_content")
         if report.images_missing_alt > 0:
             report.issues.append("images_missing_alt")
+        if report.images_missing_dimensions > 0 and report.images_total > 0:
+            report.issues.append("images_missing_dimensions")
+        if report.images_missing_lazy > 0:
+            report.issues.append("images_missing_lazy")
         if not report.has_viewport:
             report.issues.append("missing_viewport")
         if not report.has_lang:
@@ -533,8 +675,18 @@ class SiteAuditAgent:
             report.issues.append("missing_open_graph")
         if not report.canonical:
             report.issues.append("missing_canonical")
+        # Security headers — only flag the most impactful ones at the page
+        # level; the site-level rollup will summarise the rest.
+        if not report.security_headers.get("strict-transport-security", False):
+            report.issues.append("missing_hsts")
+        if not report.security_headers.get("x-content-type-options", False):
+            report.issues.append("missing_xcto")
 
         return report
+
+    def _inspect_security_headers(self, headers: Dict[str, str]) -> Dict[str, bool]:
+        """Returns a presence map for the security headers we surface."""
+        return {name: bool(headers.get(name)) for name, _, _ in SECURITY_HEADERS}
 
     def _extract_schema_types(self, node: Any) -> List[str]:
         out: List[str] = []
@@ -724,6 +876,152 @@ class SiteAuditAgent:
 
     # ── Findings + recommendations ──────────────────────────────────────────
 
+    # Single source of truth for page-level findings. Each entry is keyed by
+    # the issue string emitted from `_audit_page` and carries enough context
+    # to produce both a finding and an actionable recommendation.
+    PAGE_ISSUE_RULES: List[Tuple[str, Dict[str, Any]]] = [
+        ("missing_title", {
+            "category": "on_page", "severity": "critical",
+            "title": "Pages missing a <title>",
+            "description": "Every page needs a unique, descriptive title between 30–65 characters.",
+            "how_to_fix": "Add `<title>Primary keyword | Brand</title>` in each page's <head>. Lead with the keyword, end with the brand.",
+            "impact": "high", "effort": "low", "group": "quick_win",
+        }),
+        ("short_title", {
+            "category": "on_page", "severity": "warning",
+            "title": "Page titles too short",
+            "description": "Aim for 30–65 characters to maximise SERP CTR.",
+            "how_to_fix": "Expand each title with a benefit or qualifier (location, year, audience). Keep total length 30–65 chars.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("long_title", {
+            "category": "on_page", "severity": "warning",
+            "title": "Page titles too long",
+            "description": "Titles over 65 chars get truncated in Google SERPs.",
+            "how_to_fix": "Trim filler words and move secondary modifiers to the meta description.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_meta_description", {
+            "category": "on_page", "severity": "warning",
+            "title": "Pages missing a meta description",
+            "description": "Meta descriptions help CTR and are surfaced by AI assistants summarising the page.",
+            "how_to_fix": "Add `<meta name=\"description\" content=\"…\">` summarising the page in 80–165 chars with a clear benefit.",
+            "impact": "high", "effort": "low", "group": "quick_win",
+        }),
+        ("short_meta_description", {
+            "category": "on_page", "severity": "info",
+            "title": "Meta descriptions too short",
+            "description": "Aim for 80–165 characters.",
+            "how_to_fix": "Expand the description with a concrete benefit or differentiator.",
+            "impact": "low", "effort": "low", "group": "quick_win",
+        }),
+        ("long_meta_description", {
+            "category": "on_page", "severity": "info",
+            "title": "Meta descriptions too long",
+            "description": "Descriptions over 165 chars get truncated.",
+            "how_to_fix": "Tighten copy; keep the value-prop in the first 120 chars so it survives truncation.",
+            "impact": "low", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_h1", {
+            "category": "on_page", "severity": "critical",
+            "title": "Pages missing an <h1>",
+            "description": "Every page needs exactly one h1 describing the page topic.",
+            "how_to_fix": "Add a single `<h1>` near the top of the main content with the primary keyword.",
+            "impact": "high", "effort": "low", "group": "quick_win",
+        }),
+        ("multiple_h1", {
+            "category": "on_page", "severity": "warning",
+            "title": "Pages with multiple <h1> tags",
+            "description": "Use one h1 and structure the rest as h2/h3.",
+            "how_to_fix": "Keep one `<h1>` and convert duplicates to `<h2>` / `<h3>`.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("thin_content", {
+            "category": "on_page", "severity": "warning",
+            "title": "Thin content (<300 words)",
+            "description": "Pages with under 300 words rarely rank or get cited by AI assistants.",
+            "how_to_fix": "Expand to 600+ words with FAQs, examples, comparisons, and original data.",
+            "impact": "high", "effort": "high", "group": "strategic",
+        }),
+        ("images_missing_alt", {
+            "category": "on_page", "severity": "warning",
+            "title": "Images missing alt text",
+            "description": "Alt text helps accessibility, image search, and AI summarisation.",
+            "how_to_fix": "Add descriptive `alt=\"…\"` to each `<img>`. Decorative images can use `alt=\"\"`.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("images_missing_dimensions", {
+            "category": "performance", "severity": "warning",
+            "title": "Images missing width/height",
+            "description": "Without explicit dimensions the browser can't reserve space, hurting Cumulative Layout Shift (CLS).",
+            "how_to_fix": "Add `width` and `height` attributes (or set `aspect-ratio` in CSS) on every `<img>`.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("images_missing_lazy", {
+            "category": "performance", "severity": "info",
+            "title": "Below-the-fold images not lazy-loaded",
+            "description": "Lazy-loading defers off-screen images and improves Largest Contentful Paint (LCP).",
+            "how_to_fix": "Add `loading=\"lazy\"` to images that appear below the initial viewport.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_viewport", {
+            "category": "technical", "severity": "critical",
+            "title": "Pages without mobile viewport",
+            "description": "Without a viewport meta tag Google's mobile-first index treats the page as non-mobile-friendly.",
+            "how_to_fix": "Add `<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">` to every page.",
+            "impact": "high", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_html_lang", {
+            "category": "technical", "severity": "warning",
+            "title": "Pages without <html lang>",
+            "description": "Set the lang attribute so search engines and AI know the language.",
+            "how_to_fix": "Set `<html lang=\"sv\">` (or appropriate ISO code) on every page.",
+            "impact": "low", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_structured_data", {
+            "category": "geo", "severity": "warning",
+            "title": "Pages without schema.org markup",
+            "description": "Schema.org JSON-LD significantly boosts AI assistant citation rate and SERP rich results.",
+            "how_to_fix": "Add JSON-LD for `Organization`, `WebSite`, and the page-specific type (Article, Product, FAQPage, HowTo).",
+            "impact": "high", "effort": "medium", "group": "strategic",
+        }),
+        ("missing_open_graph", {
+            "category": "geo", "severity": "info",
+            "title": "Pages without Open Graph tags",
+            "description": "OG tags control how the page renders when shared and are read by some AI crawlers.",
+            "how_to_fix": "Add `og:title`, `og:description`, `og:image`, and `og:url` meta tags in each page's <head>.",
+            "impact": "medium", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_canonical", {
+            "category": "technical", "severity": "info",
+            "title": "Pages without canonical link",
+            "description": "Canonical links prevent duplicate-content penalties.",
+            "how_to_fix": "Add `<link rel=\"canonical\" href=\"<absolute-url>\">` on every page (self-referential is fine).",
+            "impact": "low", "effort": "low", "group": "quick_win",
+        }),
+        ("missing_hsts", {
+            "category": "technical", "severity": "warning",
+            "title": "HTTPS not enforced (HSTS missing)",
+            "description": "Without HSTS, browsers may downgrade requests to HTTP on first visit.",
+            "how_to_fix": "Send `Strict-Transport-Security: max-age=31536000; includeSubDomains` from the server.",
+            "impact": "medium", "effort": "low", "group": "technical_debt",
+        }),
+        ("missing_xcto", {
+            "category": "technical", "severity": "info",
+            "title": "X-Content-Type-Options missing",
+            "description": "MIME-sniffing protection is recommended by browsers and security scanners.",
+            "how_to_fix": "Send `X-Content-Type-Options: nosniff` from the server.",
+            "impact": "low", "effort": "low", "group": "technical_debt",
+        }),
+        ("fetch_failed", {
+            "category": "technical", "severity": "critical",
+            "title": "Pages that failed to load",
+            "description": "These pages returned an error or timed out during the audit.",
+            "how_to_fix": "Check server logs for errors; verify the URLs aren't blocked by robots.txt or a CDN rule.",
+            "impact": "high", "effort": "medium", "group": "technical_debt",
+        }),
+    ]
+
     def _compute_findings(
         self,
         pages: List[PageReport],
@@ -736,70 +1034,136 @@ class SiteAuditAgent:
         findings: List[Dict[str, Any]] = []
         n = len(pages) or 1
 
-        def _add(category: str, severity: str, title: str, description: str, affected: int) -> None:
+        def _add(
+            category: str, severity: str, title: str, description: str,
+            affected: int, *,
+            affected_urls: Optional[List[str]] = None,
+            how_to_fix: Optional[str] = None,
+            impact: Optional[str] = None,
+            effort: Optional[str] = None,
+            group: Optional[str] = None,
+        ) -> None:
             findings.append({
                 "category": category,
                 "severity": severity,
                 "title": title,
                 "description": description,
                 "affected_pages": affected,
+                "affected_urls": (affected_urls or [])[:8],
+                "how_to_fix": how_to_fix,
+                "impact": impact,
+                "effort": effort,
+                "group": group,
             })
 
-        # Domain-level
+        # Domain-level — these don't have specific URLs but still benefit
+        # from concrete fix instructions.
         if not base_url.startswith("https://"):
             _add("technical", "critical", "Site not served over HTTPS",
-                 "Search engines and browsers penalise non-HTTPS sites; switch to TLS.", n)
+                 "Search engines and browsers penalise non-HTTPS sites; switch to TLS.", n,
+                 how_to_fix="Provision a TLS certificate (Let's Encrypt is free) and redirect all HTTP traffic to HTTPS.",
+                 impact="high", effort="medium", group="technical_debt")
         if not robots:
             _add("technical", "warning", "robots.txt is missing",
-                 "Add a robots.txt at the domain root to control crawler access.", 0)
+                 "Add a robots.txt at the domain root to control crawler access.", 0,
+                 how_to_fix="Create `/robots.txt` allowing crawlers and pointing at your sitemap: `Sitemap: https://example.com/sitemap.xml`.",
+                 impact="medium", effort="low", group="quick_win")
         if not sitemap_urls:
             _add("technical", "warning", "sitemap.xml is missing",
-                 "Submit a sitemap so search engines and AI crawlers can discover every page.", 0)
+                 "Submit a sitemap so search engines and AI crawlers can discover every page.", 0,
+                 how_to_fix="Generate `/sitemap.xml`, reference it in `robots.txt`, and submit it in Google Search Console.",
+                 impact="high", effort="low", group="quick_win")
         if not llms:
             _add("geo", "info", "llms.txt not present",
-                 "An llms.txt file lets you guide LLM crawlers about which content to prioritise.", 0)
+                 "An llms.txt file lets you guide LLM crawlers about which content to prioritise.", 0,
+                 how_to_fix="Create `/llms.txt` with a concise list of your most-cite-worthy URLs and what each covers.",
+                 impact="medium", effort="low", group="quick_win")
 
-        # Page-level rollups
-        def _count(issue: str) -> int:
-            return sum(1 for p in pages if issue in p.issues)
+        # Site-level: duplicate titles / meta descriptions across audited pages.
+        title_to_urls: Dict[str, List[str]] = {}
+        meta_to_urls: Dict[str, List[str]] = {}
+        for p in pages:
+            if p.title and p.title.strip():
+                title_to_urls.setdefault(p.title.strip(), []).append(p.url)
+            if p.meta_description and p.meta_description.strip():
+                meta_to_urls.setdefault(p.meta_description.strip(), []).append(p.url)
+        dupe_title_urls = [u for urls in title_to_urls.values() if len(urls) > 1 for u in urls]
+        dupe_meta_urls = [u for urls in meta_to_urls.values() if len(urls) > 1 for u in urls]
+        if dupe_title_urls:
+            _add("on_page", "warning", "Duplicate page titles",
+                 "Multiple pages share the same <title>, diluting topical relevance and SERP CTR.",
+                 len(dupe_title_urls),
+                 affected_urls=dupe_title_urls,
+                 how_to_fix="Make each page's <title> unique by adding a page-specific qualifier (topic, location, model, year).",
+                 impact="medium", effort="low", group="quick_win")
+        if dupe_meta_urls:
+            _add("on_page", "info", "Duplicate meta descriptions",
+                 "Multiple pages share the same meta description, weakening their SERP appearance.",
+                 len(dupe_meta_urls),
+                 affected_urls=dupe_meta_urls,
+                 how_to_fix="Write a unique meta description for each page summarising its specific value.",
+                 impact="low", effort="low", group="quick_win")
 
-        rules = [
-            ("missing_title",            "on_page",   "critical", "Pages missing a <title>",                  "Every page needs a unique, descriptive title between 30–65 characters."),
-            ("short_title",              "on_page",   "warning",  "Page titles too short",                    "Aim for 30–65 characters to maximise SERP CTR."),
-            ("long_title",               "on_page",   "warning",  "Page titles too long",                     "Titles over 65 chars get truncated in Google SERPs."),
-            ("missing_meta_description", "on_page",   "warning",  "Pages missing a meta description",         "Meta descriptions help CTR and are surfaced by AI assistants summarising the page."),
-            ("short_meta_description",   "on_page",   "info",     "Meta descriptions too short",              "Aim for 80–165 characters."),
-            ("long_meta_description",    "on_page",   "info",     "Meta descriptions too long",               "Descriptions over 165 chars get truncated."),
-            ("missing_h1",               "on_page",   "critical", "Pages missing an <h1>",                    "Every page needs exactly one h1 describing the page topic."),
-            ("multiple_h1",              "on_page",   "warning",  "Pages with multiple <h1> tags",            "Use one h1 and structure the rest as h2/h3."),
-            ("thin_content",             "on_page",   "warning",  "Thin content (<300 words)",                "Pages with under 300 words rarely rank or get cited by AI assistants."),
-            ("images_missing_alt",       "on_page",   "warning",  "Images missing alt text",                  "Alt text helps accessibility, image search, and AI summarisation."),
-            ("missing_viewport",         "technical", "critical", "Pages without mobile viewport",            "Add <meta name=\"viewport\"> for mobile rendering and Google mobile-friendly status."),
-            ("missing_html_lang",        "technical", "warning",  "Pages without <html lang>",                "Set the lang attribute so search engines and AI know the language."),
-            ("missing_structured_data",  "geo",       "warning",  "Pages without schema.org markup",          "Schema.org JSON-LD significantly boosts AI assistant citation rate."),
-            ("missing_open_graph",       "geo",       "info",     "Pages without Open Graph tags",            "OG tags control how the page renders when shared and are read by some AI crawlers."),
-            ("missing_canonical",        "technical", "info",     "Pages without canonical link",             "Canonical links prevent duplicate-content penalties."),
-            ("fetch_failed",             "technical", "critical", "Pages that failed to load",                "These pages returned an error or timed out during the audit."),
-        ]
-        for issue, category, severity, title, desc in rules:
-            c = _count(issue)
-            if c > 0:
-                _add(category, severity, title, desc, c)
+        # Site-level: hreflang. Only flag if NO page has it — single-language
+        # sites are a valid configuration.
+        if pages and not any(p.has_hreflang for p in pages):
+            _add("technical", "info", "No hreflang tags found",
+                 "If you serve multiple languages or regions, hreflang tells Google which version to show.",
+                 0,
+                 how_to_fix="Add `<link rel=\"alternate\" hreflang=\"<code>\" href=\"<url>\">` for each language/region variant in <head>.",
+                 impact="medium", effort="medium", group="strategic")
+
+        # Site-level: security headers (most useful when consistently missing).
+        sec_missing: Dict[str, List[str]] = {}
+        for header_name, label, fix in SECURITY_HEADERS:
+            if header_name in ("strict-transport-security", "x-content-type-options"):
+                continue  # handled per-page
+            missing = [p.url for p in pages if not p.security_headers.get(header_name)]
+            if missing and len(missing) == len(pages):
+                sec_missing[label] = missing
+        for label, urls in sec_missing.items():
+            fix_text = next((f for n_, l, f in SECURITY_HEADERS if l == label), "")
+            _add("technical", "info", f"{label} header missing",
+                 f"The {label} response header is missing on every audited page.",
+                 len(urls),
+                 affected_urls=urls,
+                 how_to_fix=fix_text,
+                 impact="low", effort="low", group="technical_debt")
+
+        # Page-level rollups via the rules table.
+        rule_map = dict(self.PAGE_ISSUE_RULES)
+        for issue, meta in self.PAGE_ISSUE_RULES:
+            urls = [p.url for p in pages if issue in p.issues]
+            if not urls:
+                continue
+            _add(meta["category"], meta["severity"], meta["title"], meta["description"],
+                 len(urls),
+                 affected_urls=urls,
+                 how_to_fix=meta.get("how_to_fix"),
+                 impact=meta.get("impact"), effort=meta.get("effort"),
+                 group=meta.get("group"))
 
         # Broken links
         if broken_links:
             _add("links", "critical" if len(broken_links) >= 5 else "warning",
                  f"{len(broken_links)} broken outbound link{'s' if len(broken_links) != 1 else ''}",
-                 "Broken links waste crawl budget and damage user trust.", len(broken_links))
+                 "Broken links waste crawl budget and damage user trust.", len(broken_links),
+                 affected_urls=[bl.url for bl in broken_links[:8]],
+                 how_to_fix="Fix or remove each broken link; for moved targets use a 301 to the new URL.",
+                 impact="medium", effort="low", group="quick_win")
 
         # Healthy signals
         if all(p.has_schema for p in pages) and pages:
             _add("geo", "success", "All audited pages include structured data",
-                 "Schema.org markup is consistently applied — keep it up to date.", n)
+                 "Schema.org markup is consistently applied — keep it up to date.", n,
+                 group="monitoring")
         if all(p.h1_count == 1 for p in pages) and pages:
             _add("on_page", "success", "All audited pages have exactly one <h1>",
-                 "Heading structure is clean across the audited pages.", n)
+                 "Heading structure is clean across the audited pages.", n,
+                 group="monitoring")
 
+        # Use rule_map to silence unused-var lint if applicable.
+        _ = rule_map
         return findings
 
     def _unreachable_findings(
@@ -849,9 +1213,19 @@ class SiteAuditAgent:
                 "reachable over HTTPS, then re-run the audit." + diag
             ),
             "affected_pages": attempted,
+            "affected_urls": [],
+            "how_to_fix": "Verify DNS, that the server is online, and that no firewall/CDN rule blocks the audit user agent.",
+            "impact": "high",
+            "effort": "medium",
+            "group": "technical_debt",
         }]
 
     def _compute_recommendations(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return ALL actionable recommendations enriched with how_to_fix /
+        impact / effort / group / affected_urls so the dashboard can group
+        them (Quick wins / Strategic / Technical debt) instead of showing a
+        flat top-10 list.
+        """
         sev_priority = {"critical": "high", "warning": "medium", "info": "low", "success": "low"}
         # Drop "success" entries from recommendations.
         actionable = [f for f in findings if f["severity"] != "success"]
@@ -865,6 +1239,11 @@ class SiteAuditAgent:
                 "title": f["title"],
                 "description": f["description"],
                 "affected_count": f.get("affected_pages", 0),
+                "affected_urls": f.get("affected_urls") or [],
+                "how_to_fix": f.get("how_to_fix"),
+                "impact": f.get("impact"),
+                "effort": f.get("effort"),
+                "group": f.get("group") or "technical_debt",
             }
-            for f in actionable[:10]
+            for f in actionable
         ]
