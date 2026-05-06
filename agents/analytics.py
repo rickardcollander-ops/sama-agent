@@ -1063,17 +1063,6 @@ class AnalyticsAgent:
                     "error": f"{type(err).__name__}: {err}"[:240],
                 })
 
-            if last_error is not None:
-                logger.error(
-                    f"daily_metrics upsert failed for channel={channel}: "
-                    f"{type(last_error).__name__}: {last_error}",
-                    exc_info=True,
-                )
-                errors.append({
-                    "channel": channel,
-                    "error": f"{type(last_error).__name__}: {last_error}"[:240],
-                })
-
         # SEO channel
         _upsert_channel("seo", {
             "total_clicks": seo_data.get("total_clicks", 0),
