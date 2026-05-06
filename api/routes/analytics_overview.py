@@ -196,19 +196,13 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
         reverse=True,
     )
 
-    # ── 4. Build daily series (DB + synthetic today if empty) ─────────
+    # ── 4. Build daily series ─────────────────────────────────────────
+    # Live per-day GSC + GA4 always covers the full requested window, so
+    # whenever it has data we use it directly. DB rows from daily_metrics
+    # are unreliable here — they can be sparse or contain zero-valued rows
+    # from failed/partial syncs that would otherwise blank out the chart.
     daily_map: Dict[str, Dict[str, Any]] = {}
-    for r in db_rows:
-        date = r.get("date") or ""
-        if not date:
-            continue
-        entry = daily_map.setdefault(date, {"date": date, "clicks": 0, "impressions": 0})
-        entry["clicks"] += r.get("total_clicks") or 0
-        entry["impressions"] += r.get("total_impressions") or 0
-
-    # If DB gave us no daily rows, build the daily series from live per-day
-    # GSC + GA4 fetches so the chart shows real history, not just today.
-    if not daily_map:
+    if seo_daily_live or ga4_daily_live:
         for row in seo_daily_live:
             d = row.get("date")
             if not d:
@@ -223,18 +217,28 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
             entry = daily_map.setdefault(d, {"date": d, "clicks": 0, "impressions": 0})
             entry["clicks"] += int(row.get("clicks") or 0)
             entry["impressions"] += int(row.get("impressions") or 0)
+    else:
+        for r in db_rows:
+            date = r.get("date") or ""
+            if not date:
+                continue
+            entry = daily_map.setdefault(date, {"date": date, "clicks": 0, "impressions": 0})
+            entry["clicks"] += r.get("total_clicks") or 0
+            entry["impressions"] += r.get("total_impressions") or 0
 
     daily = sorted(daily_map.values(), key=lambda d: d["date"])
 
     # ── 5. Totals ─────────────────────────────────────────────────────
-    if db_rows:
-        totals = _sum_totals(db_rows)
-    elif live_channels:
+    # Derived from the merged channels (which already combine DB + live)
+    # so the top cards always reflect what the breakdown table shows.
+    # Falling back to summing db_rows directly used to print zeros when
+    # daily_metrics had a single empty row from a failed sync.
+    if channels:
         totals = {
-            "clicks": sum(c["clicks"] for c in live_channels.values()),
-            "impressions": sum(c["impressions"] for c in live_channels.values()),
-            "conversions": sum(c.get("conversions", 0) for c in live_channels.values()),
-            "spend": round(sum(c.get("spend", 0.0) for c in live_channels.values()), 2),
+            "clicks": sum(c.get("clicks", 0) for c in channels),
+            "impressions": sum(c.get("impressions", 0) for c in channels),
+            "conversions": sum(int(c.get("conversions", 0) or 0) for c in channels),
+            "spend": round(sum(float(c.get("spend", 0.0) or 0) for c in channels), 2),
         }
     else:
         totals = {"clicks": 0, "impressions": 0, "conversions": 0, "spend": 0.0}
