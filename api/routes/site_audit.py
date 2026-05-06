@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 class RunPayload(BaseModel):
     domain: Optional[str] = None
-    max_pages: Optional[int] = 15
+    max_pages: Optional[int] = 200
 
 
 # ── POST /run ────────────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ async def run_site_audit(payload: RunPayload, request: Request):
     if not domain:
         raise HTTPException(status_code=400, detail="domain required")
 
-    max_pages = max(1, min(payload.max_pages or 15, 30))
+    max_pages = max(1, min(payload.max_pages or 200, 500))
     sb = get_supabase()
 
     # Persist the row before kicking off the background task — if the insert
@@ -79,6 +80,12 @@ async def run_site_audit(payload: RunPayload, request: Request):
     return {"id": run_id, "status": "running"}
 
 
+# How often (in seconds) we may write progress to Supabase. The crawler
+# fires the callback after every page; on a fast site that's many writes
+# per second. Throttling keeps DB load sane while still feeling live.
+_PROGRESS_WRITE_INTERVAL_S = 1.5
+
+
 async def _execute_audit(
     run_id: str,
     tenant_id: str,
@@ -91,8 +98,33 @@ async def _execute_audit(
     config = await get_tenant_config(tenant_id)
     agent = SiteAuditAgent(tenant_config=config)
 
+    last_write = {"t": 0.0, "total": 0}
+
+    async def progress_cb(done: int, total: int) -> None:
+        # Always write the first tick so the widget shows pages_total fast,
+        # then throttle, but always flush the final tick so the bar reaches
+        # 100% as soon as the crawl loop returns.
+        now = time.monotonic()
+        first = last_write["total"] == 0 and total > 0
+        final = total > 0 and done >= total
+        if not (first or final or now - last_write["t"] >= _PROGRESS_WRITE_INTERVAL_S):
+            return
+        last_write["t"] = now
+        last_write["total"] = total
+        try:
+            await asyncio.to_thread(
+                lambda: sb.table("site_audits").update({
+                    "pages_total": total,
+                    "pages_done": done,
+                }).eq("id", run_id).execute()
+            )
+        except Exception:
+            logger.debug(f"progress write failed for {run_id}", exc_info=True)
+
     try:
-        result = await agent.audit_domain(domain=domain, max_pages=max_pages)
+        result = await agent.audit_domain(
+            domain=domain, max_pages=max_pages, progress_cb=progress_cb,
+        )
         result["id"] = run_id
         update = {
             "status": "completed",
@@ -125,7 +157,7 @@ async def list_runs(request: Request, limit: int = 20):
     try:
         result = (
             sb.table("site_audits")
-            .select("id,domain,pages_analyzed,overall_score,status,started_at,completed_at,error")
+            .select("id,domain,pages_analyzed,pages_total,pages_done,overall_score,status,started_at,completed_at,error")
             .eq("tenant_id", tenant_id)
             .order("started_at", desc=True)
             .limit(min(limit, 100))

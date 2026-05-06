@@ -22,7 +22,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
@@ -35,7 +35,17 @@ logger = logging.getLogger(__name__)
 
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
-DEFAULT_MAX_PAGES = 15
+# We default to 200 because most marketing sites publish 50–200 URLs in their
+# sitemap and the user expects the audit to cover the whole site, not a sample.
+# The API route enforces an absolute upper bound so a misconfigured giant site
+# can't run for hours.
+DEFAULT_MAX_PAGES = 200
+# Hard ceiling on how many URLs we expand out of (possibly nested) sitemaps.
+# Protects against runaway sitemap indexes; well above any realistic SMB site.
+SITEMAP_DISCOVERY_CAP = 1000
+# How deep we recurse into sitemap indexes before giving up. Real-world sites
+# nest at most 1–2 levels (index → per-type → per-page); 3 leaves headroom.
+SITEMAP_MAX_DEPTH = 3
 DEFAULT_MAX_LINKS_TO_CHECK = 40
 DEFAULT_TIMEOUT_S = 20.0
 # Some CDNs (Cloudflare, Vercel edge) return 403 to "non-browser" UAs. We send
@@ -206,8 +216,15 @@ class SiteAuditAgent:
         domain: str,
         max_pages: int = DEFAULT_MAX_PAGES,
         max_links_to_check: int = DEFAULT_MAX_LINKS_TO_CHECK,
+        progress_cb: Optional[Callable[[int, int], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
-        """Run a full audit and return a JSON-serialisable report."""
+        """Run a full audit and return a JSON-serialisable report.
+
+        ``progress_cb`` is invoked as ``await cb(pages_done, pages_total)``
+        once after sitemap discovery (with ``done=0``) and again after each
+        page completes, so the dashboard's running-jobs widget can show a
+        real progress bar instead of a time-based estimate.
+        """
         base_url, host = _normalise_domain(domain)
         started = time.time()
 
@@ -247,11 +264,30 @@ class SiteAuditAgent:
             seen: Set[str] = set()
             unique_pages = [p for p in pages_to_audit if not (p in seen or seen.add(p))]
 
+            total = len(unique_pages)
+            if progress_cb:
+                try:
+                    await progress_cb(0, total)
+                except Exception:
+                    logger.debug("progress_cb failed at start", exc_info=True)
+
             sem = asyncio.Semaphore(5)
+            done_counter = 0
+            done_lock = asyncio.Lock()
 
             async def _bounded(url: str) -> Optional[PageReport]:
+                nonlocal done_counter
                 async with sem:
-                    return await self._audit_page(client, url, host)
+                    result = await self._audit_page(client, url, host)
+                if progress_cb:
+                    async with done_lock:
+                        done_counter += 1
+                        snapshot = done_counter
+                    try:
+                        await progress_cb(snapshot, total)
+                    except Exception:
+                        logger.debug("progress_cb failed mid-run", exc_info=True)
+                return result
 
             page_results = await asyncio.gather(*[_bounded(u) for u in unique_pages])
             pages: List[PageReport] = [p for p in page_results if p is not None]
@@ -468,12 +504,13 @@ class SiteAuditAgent:
     async def _discover_sitemap_urls(
         self, client: httpx.AsyncClient, base_url: str, robots: Optional[str]
     ) -> Tuple[List[str], Dict[str, Any]]:
-        """Pull URLs from sitemap.xml (and robots.txt's Sitemap: directive).
+        """Pull URLs from sitemap.xml (and robots.txt's Sitemap: directive),
+        recursively expanding sitemap indexes into their child sitemaps.
 
-        Returns (urls, info) so callers know which sitemap location worked
-        and why it might have been empty.
+        Returns (urls, info) so callers know which sitemap location(s) worked
+        and why they might have been empty.
         """
-        sitemap_locations: List[str] = []
+        seed_locations: List[str] = []
 
         # robots.txt may declare Sitemap: lines
         if robots:
@@ -481,52 +518,99 @@ class SiteAuditAgent:
                 if line.lower().startswith("sitemap:"):
                     loc = line.split(":", 1)[1].strip()
                     if loc:
-                        sitemap_locations.append(loc)
+                        seed_locations.append(loc)
 
         # Always probe the conventional location too — robots.txt may omit it.
         default_loc = base_url.rstrip("/") + "/sitemap.xml"
-        if default_loc not in sitemap_locations:
-            sitemap_locations.append(default_loc)
+        if default_loc not in seed_locations:
+            seed_locations.append(default_loc)
 
-        urls: List[str] = []
-        seen: Set[str] = set()
+        page_urls: List[str] = []
+        seen_pages: Set[str] = set()
+        seen_sitemaps: Set[str] = set()
         attempts: List[Dict[str, Any]] = []
-        for sm in sitemap_locations[:4]:  # don't follow forever
-            # If the sitemap is at the apex domain, _fetch_meta_file gives us
-            # the apex↔www fallback for free; otherwise just try once.
-            if sm.endswith("/sitemap.xml"):
+
+        # BFS over (sitemap_url, depth). We need BFS rather than the previous
+        # single-pass loop because a "sitemap.xml" can be a <sitemapindex>
+        # listing other sitemaps (which Yoast and most CMSes generate by
+        # default). The old code treated those child <loc> entries as page
+        # URLs, which is why onlinesverige.se reported "2 pages analyzed" —
+        # the two children of the index were crawled as if they were pages.
+        queue: List[Tuple[str, int]] = [(loc, 0) for loc in seed_locations[:4]]
+
+        while queue and len(page_urls) < SITEMAP_DISCOVERY_CAP:
+            sm, depth = queue.pop(0)
+            if sm in seen_sitemaps:
+                continue
+            seen_sitemaps.add(sm)
+
+            # Use the apex↔www fallback only for the conventional path; nested
+            # sitemap URLs are explicit enough to fetch directly.
+            if sm.rstrip("/").endswith("/sitemap.xml") and depth == 0:
                 parsed = urlparse(sm)
                 sm_base = f"{parsed.scheme}://{parsed.netloc}"
                 text, info = await self._fetch_meta_file(client, sm_base, "/sitemap.xml")
             else:
                 text, status, err = await self._fetch_text_detailed(client, sm)
                 info = {"url": sm, "status": status, "error": err}
+            info["depth"] = depth
             attempts.append(info)
             if not text:
                 continue
-            urls.extend(self._parse_sitemap(text, seen))
-            if len(urls) > 200:
-                break
-        return urls, {"attempts": attempts}
 
-    def _parse_sitemap(self, xml_text: str, seen: Set[str]) -> List[str]:
-        """Parse a sitemap (or sitemap index) and return page URLs."""
-        out: List[str] = []
+            new_pages, child_sitemaps = self._parse_sitemap(text, seen_pages)
+            page_urls.extend(new_pages)
+
+            if depth + 1 < SITEMAP_MAX_DEPTH:
+                for child in child_sitemaps:
+                    if child not in seen_sitemaps:
+                        queue.append((child, depth + 1))
+
+        # Trim to discovery cap without dropping the discovery work we did.
+        if len(page_urls) > SITEMAP_DISCOVERY_CAP:
+            page_urls = page_urls[:SITEMAP_DISCOVERY_CAP]
+
+        return page_urls, {"attempts": attempts, "discovered": len(page_urls)}
+
+    def _parse_sitemap(
+        self, xml_text: str, seen_pages: Set[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Parse a single sitemap document.
+
+        Returns (page_urls, child_sitemap_urls). A `<urlset>` document yields
+        page URLs; a `<sitemapindex>` yields child sitemap URLs to fetch
+        next. Treating the two cases identically (as the old implementation
+        did) caused index files to be crawled as if their children were pages.
+        """
         try:
             root = ET.fromstring(xml_text)
         except ET.ParseError:
-            return out
-        # Strip namespace
-        ns = re.match(r"\{(.*)\}", root.tag)
-        nsmap = {"sm": ns.group(1)} if ns else {}
+            return [], []
+
+        ns_match = re.match(r"\{(.*)\}", root.tag)
+        nsmap = {"sm": ns_match.group(1)} if ns_match else {}
         loc_path = ".//sm:loc" if nsmap else ".//loc"
+        # Strip namespace from the local tag name for the index check.
+        local_tag = root.tag.split("}", 1)[-1].lower()
+        is_index = local_tag == "sitemapindex"
+
+        locs: List[str] = []
         for el in root.findall(loc_path, nsmap):
             url = (el.text or "").strip()
-            if not url or url in seen:
+            if url:
+                locs.append(url)
+
+        if is_index:
+            return [], locs
+
+        # Regular <urlset>: dedupe against pages we've already collected.
+        page_urls: List[str] = []
+        for url in locs:
+            if url in seen_pages:
                 continue
-            seen.add(url)
-            out.append(url)
-        return out
+            seen_pages.add(url)
+            page_urls.append(url)
+        return page_urls, []
 
     # ── Per-page audit ──────────────────────────────────────────────────────
 
@@ -879,6 +963,37 @@ class SiteAuditAgent:
     # Single source of truth for page-level findings. Each entry is keyed by
     # the issue string emitted from `_audit_page` and carries enough context
     # to produce both a finding and an actionable recommendation.
+    @staticmethod
+    def _format_issue_detail(issue: str, page: "PageReport") -> str:
+        """Render a short, page-specific snippet for a single issue so the
+        dashboard can show e.g. `'Hem' — 3 chars` next to the URL instead of
+        just the URL. Empty string when there's nothing useful to show."""
+        title = (page.title or "").strip()
+        snippet = title if len(title) <= 50 else title[:47] + "…"
+        if issue == "missing_title":
+            return "no <title>"
+        if issue in ("short_title", "long_title"):
+            return f'"{snippet}" — {page.title_length} chars' if title else f"{page.title_length} chars"
+        if issue == "missing_meta_description":
+            return "no meta description"
+        if issue in ("short_meta_description", "long_meta_description"):
+            return f"{page.meta_description_length} chars"
+        if issue == "missing_h1":
+            return "no <h1>"
+        if issue == "multiple_h1":
+            return f"{page.h1_count} <h1> tags"
+        if issue == "thin_content":
+            return f"{page.word_count} words"
+        if issue == "images_missing_alt":
+            return f"{page.images_missing_alt}/{page.images_total} images"
+        if issue == "images_missing_dimensions":
+            return f"{page.images_missing_dimensions}/{page.images_total} images"
+        if issue == "images_missing_lazy":
+            return f"{page.images_missing_lazy}/{page.images_total} images"
+        if issue == "fetch_failed":
+            return f"HTTP {page.status_code or 'error'}"
+        return ""
+
     PAGE_ISSUE_RULES: List[Tuple[str, Dict[str, Any]]] = [
         ("missing_title", {
             "category": "on_page", "severity": "critical",
@@ -1038,6 +1153,7 @@ class SiteAuditAgent:
             category: str, severity: str, title: str, description: str,
             affected: int, *,
             affected_urls: Optional[List[str]] = None,
+            examples: Optional[List[Dict[str, str]]] = None,
             how_to_fix: Optional[str] = None,
             impact: Optional[str] = None,
             effort: Optional[str] = None,
@@ -1050,6 +1166,10 @@ class SiteAuditAgent:
                 "description": description,
                 "affected_pages": affected,
                 "affected_urls": (affected_urls or [])[:8],
+                # Concrete page → value pairs so the dashboard can show
+                # "Hem (3 chars)" next to each URL instead of just a list of
+                # bare URLs. Capped to keep payload small.
+                "examples": (examples or [])[:8],
                 "how_to_fix": how_to_fix,
                 "impact": impact,
                 "effort": effort,
@@ -1133,12 +1253,18 @@ class SiteAuditAgent:
         # Page-level rollups via the rules table.
         rule_map = dict(self.PAGE_ISSUE_RULES)
         for issue, meta in self.PAGE_ISSUE_RULES:
-            urls = [p.url for p in pages if issue in p.issues]
-            if not urls:
+            affected_pages = [p for p in pages if issue in p.issues]
+            if not affected_pages:
                 continue
+            urls = [p.url for p in affected_pages]
+            examples = [
+                {"url": p.url, "detail": self._format_issue_detail(issue, p)}
+                for p in affected_pages
+            ]
             _add(meta["category"], meta["severity"], meta["title"], meta["description"],
                  len(urls),
                  affected_urls=urls,
+                 examples=examples,
                  how_to_fix=meta.get("how_to_fix"),
                  impact=meta.get("impact"), effort=meta.get("effort"),
                  group=meta.get("group"))
@@ -1240,6 +1366,7 @@ class SiteAuditAgent:
                 "description": f["description"],
                 "affected_count": f.get("affected_pages", 0),
                 "affected_urls": f.get("affected_urls") or [],
+                "examples": f.get("examples") or [],
                 "how_to_fix": f.get("how_to_fix"),
                 "impact": f.get("impact"),
                 "effort": f.get("effort"),
