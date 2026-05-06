@@ -377,3 +377,94 @@ Rules:
             "files_changed": [f.path for f in files],
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+
+
+@router.post("/preview")
+async def preview_tech_change(payload: ExecuteRequest, request: Request):
+    """
+    Generate file changes for a suggestion and return them without creating a PR.
+    Used for manual mode (no GitHub) and PDF export.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    s = _load_settings(tenant_id)
+
+    gh_config = _get_github_config(tenant_id)
+    owner = gh_config.get("repo_owner", "") if gh_config else ""
+    repo = gh_config.get("repo_name", "") if gh_config else ""
+    base_branch = gh_config.get("branch", "main") if gh_config else "main"
+    token = gh_config.get("github_token", "") if gh_config else ""
+
+    domain = s.get("domain", "")
+    brand_name = s.get("brand_name", "")
+
+    files: list[FileChange] = payload.files or []
+
+    if not files:
+        current = ""
+        target_path = (payload.file_hint or "").lstrip("/")
+
+        # Try to read current file from GitHub if connected
+        if target_path and _is_path_allowed(target_path) and owner and repo and token:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as http:
+                    current = await _read_file(http, owner, repo, target_path, base_branch, token) or ""
+            except Exception:
+                current = ""
+
+        try:
+            import anthropic
+
+            ai = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            prompt = f"""You are a senior web engineer. Generate the file changes needed to implement the following improvement.
+
+Website: {domain}
+Brand: {brand_name}
+Suggestion title: {payload.title}
+Description: {payload.description}
+File hint: {payload.file_hint or 'none'}
+Change type: {payload.change_type or 'edit'}
+
+Current contents of the hinted file (may be empty if unknown):
+---
+{current[:6000]}
+---
+
+Return ONLY a JSON object (no markdown, no code fences):
+{{
+  "files": [
+    {{"path": "relative/path/to/file.ext", "content": "FULL FILE CONTENTS AFTER THE CHANGE", "diff_hint": "One sentence describing what changed"}}
+  ],
+  "summary": "Short summary of the change"
+}}
+
+Rules:
+- Return full file content, not a diff.
+- Prefer a single file. Two files only if strictly necessary.
+- Keep changes minimal and reviewable.
+- If file hint is unknown, use a sensible generic path.
+"""
+            message = ai.messages.create(
+                model=settings.CLAUDE_MODEL,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = message.content[0].text.strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip().rstrip("`").strip()
+            result = json.loads(text)
+            raw_files = result.get("files", [])
+            files = [FileChange(path=f["path"], content=f["content"]) for f in raw_files if f.get("path")]
+            summary = result.get("summary", payload.title)
+        except Exception as e:
+            logger.error(f"preview_tech_change error: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not generate preview: {e}")
+
+    return {
+        "title": payload.title,
+        "description": payload.description,
+        "files": [{"path": f.path, "content": f.content} for f in files],
+        "summary": payload.title,
+    }
