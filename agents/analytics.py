@@ -111,7 +111,14 @@ class AnalyticsAgent:
             first = errors[0].get("error") or "unknown error"
             return f"Collected metrics across 0 channels — upsert failed: {first[:160]}"
         if errors:
-            return f"Collected metrics across {channels} channels ({len(errors)} failed)"
+            # Even with partial success, include the first error so the user
+            # sees *why* some channels are missing — not just *that* they are.
+            failed_channels = ",".join(e.get("channel", "?") for e in errors[:4])
+            first = errors[0].get("error") or "unknown error"
+            return (
+                f"Collected metrics across {channels} channels "
+                f"({len(errors)} failed: {failed_channels}) — first error: {first[:140]}"
+            )
         return f"Collected metrics across {channels} channels"
 
     # ── Data fetchers (one per channel) ───────────────────────────────
