@@ -116,11 +116,12 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
     live_channels: Dict[str, Dict[str, Any]] = {}
     seo_daily_live: List[Dict[str, Any]] = []
     ga4_daily_live: List[Dict[str, Any]] = []
+    ga4_groups_live: List[Dict[str, Any]] = []
     try:
         config = await get_tenant_config(tenant_id)
         agent = AnalyticsAgent(tenant_config=config)
 
-        seo_r, ads_r, reviews_r, content_r, ga4_r, seo_daily_r, ga4_daily_r = await asyncio.gather(
+        seo_r, ads_r, reviews_r, content_r, ga4_r, seo_daily_r, ga4_daily_r, ga4_groups_r = await asyncio.gather(
             _safe_live("seo", lambda: agent._fetch_seo_data(date_range=days)),
             _safe_live("ads", lambda: agent._fetch_ads_data(date_range=days)),
             _safe_live("reviews", agent._fetch_reviews_data),
@@ -128,6 +129,7 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
             _safe_live("ga4", lambda: agent._fetch_ga4_data(date_range=days)),
             _safe_daily("seo_daily", lambda: agent._fetch_seo_daily(date_range=days)),
             _safe_daily("ga4_daily", lambda: agent._fetch_ga4_daily(date_range=days)),
+            _safe_daily("ga4_groups", lambda: agent._fetch_ga4_channel_groups(date_range=days)),
         )
 
         for ch, raw in (
@@ -143,6 +145,7 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
 
         seo_daily_live = seo_daily_r or []
         ga4_daily_live = ga4_daily_r or []
+        ga4_groups_live = ga4_groups_r or []
 
         logger.info(
             f"overview live fetch: {len(live_channels)}/{5} channels have data"
@@ -190,25 +193,71 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
         if not db_entry or (db_entry["clicks"] == 0 and db_entry["impressions"] == 0):
             merged[ch] = live_entry
 
+    # Break GA4 into its top-4 channel groups + "Övriga" so the breakdown
+    # is meaningful (Organic Search vs Direct vs Paid Search ...) instead
+    # of a single opaque "ga4" bar.
+    if ga4_groups_live and "ga4" in merged:
+        ga4_total_clicks = merged["ga4"].get("clicks", 0)
+        ga4_total_impr = merged["ga4"].get("impressions", 0)
+        sorted_groups = [g for g in ga4_groups_live if g.get("clicks") or g.get("impressions")]
+        if sorted_groups:
+            del merged["ga4"]
+            top = sorted_groups[:4]
+            rest = sorted_groups[4:]
+            for g in top:
+                key = f"ga4: {g['name']}"
+                merged[key] = {
+                    "channel": key,
+                    "clicks": int(g.get("clicks") or 0),
+                    "impressions": int(g.get("impressions") or 0),
+                    "conversions": 0,
+                    "spend": 0.0,
+                }
+            if rest:
+                rest_clicks = sum(int(g.get("clicks") or 0) for g in rest)
+                rest_impr = sum(int(g.get("impressions") or 0) for g in rest)
+                if rest_clicks or rest_impr:
+                    merged["ga4: Övriga"] = {
+                        "channel": "ga4: Övriga",
+                        "clicks": rest_clicks,
+                        "impressions": rest_impr,
+                        "conversions": 0,
+                        "spend": 0.0,
+                    }
+            # Sanity: if breakdown rows total much less than the aggregate
+            # (e.g. some sessions have no group), top up "Övriga" to cover
+            # the gap so the channel bars still sum to the GA4 total.
+            shown_clicks = sum(
+                v["clicks"] for k, v in merged.items() if k.startswith("ga4")
+            )
+            gap = ga4_total_clicks - shown_clicks
+            if gap > 0:
+                ovr = merged.setdefault("ga4: Övriga", {
+                    "channel": "ga4: Övriga",
+                    "clicks": 0, "impressions": 0,
+                    "conversions": 0, "spend": 0.0,
+                })
+                ovr["clicks"] += gap
+                shown_impr = sum(
+                    v["impressions"] for k, v in merged.items() if k.startswith("ga4")
+                )
+                impr_gap = ga4_total_impr - shown_impr
+                if impr_gap > 0:
+                    ovr["impressions"] += impr_gap
+
     channels = sorted(
         ({**c, "spend": round(c.get("spend", 0.0), 2)} for c in merged.values()),
         key=lambda c: c["clicks"],
         reverse=True,
     )
 
-    # ── 4. Build daily series (DB + synthetic today if empty) ─────────
+    # ── 4. Build daily series ─────────────────────────────────────────
+    # Live per-day GSC + GA4 always covers the full requested window, so
+    # whenever it has data we use it directly. DB rows from daily_metrics
+    # are unreliable here — they can be sparse or contain zero-valued rows
+    # from failed/partial syncs that would otherwise blank out the chart.
     daily_map: Dict[str, Dict[str, Any]] = {}
-    for r in db_rows:
-        date = r.get("date") or ""
-        if not date:
-            continue
-        entry = daily_map.setdefault(date, {"date": date, "clicks": 0, "impressions": 0})
-        entry["clicks"] += r.get("total_clicks") or 0
-        entry["impressions"] += r.get("total_impressions") or 0
-
-    # If DB gave us no daily rows, build the daily series from live per-day
-    # GSC + GA4 fetches so the chart shows real history, not just today.
-    if not daily_map:
+    if seo_daily_live or ga4_daily_live:
         for row in seo_daily_live:
             d = row.get("date")
             if not d:
@@ -223,18 +272,28 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
             entry = daily_map.setdefault(d, {"date": d, "clicks": 0, "impressions": 0})
             entry["clicks"] += int(row.get("clicks") or 0)
             entry["impressions"] += int(row.get("impressions") or 0)
+    else:
+        for r in db_rows:
+            date = r.get("date") or ""
+            if not date:
+                continue
+            entry = daily_map.setdefault(date, {"date": date, "clicks": 0, "impressions": 0})
+            entry["clicks"] += r.get("total_clicks") or 0
+            entry["impressions"] += r.get("total_impressions") or 0
 
     daily = sorted(daily_map.values(), key=lambda d: d["date"])
 
     # ── 5. Totals ─────────────────────────────────────────────────────
-    if db_rows:
-        totals = _sum_totals(db_rows)
-    elif live_channels:
+    # Derived from the merged channels (which already combine DB + live)
+    # so the top cards always reflect what the breakdown table shows.
+    # Falling back to summing db_rows directly used to print zeros when
+    # daily_metrics had a single empty row from a failed sync.
+    if channels:
         totals = {
-            "clicks": sum(c["clicks"] for c in live_channels.values()),
-            "impressions": sum(c["impressions"] for c in live_channels.values()),
-            "conversions": sum(c.get("conversions", 0) for c in live_channels.values()),
-            "spend": round(sum(c.get("spend", 0.0) for c in live_channels.values()), 2),
+            "clicks": sum(c.get("clicks", 0) for c in channels),
+            "impressions": sum(c.get("impressions", 0) for c in channels),
+            "conversions": sum(int(c.get("conversions", 0) or 0) for c in channels),
+            "spend": round(sum(float(c.get("spend", 0.0) or 0) for c in channels), 2),
         }
     else:
         totals = {"clicks": 0, "impressions": 0, "conversions": 0, "spend": 0.0}
@@ -244,6 +303,7 @@ async def analytics_overview(request: Request, days: int = 30, compare: int = 0)
         "daily": daily,
         "totals": totals,
         "seo_daily": seo_daily_live,
+        "ga4_channel_groups": ga4_groups_live,
     }
 
     if compare:

@@ -381,6 +381,87 @@ class AnalyticsAgent:
             logger.warning(f"GA4 daily fetch failed: {e}")
             return []
 
+    async def _fetch_ga4_channel_groups(self, date_range: int = 30) -> List[Dict[str, Any]]:
+        """GA4 sessions/pageviews broken down by sessionDefaultChannelGroup.
+
+        Returns a list like:
+            [{"name": "Organic Search", "clicks": 150, "impressions": 320},
+             {"name": "Direct",         "clicks":  80, "impressions": 110}, ...]
+        sorted by clicks descending. Empty list on any failure.
+        """
+        tenant_property_id = (
+            getattr(self.tenant_config, "ga4_property_id", None)
+            if self.tenant_config else None
+        )
+        raw_property_id = tenant_property_id or settings.GA4_PROPERTY_ID
+        if not raw_property_id:
+            return []
+
+        try:
+            access_token: Optional[str] = None
+            tenant_id = getattr(self.tenant_config, "tenant_id", None) if self.tenant_config else None
+            if tenant_id:
+                try:
+                    access_token = await get_google_access_token(tenant_id, "analytics")
+                except ValueError:
+                    access_token = None
+            if not access_token:
+                access_token = await get_access_token("gsc")
+            if not access_token:
+                return []
+
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=date_range)
+            prop_id = raw_property_id
+            if not prop_id.startswith("properties/"):
+                prop_id = f"properties/{prop_id}"
+
+            url = f"https://analyticsdata.googleapis.com/v1beta/{prop_id}:runReport"
+            payload = {
+                "dateRanges": [{
+                    "startDate": start_date.strftime("%Y-%m-%d"),
+                    "endDate": end_date.strftime("%Y-%m-%d"),
+                }],
+                "dimensions": [{"name": "sessionDefaultChannelGroup"}],
+                "metrics": [
+                    {"name": "sessions"},
+                    {"name": "screenPageViews"},
+                ],
+                "orderBys": [{"metric": {"metricName": "sessions"}, "desc": True}],
+                "limit": 25,
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            if resp.status_code != 200:
+                logger.warning(f"GA4 channel-groups error {resp.status_code}: {resp.text[:160]}")
+                return []
+            rows = (resp.json() or {}).get("rows", []) or []
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                dim_values = row.get("dimensionValues") or []
+                metric_values = row.get("metricValues") or []
+                if not dim_values or len(metric_values) < 2:
+                    continue
+                name = (dim_values[0].get("value") or "").strip() or "Unassigned"
+                out.append({
+                    "name": name,
+                    "clicks": int(metric_values[0].get("value") or 0),
+                    "impressions": int(metric_values[1].get("value") or 0),
+                })
+            out.sort(key=lambda g: g["clicks"], reverse=True)
+            return out
+        except Exception as e:
+            logger.warning(f"GA4 channel-groups fetch failed: {e}")
+            return []
+
     async def _fetch_ga4_data(self, date_range: int = 30) -> Dict[str, Any]:
         """Fetch site-wide traffic data from Google Analytics 4 Data API.
 
