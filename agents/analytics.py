@@ -648,13 +648,15 @@ class AnalyticsAgent:
                 "total_clicks": row.get("total_clicks", 0),
                 "total_impressions": row.get("total_impressions", 0),
             }
-            # Resilient upsert: if PostgREST reports a missing column (PGRST204
-            # — usually because a migration hasn't run on this Supabase yet),
-            # drop that field from the payload and retry. We never strip
-            # "date" or "channel" since those are the upsert key.
+            # Resilient upsert: production Supabase environments don't always
+            # have every migration applied. We tolerate two common failures:
+            #   PGRST204 — "Could not find the 'X' column": drop the field, retry.
+            #   42P10    — "no unique or exclusion constraint matching ON CONFLICT":
+            #              fall back to a manual select → update-or-insert path.
+            # We never strip "date" or "channel" since those are the upsert key.
             payload = dict(record)
             last_error: Optional[Exception] = None
-            for _attempt in range(len(payload)):
+            for _attempt in range(len(payload) + 1):
                 try:
                     sb.table(DAILY_METRICS_TABLE).upsert(
                         payload,
@@ -664,8 +666,9 @@ class AnalyticsAgent:
                     last_error = None
                     break
                 except Exception as e:
-                    last_error = e
                     err_str = str(e)
+                    last_error = e
+
                     m = re.search(r"Could not find the '(\w+)' column", err_str)
                     if m and m.group(1) in payload and m.group(1) not in ("date", "channel"):
                         missing = m.group(1)
@@ -677,7 +680,38 @@ class AnalyticsAgent:
                             f"to restore the column."
                         )
                         continue
+
+                    if "42P10" in err_str or "no unique or exclusion constraint" in err_str:
+                        # Constraint is missing; emulate upsert by hand.
+                        try:
+                            existing = (
+                                sb.table(DAILY_METRICS_TABLE)
+                                .select("id")
+                                .eq("date", payload["date"])
+                                .eq("channel", payload["channel"])
+                                .limit(1)
+                                .execute()
+                            )
+                            if existing.data:
+                                row_id = existing.data[0]["id"]
+                                sb.table(DAILY_METRICS_TABLE).update(payload).eq(
+                                    "id", row_id
+                                ).execute()
+                            else:
+                                sb.table(DAILY_METRICS_TABLE).insert(payload).execute()
+                            upserted.append(channel)
+                            last_error = None
+                            logger.warning(
+                                "daily_metrics has no UNIQUE(date,channel) constraint "
+                                "on this Supabase — wrote via select+update/insert. "
+                                "Run migrations/008_daily_metrics.sql to restore it."
+                            )
+                        except Exception as e2:
+                            last_error = e2
+                        break
+
                     break
+
             if last_error is not None:
                 logger.error(
                     f"daily_metrics upsert failed for channel={channel}: "
