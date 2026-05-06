@@ -384,6 +384,9 @@ class AIVisibilityAgent:
                 logger.info(f"[{run_id}] {engine_name} | {category_name} | mentioned={analysis['mentioned']}")
             except Exception as e:
                 logger.error(f"[{run_id}] DB insert check FAILED: {e} | data keys: {list(check_data.keys())}")
+                # Don't count an in-memory entry as a saved check — the run
+                # summary should reflect what actually made it to the DB.
+                return None
 
             if not analysis["mentioned"]:
                 gap_info = self._identify_gap(category_name)
