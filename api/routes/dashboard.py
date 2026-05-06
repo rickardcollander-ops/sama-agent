@@ -3,8 +3,8 @@ Dashboard API — Cross-agent intelligence for the SAMA command center.
 Aggregates data from all agents and generates smart recommendations.
 """
 
-from fastapi import APIRouter
-from typing import Dict, Any, List
+from fastapi import APIRouter, Request
+from typing import Dict, Any, List, Optional
 import logging
 import asyncio
 from datetime import datetime
@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 @router.get("/status")
-async def get_dashboard_status():
+async def get_dashboard_status(request: Request):
     """
     Aggregated status from all agents + Supabase.
-    Returns health, last activity, and key counts.
+    Returns health, last activity, and key counts — scoped to the calling tenant.
     """
     from shared.database import get_supabase
+
+    tenant_id = getattr(request.state, "tenant_id", "default")
 
     status: Dict[str, Any] = {
         "timestamp": datetime.utcnow().isoformat(),
@@ -30,24 +32,12 @@ async def get_dashboard_status():
     try:
         sb = get_supabase()
 
-        # Parallel DB queries
-        async def _query(table: str, col: str = "*", limit: int = 0, count_only: bool = False):
-            try:
-                q = sb.table(table).select(col, count="exact") if count_only else sb.table(table).select(col)
-                if limit:
-                    q = q.limit(limit)
-                q = q.order("created_at", desc=True) if not count_only else q
-                r = q.execute()
-                return r
-            except Exception:
-                return None
-
         kw_res, content_res, audit_res, alert_res, log_res = await asyncio.gather(
-            asyncio.to_thread(lambda: _safe_count(sb, "seo_keywords")),
-            asyncio.to_thread(lambda: _safe_count(sb, "content_pieces")),
-            asyncio.to_thread(lambda: _safe_count(sb, "seo_audits")),
-            asyncio.to_thread(lambda: _safe_count(sb, "alerts")),
-            asyncio.to_thread(lambda: _safe_recent(sb, "agent_logs", 5)),
+            asyncio.to_thread(lambda: _safe_count(sb, "seo_keywords", tenant_id)),
+            asyncio.to_thread(lambda: _safe_count(sb, "content_pieces", tenant_id)),
+            asyncio.to_thread(lambda: _safe_count(sb, "seo_audits", tenant_id)),
+            asyncio.to_thread(lambda: _safe_count(sb, "alerts", tenant_id)),
+            asyncio.to_thread(lambda: _safe_recent(sb, "agent_logs", 5, tenant_id)),
         )
 
         status["counts"] = {
@@ -62,11 +52,9 @@ async def get_dashboard_status():
         logger.warning(f"Dashboard status DB error: {e}")
         status["db_error"] = str(e)
 
-    # Agent availability (lightweight)
     for agent_name in ["seo", "content", "ads", "social", "reviews", "analytics", "ai_visibility"]:
         status["agents"][agent_name] = "operational"
 
-    # Scheduler status — show last run times and next scheduled runs
     try:
         from shared import scheduler as job_scheduler
         job_history = job_scheduler.get_job_history()
@@ -89,10 +77,15 @@ async def get_dashboard_status():
         logger.warning(f"Scheduler status error: {e}")
         status["scheduler"] = {"running": False, "error": str(e)}
 
-    # Pending agent actions count per agent
     try:
         sb2 = get_supabase()
-        actions_res = sb2.table("agent_actions").select("agent_name").eq("status", "pending").execute()
+        actions_res = (
+            sb2.table("agent_actions")
+            .select("agent_name")
+            .eq("tenant_id", tenant_id)
+            .eq("status", "pending")
+            .execute()
+        )
         pending_actions = actions_res.data or []
         from collections import Counter
         agent_pending = Counter(a["agent_name"] for a in pending_actions)
@@ -102,10 +95,9 @@ async def get_dashboard_status():
         status["pending_actions"] = {}
         status["counts"]["pending_actions"] = 0
 
-    # Reviews summary
     try:
         sb3 = get_supabase()
-        reviews_res = sb3.table("reviews").select("rating").execute()
+        reviews_res = sb3.table("reviews").select("rating").eq("tenant_id", tenant_id).execute()
         reviews = reviews_res.data or []
         if reviews:
             ratings = [r["rating"] for r in reviews if r.get("rating")]
@@ -122,28 +114,36 @@ async def get_dashboard_status():
 
 
 @router.get("/pending-actions")
-async def get_all_pending_actions():
-    """Return all pending agent actions across every agent."""
+async def get_all_pending_actions(request: Request):
+    """Return all pending agent actions for the calling tenant."""
     from shared.actions_db import get_pending_actions
-    actions = await get_pending_actions()
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    actions = await get_pending_actions(tenant_id=tenant_id)
     return {"success": True, "total": len(actions), "actions": actions}
 
 
 @router.post("/actions/{action_id}/execute")
-async def execute_action_by_id(action_id: str):
+async def execute_action_by_id(action_id: str, request: Request):
     """
     Universal action execution endpoint.
-    Fetches the action from DB, routes to the correct agent's execute endpoint,
+    Fetches the action from DB, verifies tenant ownership,
+    routes to the correct agent's execute endpoint,
     and marks it as completed regardless of result.
     """
     from shared.database import get_supabase
     import httpx
     from shared.config import settings
 
+    tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
 
-    # Fetch the action
-    result = sb.table("agent_actions").select("*").eq("id", action_id).execute()
+    result = (
+        sb.table("agent_actions")
+        .select("*")
+        .eq("id", action_id)
+        .eq("tenant_id", tenant_id)
+        .execute()
+    )
     if not result.data:
         return {"success": False, "error": "Action not found"}
 
@@ -151,7 +151,6 @@ async def execute_action_by_id(action_id: str):
     agent = action.get("agent_name", "")
     action_type = action.get("action_type", "")
 
-    # Route to agent-specific execute endpoint
     agent_routes = {
         "seo": "/api/seo/execute",
         "content": "/api/content/execute",
@@ -183,14 +182,13 @@ async def execute_action_by_id(action_id: str):
             logger.warning(f"Agent execute failed for {agent}/{action_type}: {e}")
             execute_result = {"error": str(e)}
 
-    # Always mark the action as completed (or failed)
     try:
         success = execute_result.get("success", False) if execute_result else False
         sb.table("agent_actions").update({
             "status": "completed" if success else "failed",
             "executed_at": datetime.utcnow().isoformat(),
             "execution_result": execute_result,
-        }).eq("id", action_id).execute()
+        }).eq("id", action_id).eq("tenant_id", tenant_id).execute()
     except Exception as e:
         logger.error(f"Failed to update action status: {e}")
 
@@ -203,19 +201,20 @@ async def execute_action_by_id(action_id: str):
 
 
 @router.delete("/actions/{action_id}")
-async def dismiss_action(action_id: str):
+async def dismiss_action(action_id: str, request: Request):
     """
     Universal action dismiss endpoint.
-    Marks action as dismissed (removes from pending list).
+    Verifies tenant ownership before dismissing.
     """
     from shared.database import get_supabase
 
+    tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
         sb.table("agent_actions").update({
             "status": "dismissed",
             "executed_at": datetime.utcnow().isoformat(),
-        }).eq("id", action_id).execute()
+        }).eq("id", action_id).eq("tenant_id", tenant_id).execute()
         return {"success": True, "message": f"Action {action_id} dismissed"}
     except Exception as e:
         logger.error(f"Failed to dismiss action: {e}")
@@ -223,25 +222,25 @@ async def dismiss_action(action_id: str):
 
 
 @router.get("/recommendations")
-async def get_smart_recommendations():
+async def get_smart_recommendations(request: Request):
     """
-    Cross-agent smart recommendations.
+    Cross-agent smart recommendations, scoped to the calling tenant.
     Analyzes current state and suggests highest-impact actions.
     """
     from shared.database import get_supabase
     import asyncio
 
+    tenant_id = getattr(request.state, "tenant_id", "default")
     recommendations: List[Dict[str, Any]] = []
 
     try:
         sb = get_supabase()
 
-        # Gather data in parallel
         kw_data, alert_data, audit_data, content_data = await asyncio.gather(
-            asyncio.to_thread(lambda: _safe_query(sb, "seo_keywords", "keyword,current_position,current_ctr,current_impressions,last_checked_at", 100)),
-            asyncio.to_thread(lambda: _safe_query(sb, "alerts", "id,alert_type,severity,status,created_at", 50)),
-            asyncio.to_thread(lambda: _safe_query(sb, "seo_audits", "id,audit_date,critical_issues,high_issues", 3)),
-            asyncio.to_thread(lambda: _safe_query(sb, "content_pieces", "id,title,status,impressions_30d,clicks_30d,created_at", 50)),
+            asyncio.to_thread(lambda: _safe_query(sb, "seo_keywords", "keyword,current_position,current_ctr,current_impressions,last_checked_at", 100, tenant_id)),
+            asyncio.to_thread(lambda: _safe_query(sb, "alerts", "id,alert_type,severity,status,created_at", 50, tenant_id)),
+            asyncio.to_thread(lambda: _safe_query(sb, "seo_audits", "id,audit_date,critical_issues,high_issues", 3, tenant_id)),
+            asyncio.to_thread(lambda: _safe_query(sb, "content_pieces", "id,title,status,impressions_30d,clicks_30d,created_at", 50, tenant_id)),
         )
 
         # 1. Keywords losing position — high impact
@@ -261,7 +260,6 @@ async def get_smart_recommendations():
                     "effort": "medium",
                 })
 
-            # CTR opportunities
             low_ctr = [k for k in kw_data if (k.get("current_position") or 100) <= 5 and (k.get("current_ctr") or 0) < 3.0 and (k.get("current_impressions") or 0) > 20]
             if low_ctr:
                 recommendations.append({
@@ -275,7 +273,6 @@ async def get_smart_recommendations():
                     "effort": "low",
                 })
 
-            # Stale keyword data
             stale = [k for k in kw_data if not k.get("last_checked_at")]
             if len(stale) > len(kw_data) * 0.3:
                 recommendations.append({
@@ -289,7 +286,7 @@ async def get_smart_recommendations():
                     "effort": "low",
                 })
 
-        # 2. Pending alerts — need attention
+        # 2. Pending alerts
         if alert_data:
             pending = [a for a in alert_data if a.get("status") == "pending"]
             if pending:
@@ -351,7 +348,7 @@ async def get_smart_recommendations():
                     "effort": "medium",
                 })
 
-        # 5. General recommendations (always useful)
+        # 5. General recommendations
         if not kw_data:
             recommendations.append({
                 "id": "setup-keywords",
@@ -377,7 +374,6 @@ async def get_smart_recommendations():
             "effort": "low",
         })
 
-    # Sort by priority
     priority_order = {"high": 0, "medium": 1, "low": 2}
     recommendations.sort(key=lambda r: priority_order.get(r.get("priority", "low"), 3))
 
@@ -390,25 +386,34 @@ async def get_smart_recommendations():
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _safe_count(sb, table: str) -> int:
+def _safe_count(sb, table: str, tenant_id: Optional[str] = None) -> int:
     try:
-        r = sb.table(table).select("id", count="exact").limit(0).execute()
+        q = sb.table(table).select("id", count="exact").limit(0)
+        if tenant_id:
+            q = q.eq("tenant_id", tenant_id)
+        r = q.execute()
         return r.count or 0
     except Exception:
         return 0
 
 
-def _safe_recent(sb, table: str, limit: int) -> list:
+def _safe_recent(sb, table: str, limit: int, tenant_id: Optional[str] = None) -> list:
     try:
-        r = sb.table(table).select("*").order("created_at", desc=True).limit(limit).execute()
+        q = sb.table(table).select("*")
+        if tenant_id:
+            q = q.eq("tenant_id", tenant_id)
+        r = q.order("created_at", desc=True).limit(limit).execute()
         return r.data or []
     except Exception:
         return []
 
 
-def _safe_query(sb, table: str, columns: str, limit: int) -> list:
+def _safe_query(sb, table: str, columns: str, limit: int, tenant_id: Optional[str] = None) -> list:
     try:
-        r = sb.table(table).select(columns).limit(limit).execute()
+        q = sb.table(table).select(columns)
+        if tenant_id:
+            q = q.eq("tenant_id", tenant_id)
+        r = q.limit(limit).execute()
         return r.data or []
     except Exception:
         return []

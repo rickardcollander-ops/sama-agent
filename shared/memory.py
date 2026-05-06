@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 class AgentMemory:
     """Manages agent learnings: retrieval, formatting, and decay."""
 
-    def __init__(self, agent_name: str):
+    def __init__(self, agent_name: str, tenant_id: str = "default"):
         self.agent_name = agent_name
+        self.tenant_id = tenant_id
         self._sb = None
 
     def _get_sb(self):
@@ -32,17 +33,20 @@ class AgentMemory:
         min_confidence: float = 0.3,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve the most relevant and recent learnings for this agent.
+        Retrieve the most relevant and recent learnings for this agent+tenant.
         Filters by confidence and recency.
         """
         try:
             sb = self._get_sb()
-            query = sb.table("agent_learnings") \
-                .select("*") \
-                .eq("agent_name", self.agent_name) \
-                .gte("confidence_score", min_confidence) \
-                .order("created_at", desc=True) \
+            query = (
+                sb.table("agent_learnings")
+                .select("*")
+                .eq("agent_name", self.agent_name)
+                .eq("tenant_id", self.tenant_id)
+                .gte("confidence_score", min_confidence)
+                .order("created_at", desc=True)
                 .limit(limit)
+            )
 
             result = query.execute()
             return result.data or []
@@ -51,9 +55,7 @@ class AgentMemory:
             return []
 
     def format_learnings_for_prompt(self, learnings: List[Dict[str, Any]]) -> str:
-        """
-        Format learnings into a string suitable for injection into Claude prompts.
-        """
+        """Format learnings into a string suitable for injection into Claude prompts."""
         if not learnings:
             return ""
 
@@ -97,6 +99,7 @@ class AgentMemory:
             sb = self._get_sb()
             sb.table("agent_learnings").insert({
                 "agent_name": self.agent_name,
+                "tenant_id": self.tenant_id,
                 "cycle_id": cycle_id,
                 "learning_type": learning_type,
                 "action_taken": action_taken,
@@ -106,7 +109,7 @@ class AgentMemory:
                 "context": context or {},
                 "created_at": datetime.utcnow().isoformat(),
             }).execute()
-            logger.info(f"[memory] Stored learning for {self.agent_name}: {action_taken[:60]}")
+            logger.info(f"[memory] Stored learning for {self.agent_name} (tenant={self.tenant_id}): {action_taken[:60]}")
         except Exception as e:
             logger.error(f"[memory] Failed to store learning: {e}")
 
@@ -119,14 +122,17 @@ class AgentMemory:
             sb = self._get_sb()
             cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
 
-            result = sb.table("agent_actions") \
-                .select("id, action_id, title, expected_outcome, execution_result") \
-                .eq("agent_name", self.agent_name) \
-                .eq("status", "completed") \
-                .lte("executed_at", cutoff) \
-                .is_("reflected_at", "null") \
-                .limit(10) \
+            result = (
+                sb.table("agent_actions")
+                .select("id, action_id, title, expected_outcome, execution_result")
+                .eq("agent_name", self.agent_name)
+                .eq("tenant_id", self.tenant_id)
+                .eq("status", "completed")
+                .lte("executed_at", cutoff)
+                .is_("reflected_at", "null")
+                .limit(10)
                 .execute()
+            )
 
             actions = result.data or []
             if not actions:
@@ -145,7 +151,6 @@ class AgentMemory:
                 else:
                     actual_str = str(actual_result)[:200]
 
-                # Determine confidence based on whether outcome was achieved
                 confidence = 0.6 if actual_result else 0.3
 
                 await self.store_reflection(
@@ -156,7 +161,6 @@ class AgentMemory:
                     confidence=confidence,
                 )
 
-                # Mark as reflected
                 try:
                     sb.table("agent_actions").update({
                         "reflected_at": datetime.utcnow().isoformat()
@@ -166,7 +170,7 @@ class AgentMemory:
 
                 reflected += 1
 
-            logger.info(f"[memory] Reflected on {reflected} completed actions for {self.agent_name}")
+            logger.info(f"[memory] Reflected on {reflected} completed actions for {self.agent_name} (tenant={self.tenant_id})")
             return reflected
 
         except Exception as e:
