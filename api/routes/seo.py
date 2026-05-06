@@ -33,6 +33,21 @@ async def get_status():
         }
 
 
+async def _get_tenant_brand(sb, tenant_id: str) -> dict:
+    """Load brand context for the given tenant from user_settings."""
+    try:
+        result = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+        s = (result.data or {}).get("settings", {}) if result.data else {}
+        return {
+            "brand_name": s.get("brand_name", ""),
+            "domain": s.get("domain", ""),
+            "brand_description": s.get("brand_description", ""),
+            "business_type": s.get("business_type", ""),
+        }
+    except Exception:
+        return {}
+
+
 @router.get("/stats")
 async def get_seo_stats(request: Request):
     """Return aggregated SEO statistics for the dashboard."""
@@ -41,10 +56,7 @@ async def get_seo_stats(request: Request):
 
     try:
         sb = get_supabase()
-        query = sb.table("seo_keywords").select("*")
-        if tenant_id and tenant_id != "default":
-            query = query.eq("tenant_id", tenant_id)
-        result = query.execute()
+        result = sb.table("seo_keywords").select("*").eq("tenant_id", tenant_id).execute()
         keywords = result.data or []
 
         positions = [kw["current_position"] for kw in keywords if kw.get("current_position")]
@@ -101,7 +113,6 @@ async def initialize_keywords(request: Request):
 async def run_audit(background_tasks: BackgroundTasks):
     """Run weekly SEO audit"""
     try:
-        # Run audit in background for long-running task
         background_tasks.add_task(seo_agent.run_weekly_audit)
         return {
             "success": True,
@@ -133,26 +144,20 @@ async def track_keywords():
 
 @router.get("/keywords")
 async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
-    """Get all tracked keywords for the tenant.
-
-    Returns each row with both the `current_*` field names (legacy) and
-    short aliases (`clicks`, `impressions`, `position`, `ctr`) so any
-    frontend column mapping works.
-    """
+    """Get all tracked keywords for the tenant."""
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         sb = get_supabase()
-        query = (
+        result = (
             sb.table("seo_keywords")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .order("current_impressions", desc=True)
             .range(offset, offset + min(limit, 5000) - 1)
+            .execute()
         )
-        if tenant_id and tenant_id != "default":
-            query = query.eq("tenant_id", tenant_id)
-        result = query.execute()
         keywords = result.data or []
 
         return {
@@ -165,17 +170,14 @@ async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
                     "intent": kw.get("intent") or "",
                     "priority": kw.get("priority") or "",
                     "target_page": kw.get("target_page") or "",
-                    # Legacy names
                     "current_position": kw.get("current_position") or 0,
                     "current_clicks": kw.get("current_clicks") or 0,
                     "current_impressions": kw.get("current_impressions") or 0,
                     "current_ctr": kw.get("current_ctr") or 0.0,
-                    # Short aliases — many dashboards expect these
                     "position": kw.get("current_position") or 0,
                     "clicks": kw.get("current_clicks") or 0,
                     "impressions": kw.get("current_impressions") or 0,
                     "ctr": kw.get("current_ctr") or 0.0,
-                    # Trend metadata
                     "position_change": kw.get("position_change") or 0,
                     "position_trend": kw.get("position_trend") or "stable",
                     "last_checked_at": kw.get("last_checked_at"),
@@ -197,12 +199,15 @@ async def get_top_performers(request: Request):
 
     try:
         sb = get_supabase()
-        query = sb.table("seo_keywords").select("*").lte("current_position", 10)
-        if tenant_id and tenant_id != "default":
-            query = query.eq("tenant_id", tenant_id)
-        result = query.execute()
+        result = (
+            sb.table("seo_keywords")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .lte("current_position", 10)
+            .execute()
+        )
         keywords = result.data or []
-        
+
         return {
             "count": len(keywords),
             "keywords": [
@@ -220,10 +225,11 @@ async def get_top_performers(request: Request):
 
 
 @router.post("/keywords/add")
-async def add_keyword(data: dict):
+async def add_keyword(request: Request, data: dict):
     """Add a single keyword to tracking"""
     from shared.database import get_supabase
     from datetime import datetime
+    tenant_id = getattr(request.state, "tenant_id", "default")
 
     keyword = (data.get("keyword") or "").strip().lower()
     if not keyword:
@@ -232,13 +238,19 @@ async def add_keyword(data: dict):
     try:
         sb = get_supabase()
 
-        # Check for duplicate
-        existing = sb.table("seo_keywords").select("id").eq("keyword", keyword).execute()
+        existing = (
+            sb.table("seo_keywords")
+            .select("id")
+            .eq("keyword", keyword)
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
         if existing.data:
             return {"success": False, "message": f'"{keyword}" is already being tracked'}
 
         sb.table("seo_keywords").insert({
             "keyword": keyword,
+            "tenant_id": tenant_id,
             "intent": data.get("intent", "manual"),
             "priority": data.get("priority", "medium"),
             "target_page": data.get("target_page", "/"),
@@ -255,16 +267,23 @@ async def add_keyword(data: dict):
 
 
 @router.post("/actions/cleanup")
-async def cleanup_duplicate_actions():
+async def cleanup_duplicate_actions(request: Request):
     """Remove duplicate pending actions keeping only the most recent per action_id"""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        # Get all pending SEO actions
-        result = sb.table("agent_actions").select("id,action_id,created_at").eq("agent_name", "seo").eq("status", "pending").order("created_at", desc=True).execute()
+        result = (
+            sb.table("agent_actions")
+            .select("id,action_id,created_at")
+            .eq("agent_name", "seo")
+            .eq("status", "pending")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
         rows = result.data or []
 
-        # Group by action_id, keep newest, collect rest for deletion
         seen = {}
         to_delete = []
         for row in rows:
@@ -285,26 +304,35 @@ async def cleanup_duplicate_actions():
 
 
 @router.post("/reset")
-async def reset_seo_data(include_keywords: bool = False):
-    """Reset SEO data so analysis can start from a clean slate."""
+async def reset_seo_data(request: Request, include_keywords: bool = False):
+    """Reset SEO data for this tenant so analysis can start from a clean slate."""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         sb = get_supabase()
 
-        # Delete all SEO agent actions (pending/completed/failed)
         actions_result = (
             sb.table("agent_actions")
             .delete()
             .eq("agent_name", "seo")
+            .eq("tenant_id", tenant_id)
             .execute()
         )
 
-        # Delete all stored SEO audits
-        audits_result = sb.table("seo_audits").delete().neq("id", "").execute()
+        audits_result = (
+            sb.table("seo_audits")
+            .delete()
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
 
-        # Delete all saved SEO strategies and task states
-        strategies_result = sb.table("seo_strategies").delete().neq("id", "").execute()
+        strategies_result = (
+            sb.table("seo_strategies")
+            .delete()
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
 
         reset_summary = {
             "actions_deleted": len(actions_result.data or []),
@@ -315,7 +343,12 @@ async def reset_seo_data(include_keywords: bool = False):
         }
 
         if include_keywords:
-            keywords_result = sb.table("seo_keywords").delete().neq("id", "").execute()
+            keywords_result = (
+                sb.table("seo_keywords")
+                .delete()
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
             reset_summary["keywords_deleted"] = len(keywords_result.data or [])
 
         return {
@@ -328,12 +361,13 @@ async def reset_seo_data(include_keywords: bool = False):
 
 
 @router.delete("/keywords/{keyword:path}")
-async def delete_keyword(keyword: str):
+async def delete_keyword(keyword: str, request: Request):
     """Remove a keyword from tracking"""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_keywords").delete().eq("keyword", keyword).execute()
+        sb.table("seo_keywords").delete().eq("keyword", keyword).eq("tenant_id", tenant_id).execute()
         return {"success": True, "message": f'Removed "{keyword}"'}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -402,12 +436,20 @@ def _strategy_to_tasks(strategy: dict) -> list:
 
 
 @router.get("/strategy")
-async def load_seo_strategy():
-    """Load the most recent saved strategy"""
+async def load_seo_strategy(request: Request):
+    """Load the most recent saved strategy for this tenant"""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_strategies").select("*").order("created_at", desc=True).limit(1).execute()
+        result = (
+            sb.table("seo_strategies")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         row = (result.data or [None])[0]
         if not row:
             return {"success": True, "strategy": None}
@@ -425,14 +467,21 @@ async def load_seo_strategy():
 
 
 @router.patch("/strategy/tasks/{task_id}")
-async def update_task(task_id: str, data: dict):
+async def update_task(task_id: str, data: dict, request: Request):
     """Toggle a task done/undone"""
     from shared.database import get_supabase
     from datetime import datetime
-    import json
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_strategies").select("id,tasks").order("created_at", desc=True).limit(1).execute()
+        result = (
+            sb.table("seo_strategies")
+            .select("id,tasks")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         row = (result.data or [None])[0]
         if not row:
             raise HTTPException(status_code=404, detail="No strategy found")
@@ -454,26 +503,38 @@ async def update_task(task_id: str, data: dict):
 
 
 @router.post("/strategy")
-async def get_seo_strategy(force: bool = False):
-    """Generate a strategic SEO plan using Claude. Skips generation if data hasn't changed significantly."""
+async def get_seo_strategy(request: Request, force: bool = False):
+    """Generate a strategic SEO plan using Claude. Scoped to the requesting tenant."""
     from shared.database import get_supabase
     from anthropic import Anthropic
     from shared.config import settings
     import json, re
     from datetime import datetime
+    tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         sb = get_supabase()
 
-        # Gather keyword data
-        kw_result = sb.table("seo_keywords").select("*").execute()
+        # Load tenant brand context for a personalised AI prompt
+        brand = await _get_tenant_brand(sb, tenant_id)
+        brand_name = brand.get("brand_name") or tenant_id
+        domain = brand.get("domain") or ""
+        brand_description = brand.get("brand_description") or ""
+
+        kw_result = sb.table("seo_keywords").select("*").eq("tenant_id", tenant_id).execute()
         keywords = kw_result.data or []
 
         current_fingerprint = _build_fingerprint(keywords)
 
-        # Check if existing strategy has same fingerprint
         if not force:
-            existing = sb.table("seo_strategies").select("*").order("created_at", desc=True).limit(1).execute()
+            existing = (
+                sb.table("seo_strategies")
+                .select("*")
+                .eq("tenant_id", tenant_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
             existing_row = (existing.data or [None])[0]
             if existing_row and existing_row.get("data_fingerprint") == current_fingerprint:
                 return {
@@ -488,14 +549,20 @@ async def get_seo_strategy(force: bool = False):
                     "message": "Data hasn't changed significantly — showing existing strategy."
                 }
 
-        ranked    = [k for k in keywords if k.get("current_position") and k["current_position"] > 0]
-        unranked  = [k for k in keywords if not k.get("current_position")]
-        top3      = [k for k in ranked if k["current_position"] <= 3]
-        top10     = [k for k in ranked if k["current_position"] <= 10]
-        page2     = [k for k in ranked if 11 <= k["current_position"] <= 20]
+        ranked   = [k for k in keywords if k.get("current_position") and k["current_position"] > 0]
+        unranked = [k for k in keywords if not k.get("current_position")]
+        top3     = [k for k in ranked if k["current_position"] <= 3]
+        top10    = [k for k in ranked if k["current_position"] <= 10]
+        page2    = [k for k in ranked if 11 <= k["current_position"] <= 20]
 
-        # Latest audit
-        audit_result = sb.table("seo_audits").select("*").order("audit_date", desc=True).limit(1).execute()
+        audit_result = (
+            sb.table("seo_audits")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("audit_date", desc=True)
+            .limit(1)
+            .execute()
+        )
         latest_audit = (audit_result.data or [None])[0]
 
         audit_summary = ""
@@ -514,7 +581,10 @@ Latest Audit ({latest_audit.get('audit_date', '')[:10]}):
 
         unranked_summary = ", ".join([f"'{k['keyword']}'" for k in unranked[:10]])
 
-        prompt = f"""You are an expert SEO strategist. Analyze this data for successifier.com (AI customer success platform) and give a concrete 90-day SEO strategy.
+        site_context = domain or brand_name
+        desc_line = f" ({brand_description})" if brand_description else ""
+
+        prompt = f"""You are an expert SEO strategist. Analyze this data for {site_context}{desc_line} and give a concrete 90-day SEO strategy.
 
 KEYWORD DATA:
 Tracked: {len(keywords)} keywords total
@@ -541,7 +611,7 @@ Give your response in this exact JSON structure:
   "kpi_targets": {{"top10_keywords": 0, "monthly_clicks": 0, "avg_position": 0}}
 }}
 
-Be specific to successifier.com and the customer success SaaS space. Focus on realistic wins. Make each action in month1/month2/month3 a concrete single task someone can do and check off."""
+Be specific to {site_context}. Focus on realistic wins. Make each action a concrete single task someone can do and check off."""
 
         client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         response = await asyncio.to_thread(
@@ -566,8 +636,8 @@ Be specific to successifier.com and the customer success SaaS space. Focus on re
 
         tasks = _strategy_to_tasks(strategy)
 
-        # Save to DB
         row = sb.table("seo_strategies").insert({
+            "tenant_id": tenant_id,
             "headline": strategy.get("headline", ""),
             "strategy_json": strategy,
             "tasks": tasks,
@@ -603,14 +673,15 @@ class KeywordSuggestRequest(BaseModel):
 @router.post("/suggest-keywords")
 async def suggest_keywords(payload: KeywordSuggestRequest, request: Request):
     """Use AI to suggest relevant keywords based on brand context."""
+    from shared.database import get_supabase
+    from shared.config import settings
     tenant_id = getattr(request.state, "tenant_id", "default")
 
     try:
         import anthropic
         import json
 
-        # Load brand context from DB if not provided
-        if not payload.brand_name and tenant_id != "default":
+        if not payload.brand_name:
             try:
                 sb = get_supabase()
                 data = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
@@ -677,10 +748,7 @@ async def discover_opportunities():
 
 @router.post("/keywords/sync-gsc")
 async def sync_gsc_keywords(request: Request, min_impressions: int = 1):
-    """Sync all keywords from Google Search Console into the seo_keywords table.
-    New keywords are auto-added, existing ones get updated metrics. Writes are
-    scoped to the requesting tenant so per-tenant /keywords queries can read them.
-    """
+    """Sync all keywords from Google Search Console into the seo_keywords table."""
     try:
         from shared.tenant_agents import get_seo_agent
         tenant_id = getattr(request.state, "tenant_id", "default")
@@ -697,15 +765,14 @@ async def _gsc_queries_payload(request: Request, limit: int) -> dict:
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
 
-    query = (
+    result = (
         sb.table("seo_keywords")
         .select("keyword,current_position,current_clicks,current_impressions,current_ctr,last_checked_at,target_page")
+        .eq("tenant_id", tenant_id)
         .order("current_impressions", desc=True)
         .limit(min(limit, 5000))
+        .execute()
     )
-    if tenant_id and tenant_id != "default":
-        query = query.eq("tenant_id", tenant_id)
-    result = query.execute()
     rows = result.data or []
     return {
         "tenant_id": tenant_id,
@@ -725,9 +792,6 @@ async def _gsc_queries_payload(request: Request, limit: int) -> dict:
     }
 
 
-# Canonical endpoint + legacy aliases the dashboard probes for. All return
-# the same payload so 404/405 noise disappears regardless of which path the
-# frontend tries first.
 @router.get("/gsc/queries")
 @router.get("/gsc/top-queries")
 @router.get("/search-console/queries")
@@ -736,8 +800,7 @@ async def _gsc_queries_payload(request: Request, limit: int) -> dict:
 @router.get("/rankings")
 @router.get("/metrics")
 async def get_gsc_queries(request: Request, limit: int = 1000):
-    """Return GSC queries for the tenant. Pulls from seo_keywords (populated
-    by /keywords/sync-gsc) so it works even when GSC API is rate-limited."""
+    """Return GSC queries for the tenant."""
     try:
         return await _gsc_queries_payload(request, limit)
     except Exception as e:
@@ -745,10 +808,11 @@ async def get_gsc_queries(request: Request, limit: int = 1000):
 
 
 @router.get("/actions")
-async def get_seo_actions(status: str = None, limit: int = 100):
+async def get_seo_actions(request: Request, status: str = None, limit: int = 100):
     """Get SEO actions from database"""
     from shared.actions_db import get_actions
-    actions = await get_actions(agent_name="seo", status=status, limit=limit)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    actions = await get_actions(agent_name="seo", status=status, limit=limit, tenant_id=tenant_id)
     return {"success": True, "actions": actions}
 
 
@@ -765,13 +829,21 @@ async def delete_action(action_id: str):
 
 
 @router.delete("/strategy/tasks/{task_id}")
-async def delete_strategy_task(task_id: str):
+async def delete_strategy_task(task_id: str, request: Request):
     """Delete a single task from the current strategy"""
     from shared.database import get_supabase
     from datetime import datetime
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_strategies").select("id,tasks").order("created_at", desc=True).limit(1).execute()
+        result = (
+            sb.table("seo_strategies")
+            .select("id,tasks")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         row = (result.data or [None])[0]
         if not row:
             raise HTTPException(status_code=404, detail="No strategy found")
@@ -794,7 +866,7 @@ async def delete_strategy_task(task_id: str):
 
 @router.post("/analyze")
 async def run_full_analysis(background: bool = True):
-    """Run full SEO analysis. With background=true (default), returns immediately with cycle_id for polling."""
+    """Run full SEO analysis."""
     from api.routes.seo_analyze_ooda import run_seo_analysis_with_ooda
 
     if background:
@@ -806,7 +878,7 @@ async def run_full_analysis(background: bool = True):
 
 @router.get("/cycle-status")
 async def seo_cycle_status(cycle_id: str = None):
-    """Poll analysis progress. Returns phase, progress %, and done flag."""
+    """Poll analysis progress."""
     from shared.background_analysis import get_cycle_status
     return await get_cycle_status("seo", cycle_id)
 
@@ -820,13 +892,11 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
     if not action:
         raise HTTPException(status_code=400, detail="No action provided")
 
-    # DB stores as action_type; dashboard may send either field name
     action_type = action.get("action_type") or action.get("type", "")
     keyword = action.get("keyword", "")
-    db_row_id = action.get("id")  # UUID primary key in agent_actions table
+    db_row_id = action.get("id")
 
     def mark_done(result: dict):
-        """Update status to completed in DB"""
         if db_row_id:
             try:
                 sb = get_supabase()
@@ -836,11 +906,10 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
                     "executed_at": datetime.utcnow().isoformat(),
                     "execution_result": result
                 }).eq("id", db_row_id).execute()
-            except Exception as e:
-                pass  # Don't fail the response if DB update fails
+            except Exception:
+                pass
 
     def mark_failed(error: str):
-        """Update status to failed in DB"""
         if db_row_id:
             try:
                 sb = get_supabase()
@@ -855,7 +924,6 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
 
     try:
         if action_type == "content":
-            # Generate blog post via Content Agent, then create GitHub PR
             title = action.get("title", keyword)
             result = await content_agent.generate_blog_post(
                 topic=title,
@@ -863,7 +931,6 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
                 word_count=2000
             )
 
-            # Try to push as PR if GitHub token is set
             from shared.github_helper import create_blog_post_pr
             import re as _re
 
@@ -895,11 +962,10 @@ async def execute_action(action: Dict[str, Any] = Body(...)):
             return outcome
 
         elif action_type == "on_page":
-            # Generate structured on-page SEO suggestions
             description = action.get("description", "")
             target_page = action.get("target_page", "")
             if seo_agent.client:
-                _on_page_prompt = f"""You are an SEO specialist for successifier.com — an AI customer success platform.
+                _on_page_prompt = f"""You are an SEO specialist.
 
 Page: {target_page or 'unknown'}
 Context: {description}
@@ -920,9 +986,7 @@ Reply with ONLY this exact JSON (no prose outside it):
 Rules:
 - title_tag: max 60 chars, include '{keyword}'
 - meta_description: max 155 chars, compelling CTA
-- Use real successifier.com paths: /, /pricing, /blog, /vs/gainsight, /vs/totango, /vs/churnzero, /product
-- 3 internal links, 3 LSI keywords, 3 quick wins
-- Be specific to successifier.com, not generic"""
+- 3 internal links, 3 LSI keywords, 3 quick wins"""
                 response = await asyncio.to_thread(
                     seo_agent.client.messages.create,
                     model=seo_agent.model,
@@ -954,8 +1018,8 @@ Rules:
                     "keyword": keyword,
                     "target_page": target_page,
                     "suggestions": {
-                        "title_tag": f"{keyword.title()} | Successifier",
-                        "meta_description": f"{keyword.title()} with Successifier's AI-powered CS platform. Reduce churn by 40%.",
+                        "title_tag": f"{keyword.title()}",
+                        "meta_description": f"{keyword.title()} — improve your online presence.",
                         "h1": f"{keyword.title()}: Complete Guide",
                         "internal_links": [],
                         "lsi_keywords": [],
@@ -986,14 +1050,12 @@ Rules:
                         "action_type": "comparison_page_created",
                         "competitor": competitor,
                         "github": github_result,
-                        "url": f"https://successifier.com/vs/{competitor}"
                     }
                     mark_done(outcome)
                     return outcome
 
-            # Other technical issues: generate a structured fix plan
             if seo_agent.client:
-                _tech_prompt = f"""Technical SEO issue on successifier.com:
+                _tech_prompt = f"""Technical SEO issue:
 Issue: {title}
 Details: {action.get('description', '')}
 Page: {target_page}
@@ -1055,8 +1117,7 @@ Be developer-ready. No generic advice."""
 @router.get("/keywords/ctr-opportunities")
 async def get_ctr_opportunities():
     """
-    Keywords with position ≤ 20 but CTR < 2%.
-    These are quick wins — improving title/meta could boost clicks without ranking changes.
+    Keywords with position <= 20 but CTR < 2%.
     """
     try:
         opportunities = await seo_agent.get_ctr_opportunities()
@@ -1069,7 +1130,6 @@ async def get_ctr_opportunities():
 async def get_page_gsc_insights():
     """
     Per-page GSC data: which pages get the most clicks/impressions.
-    Uses GSC dimension=page with full pagination.
     """
     from datetime import datetime, timedelta
 
@@ -1098,12 +1158,20 @@ async def get_page_gsc_insights():
 
 
 @router.get("/audits")
-async def get_audit_history(limit: int = 5):
-    """Get past audit results"""
+async def get_audit_history(request: Request, limit: int = 5):
+    """Get past audit results for this tenant"""
     from shared.database import get_supabase
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = sb.table("seo_audits").select("*").order("audit_date", desc=True).limit(limit).execute()
+        result = (
+            sb.table("seo_audits")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("audit_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
         return {"audits": result.data or []}
     except Exception as e:
         return {"audits": [], "error": str(e)}
