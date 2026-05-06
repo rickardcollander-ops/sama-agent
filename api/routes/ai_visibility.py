@@ -25,59 +25,61 @@ class GapUpdateRequest(BaseModel):
     status: str  # open | in_progress | resolved
 
 
-# ── Status ───────────────────────────────────────────────────────────────────────────
+# ── Status ────────────────────────────────────────────────────────────────────────────────────
 
 @router.get("/status")
 async def get_status():
     return {"agent": "ai_visibility", "status": "operational"}
 
 
-# ── Summary ──────────────────────────────────────────────────────────────────────────
+# ── Summary ─────────────────────────────────────────────────────────────────────────────────
 
 @router.get("/summary")
 async def get_summary(request: Request):
     """Mention rate, avg rank, top competitors, trend"""
     tenant_id = getattr(request.state, "tenant_id", "default")
-    if tenant_id and tenant_id != "default":
-        return ai_visibility_agent.get_summary(tenant_id=tenant_id)
-    return ai_visibility_agent.get_summary()
+    return ai_visibility_agent.get_summary(tenant_id=tenant_id)
 
 
-# ── Checks ───────────────────────────────────────────────────────────────────────────
+# ── Checks ──────────────────────────────────────────────────────────────────────────────────
 
 @router.get("/checks")
 async def get_checks(request: Request, limit: int = 50):
-    """All monitoring checks, newest first"""
+    """All monitoring checks for the calling tenant, newest first"""
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        query = sb.table("ai_visibility_checks").select("*").order("checked_at", desc=True).limit(limit)
-        if tenant_id and tenant_id != "default":
-            query = query.eq("tenant_id", tenant_id)
-        data = query.execute()
+        data = (
+            sb.table("ai_visibility_checks")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("checked_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
         return {"checks": data.data or []}
     except Exception as e:
         logger.error(f"get_checks error: {e}")
         return {"checks": []}
 
 
-# ── Gaps ──────────────────────────────────────────────────────────────────────────────
+# ── Gaps ───────────────────────────────────────────────────────────────────────────────────────
 
 @router.get("/gaps")
-async def get_gaps():
-    """Open gaps sorted by priority"""
+async def get_gaps(request: Request):
+    """Open gaps for the calling tenant, sorted by priority"""
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        # Fetch all gaps (open + in_progress shown, resolved hidden)
         data = (
             sb.table("ai_visibility_gaps")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .neq("status", "resolved")
             .order("created_at", desc=True)
             .execute()
         )
         gaps = data.data or []
-        # Sort: high → medium → low
         priority_order = {"high": 0, "medium": 1, "low": 2}
         gaps.sort(key=lambda g: priority_order.get(g.get("priority", "low"), 2))
         return {"gaps": gaps}
@@ -86,13 +88,10 @@ async def get_gaps():
         return {"gaps": []}
 
 
-# ── Run check ─────────────────────────────────────────────────────────────────────────
+# ── Run check ────────────────────────────────────────────────────────────────────────────────
 
 def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: Optional[str] = None) -> None:
-    """Update the agent_runs row when the monitoring thread finishes.
-
-    Safe to call without a run_id (no-op) so callers don't have to branch.
-    """
+    """Update the agent_runs row when the monitoring thread finishes."""
     if not run_id:
         return
     try:
@@ -112,10 +111,6 @@ def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: 
 def _run_check_thread(agent: AIVisibilityAgent, label: str, run_id: Optional[str]):
     try:
         logger.info(f"AI Visibility monitoring thread started for {label} (run_id={run_id})")
-        # Pass run_id so run_monitoring writes per-prompt progress to
-        # agent_runs.summary as it goes — the dashboard banner reads that
-        # field and shows live "X/N prompts checked" instead of a static
-        # spinner.
         result = asyncio.run(agent.run_monitoring(run_id_for_progress=run_id))
         logger.info(f"AI Visibility monitoring done for {label}: {result}")
         if isinstance(result, dict):
@@ -135,15 +130,10 @@ def _run_check_thread(agent: AIVisibilityAgent, label: str, run_id: Optional[str
 
 @router.post("/check")
 async def run_check(request: Request):
-    """Kick off a monitoring run in a background thread.
-
+    """
+    Kick off a monitoring run in a background thread.
     For tenant requests, build a per-tenant agent so the run uses the
     user's saved geo_queries, brand name and competitors.
-
-    An agent_runs row is inserted up front so the dashboard's
-    useActiveRuns hook can match the trigger to a backend run via the
-    returned run_id; the background thread updates the same row when
-    the monitoring finishes.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
     if tenant_id and tenant_id != "default":
@@ -156,8 +146,6 @@ async def run_check(request: Request):
         agent = ai_visibility_agent
         label = "default"
 
-    # Record the run so the dashboard can poll for status. Persisted only for
-    # real tenants — anonymous/default runs don't need to show up in history.
     run_id: Optional[str] = None
     if tenant_id and tenant_id != "default":
         try:
@@ -182,42 +170,45 @@ async def run_check(request: Request):
     }
 
 
-# ── Update gap ─────────────────────────────────────────────────────────────────────────
+# ── Update gap ────────────────────────────────────────────────────────────────────────────────
 
 @router.post("/gaps/update")
-async def update_gap(req: GapUpdateRequest):
-    """Mark a gap as in_progress or resolved"""
+async def update_gap(req: GapUpdateRequest, request: Request):
+    """Mark a gap as in_progress or resolved — verified against calling tenant."""
     if req.status not in ("open", "in_progress", "resolved"):
         return {"error": "Invalid status"}
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        sb.table("ai_visibility_gaps").update({"status": req.status}).eq("id", req.gap_id).execute()
+        sb.table("ai_visibility_gaps").update({"status": req.status}).eq("id", req.gap_id).eq("tenant_id", tenant_id).execute()
         return {"success": True, "gap_id": req.gap_id, "status": req.status}
     except Exception as e:
         logger.error(f"update_gap error: {e}")
         return {"error": str(e)}
 
 
-# ── Clear data ─────────────────────────────────────────────────────────────────────────
+# ── Clear data ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/clear")
-async def clear_data():
-    """Delete all checks and gaps — use when old/corrupt data needs to be removed"""
+async def clear_data(request: Request):
+    """Delete all checks and gaps for the calling tenant only."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        sb.table("ai_visibility_checks").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-        sb.table("ai_visibility_gaps").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-        return {"success": True, "message": "All checks and gaps cleared."}
+        sb.table("ai_visibility_checks").delete().eq("tenant_id", tenant_id).execute()
+        sb.table("ai_visibility_gaps").delete().eq("tenant_id", tenant_id).execute()
+        return {"success": True, "message": f"All checks and gaps cleared for tenant {tenant_id}."}
     except Exception as e:
         logger.error(f"clear_data error: {e}")
         return {"error": str(e)}
 
 
-# ── Debug: single sync test ───────────────────────────────────────────────────────────────────
+# ── Debug: single sync test ────────────────────────────────────────────────────────────────────────────────
 
 @router.get("/test")
-async def test_single():
+async def test_single(request: Request):
     """Run ONE prompt against ONE engine synchronously and return result — for debugging"""
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         from anthropic import Anthropic
         from shared.config import settings
@@ -230,9 +221,9 @@ async def test_single():
         )
         response_text = msg.content[0].text
         mentioned = "successifier" in response_text.lower()
-        # Try DB insert
         sb = get_supabase()
         sb.table("ai_visibility_checks").insert({
+            "tenant_id": tenant_id,
             "prompt": "TEST: What are the best customer success tools?",
             "category": "tool_recommendation",
             "ai_engine": "ChatGPT (GPT-4o)",
@@ -249,19 +240,31 @@ async def test_single():
         return {"ok": False, "error": str(e), "error_type": type(e).__name__}
 
 
-# ── Strategic Analysis ──────────────────────────────────────────────────────────────────────
+# ── Strategic Analysis ───────────────────────────────────────────────────────────────────────────────
 
 @router.post("/strategic-analysis")
-async def strategic_analysis():
+async def strategic_analysis(request: Request):
     """Generate a comprehensive, opinionated strategic analysis of AI visibility"""
-    result = await ai_visibility_agent.generate_strategic_analysis()
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    if tenant_id and tenant_id != "default":
+        config = await get_tenant_config(tenant_id)
+        agent = AIVisibilityAgent(tenant_config=config)
+    else:
+        agent = ai_visibility_agent
+    result = await agent.generate_strategic_analysis()
     return result
 
 
-# ── GEO Recommendations ───────────────────────────────────────────────────────────────────
+# ── GEO Recommendations ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/recommendations")
-async def generate_recommendations():
+async def generate_recommendations(request: Request):
     """Generate Claude-powered GEO recommendations from open gaps"""
-    recommendations = await ai_visibility_agent.generate_geo_recommendations()
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    if tenant_id and tenant_id != "default":
+        config = await get_tenant_config(tenant_id)
+        agent = AIVisibilityAgent(tenant_config=config)
+    else:
+        agent = ai_visibility_agent
+    recommendations = await agent.generate_geo_recommendations()
     return {"recommendations": recommendations}
