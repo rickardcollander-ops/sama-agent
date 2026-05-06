@@ -117,9 +117,30 @@ class AnalyticsAgent:
     # ── Data fetchers (one per channel) ───────────────────────────────
 
     async def _fetch_seo_data(self, date_range: int = 28) -> Dict[str, Any]:
-        """Fetch real SEO data from the SEO agent's GSC integration."""
+        """Fetch real SEO data from Google Search Console.
+
+        Resolution order for the GSC token:
+        1. Per-tenant token from `google_connections` (saved when the user
+           connects GSC via the dashboard's OAuth flow).
+        2. Global `GOOGLE_REFRESH_TOKEN` env var (legacy single-tenant fallback).
+
+        We query GSC directly here rather than going through the global
+        SEO-agent singleton — that singleton uses the global site URL and
+        global token, which is wrong for any non-Successifier tenant and
+        masks per-tenant connection issues.
+        """
+        tenant_id = (
+            getattr(self.tenant_config, "tenant_id", None)
+            if self.tenant_config else None
+        )
+        site_url = (
+            getattr(self.tenant_config, "gsc_site_url", None)
+            if self.tenant_config else None
+        ) or settings.GSC_SITE_URL or ""
+
         channel_data = {
-            "configured": is_gsc_configured(),
+            "configured": bool(site_url),
+            "site_url": site_url or None,
             "total_clicks": 0,
             "total_impressions": 0,
             "avg_ctr": 0.0,
@@ -130,27 +151,64 @@ class AnalyticsAgent:
             "top_10_keywords": 0,
         }
 
-        if not is_gsc_configured():
+        if not site_url:
             channel_data["status"] = "not_configured"
+            channel_data["message"] = "No GSC site URL configured for this tenant."
             return channel_data
 
         try:
-            from agents.seo import seo_agent
+            access_token: Optional[str] = None
+            if tenant_id:
+                try:
+                    access_token = await get_google_access_token(tenant_id, "search_console")
+                except ValueError:
+                    access_token = None
+            if not access_token:
+                access_token = await get_access_token("gsc")
+            if not access_token:
+                channel_data["status"] = "auth_error"
+                channel_data["message"] = "Connect Google Search Console in Settings."
+                return channel_data
 
-            # Get aggregate GSC summary (clicks, impressions, CTR, position)
-            gsc_data = await seo_agent._fetch_gsc_data()
-            if gsc_data.get("status") == "ok":
-                channel_data["total_clicks"] = gsc_data.get("total_clicks", 0)
-                channel_data["total_impressions"] = gsc_data.get("total_impressions", 0)
-                channel_data["avg_ctr"] = gsc_data.get("avg_ctr", 0.0)
-                channel_data["avg_position"] = gsc_data.get("avg_position", 0.0)
-                channel_data["status"] = "ok"
+            end_date = datetime.utcnow().strftime("%Y-%m-%d")
+            start_date = (datetime.utcnow() - timedelta(days=date_range)).strftime("%Y-%m-%d")
+            encoded_site = site_url.replace(":", "%3A").replace("/", "%2F")
+            url = f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query"
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "dimensions": [],
+                        "rowLimit": 1,
+                    },
+                )
+
+            if resp.status_code != 200:
+                logger.warning(f"GSC API error {resp.status_code}: {resp.text[:200]}")
+                channel_data["status"] = "error"
+                channel_data["error"] = f"GSC API returned {resp.status_code}: {resp.text[:160]}"
+                return channel_data
+
+            rows = (resp.json() or {}).get("rows", []) or []
+            if rows:
+                row = rows[0]
+                channel_data.update({
+                    "status": "ok",
+                    "total_clicks": int(row.get("clicks", 0) or 0),
+                    "total_impressions": int(row.get("impressions", 0) or 0),
+                    "avg_ctr": round(float(row.get("ctr", 0) or 0) * 100, 2),
+                    "avg_position": round(float(row.get("position", 0) or 0), 1),
+                })
             else:
-                channel_data["status"] = gsc_data.get("status", "error")
-                channel_data["message"] = gsc_data.get("message", "")
+                channel_data["status"] = "no_data"
 
-            # Get keyword ranking summary from the database
+            # Pull keyword summary from the database (tenant-scoped read).
             try:
+                from agents.seo import seo_agent
                 keywords = await seo_agent.get_keywords()
                 channel_data["keywords_tracked"] = len(keywords)
                 channel_data["top_3_keywords"] = sum(
@@ -618,17 +676,30 @@ class AnalyticsAgent:
         """
         logger.info("Collecting daily metrics for all channels")
 
-        # Fetch any missing channel data
+        async def _safe_fetch(name: str, coro_factory):
+            try:
+                return await coro_factory()
+            except Exception as e:
+                logger.warning(
+                    f"_fetch_{name}_data raised — recording as error and "
+                    f"continuing: {type(e).__name__}: {e}"
+                )
+                return {"status": "error", "error": f"{type(e).__name__}: {e}"[:240]}
+
+        # Fetch any missing channel data. Each fetcher already catches its
+        # own internal errors, but a few code paths (config probes, lazy
+        # imports) can still raise — we MUST NOT let that kill the whole
+        # run, otherwise one busted channel zeroes out the dashboard.
         if seo_data is None:
-            seo_data = await self._fetch_seo_data()
+            seo_data = await _safe_fetch("seo", self._fetch_seo_data)
         if ads_data is None:
-            ads_data = await self._fetch_ads_data()
+            ads_data = await _safe_fetch("ads", self._fetch_ads_data)
         if reviews_data is None:
-            reviews_data = await self._fetch_reviews_data()
+            reviews_data = await _safe_fetch("reviews", self._fetch_reviews_data)
         if content_data is None:
-            content_data = await self._fetch_content_data()
+            content_data = await _safe_fetch("content", self._fetch_content_data)
         if ga4_data is None:
-            ga4_data = await self._fetch_ga4_data()
+            ga4_data = await _safe_fetch("ga4", self._fetch_ga4_data)
 
         today = datetime.utcnow().strftime("%Y-%m-%d")
         sb = get_supabase()
