@@ -17,6 +17,7 @@ from api.routes import (
     ai_visibility, dashboard, social_reddit, gtm, goals, notifications, dev_agent,
     agent_reports, agent_chat, user_settings, leads, webhooks,
     content_pieces, content_generate, social_posts, analytics_overview,
+    analytics_debug,
     ads_creatives, ads_credentials, google_oauth, tenant_activation,
     github_integration, usage, social_schedule, analytics_attribution,
     content_validation, analysis as analysis_routes, approvals,
@@ -206,6 +207,7 @@ app.include_router(content_generate.router, prefix="/api/content", tags=["conten
 app.include_router(social_posts.router, prefix="/api/social", tags=["social-posts"])
 app.include_router(social_schedule.router, prefix="/api/social", tags=["social-schedule"])
 app.include_router(analytics_overview.router, prefix="/api/analytics", tags=["analytics-overview"])
+app.include_router(analytics_debug.router, prefix="/api/analytics", tags=["analytics-debug"])
 app.include_router(analytics_attribution.router, prefix="/api/analytics", tags=["analytics-attribution"])
 app.include_router(ads_creatives.router, prefix="/api/ads", tags=["ads-creatives"])
 app.include_router(ads_credentials.router, prefix="/api/ads", tags=["ads-credentials"])
