@@ -28,6 +28,11 @@ class ContentPieceCreate(BaseModel):
     target_url: Optional[str] = None
     word_count: int = 0
     status: str = "draft"
+    # Sprint 2 (K-2 / K-5) — links back to the surface that motivated this
+    # article. At most one is set: a gap from Insikter, or a strategy topic.
+    source_gap_id: Optional[str] = None
+    source_gap_title: Optional[str] = None
+    source_strategy_topic: Optional[str] = None
 
 
 class ContentPieceUpdate(BaseModel):
@@ -39,6 +44,9 @@ class ContentPieceUpdate(BaseModel):
     target_url: Optional[str] = None
     word_count: Optional[int] = None
     status: Optional[str] = None
+    source_gap_id: Optional[str] = None
+    source_gap_title: Optional[str] = None
+    source_strategy_topic: Optional[str] = None
 
 
 def _ensure_numeric(row: dict) -> dict:
