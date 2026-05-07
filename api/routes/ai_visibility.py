@@ -108,7 +108,12 @@ def _finalize_run(run_id: Optional[str], status: str, summary: str = "", error: 
         logger.warning(f"Could not update agent_runs {run_id}", exc_info=True)
 
 
-def _run_check_thread(agent: AIVisibilityAgent, label: str, run_id: Optional[str]):
+def _run_check_thread(
+    agent: AIVisibilityAgent,
+    label: str,
+    run_id: Optional[str],
+    tenant_id: Optional[str] = None,
+):
     try:
         logger.info(f"AI Visibility monitoring thread started for {label} (run_id={run_id})")
         result = asyncio.run(agent.run_monitoring(run_id_for_progress=run_id))
@@ -122,6 +127,28 @@ def _run_check_thread(agent: AIVisibilityAgent, label: str, run_id: Optional[str
                 summary_text = f"{checks} checks completed"
         else:
             summary_text = "GEO check completed"
+
+        # Auto-feed: translate freshly-created ai_visibility_gaps into
+        # plan items so the GEO findings show up alongside SEO/content gaps
+        # on the unified Plan list.
+        if tenant_id:
+            try:
+                from agents.ai_visibility import _gaps_to_content_actions
+                from api.routes.content_plan import upsert_analysis_gap_items
+                sb = get_supabase()
+                gaps_q = sb.table("ai_visibility_gaps").select("*").eq("status", "open")
+                if tenant_id != "default":
+                    gaps_q = gaps_q.eq("tenant_id", tenant_id)
+                gaps = gaps_q.order("created_at", desc=True).limit(50).execute().data or []
+                actions = _gaps_to_content_actions(gaps)
+                if actions:
+                    inserted = upsert_analysis_gap_items(
+                        tenant_id, actions, cycle_id=run_id, source="ai_visibility_gap"
+                    )
+                    logger.info(f"AI visibility → plan: {inserted} items added for {tenant_id}")
+            except Exception as e:
+                logger.debug(f"AI visibility → plan auto-feed skipped: {e}")
+
         _finalize_run(run_id, "completed", summary=summary_text)
     except Exception as e:
         logger.error(f"AI Visibility monitoring thread error for {label}: {e}", exc_info=True)
@@ -160,7 +187,11 @@ async def run_check(request: Request):
         except Exception:
             logger.warning("Could not insert agent_runs row for AI visibility check", exc_info=True)
 
-    t = threading.Thread(target=_run_check_thread, args=(agent, label, run_id), daemon=True)
+    t = threading.Thread(
+        target=_run_check_thread,
+        args=(agent, label, run_id, tenant_id),
+        daemon=True,
+    )
     t.start()
     logger.info(f"AI Visibility monitoring thread started: {t.name} ({label}, run_id={run_id})")
     return {

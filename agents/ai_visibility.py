@@ -805,3 +805,39 @@ Respond ONLY as a JSON array with objects having these fields:
 
 
 ai_visibility_agent = AIVisibilityAgent()
+
+
+# ── Plan-feed translator ─────────────────────────────────────────────────────
+
+def _gaps_to_content_actions(gaps: list) -> list:
+    """Convert ai_visibility_gaps rows into the action-dict shape that
+    ``upsert_analysis_gap_items`` understands. Each gap becomes either a
+    blog or comparison idea, with ``prompt`` carried as the keyword/title."""
+    actions = []
+    for gap in gaps or []:
+        prompt = (gap.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        category = (gap.get("category") or "").strip()
+        action_type = (gap.get("action_type") or "").strip()
+
+        kind = "blog_article"
+        lower = prompt.lower()
+        if action_type == "build_reviews" or " vs " in lower or "alternative" in lower:
+            kind = "comparison"
+
+        actions.append({
+            "id": f"aiv-{gap.get('id', '')}",
+            "type": kind,
+            "priority": gap.get("priority") or "medium",
+            "title": (f"AI gap: {prompt}")[:200],
+            "description": category or action_type or "AI visibility gap",
+            "action": "Create content that addresses this AI prompt",
+            "keyword": prompt,
+            "pillar": category or None,
+            "expected_outcome": {
+                "type": "ai_visibility",
+                "ai_engine": gap.get("ai_engine"),
+            },
+        })
+    return actions
