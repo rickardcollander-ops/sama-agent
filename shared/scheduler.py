@@ -37,6 +37,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_ads_check":        {"last_run": None, "last_status": None, "last_error": None},
     "weekly_content_analysis": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_content_autopilot": {"last_run": None, "last_status": None, "last_error": None},
+    "hourly_due_content_drafts": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_ai_visibility":   {"last_run": None, "last_status": None, "last_error": None},
     "midday_review_check":    {"last_run": None, "last_status": None, "last_error": None},
     "daily_reflection":       {"last_run": None, "last_status": None, "last_error": None},
@@ -188,15 +189,7 @@ async def _run_weekly_content_analysis():
 
 
 async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, Any]) -> Dict[str, int]:
-    """Run the full content autopilot chain for a single tenant.
-
-    Pipeline:
-        1. analyze       — content OODA, auto-feeds gaps into the plan
-        2. generate      — AI-batch ideas, deduped against existing plan
-        3. draft top N   — materialise top-priority plan items
-        4. queue/publish — auto-publish if validation_score passes & enabled,
-                           otherwise queue in pending_approvals for the editor
-    """
+    """Run the full content autopilot chain for a single tenant."""
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
     from api.routes.content_validation import _heuristic_checks
     from shared.database import get_supabase
@@ -204,22 +197,17 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
     stats = {"plan_items_added": 0, "ideas_generated": 0, "drafted": 0, "queued": 0, "published": 0}
     sb = get_supabase()
 
-    # 1. Analyze (auto-feeds analysis_gap rows into content_plan_items)
     try:
         result = await run_content_analysis_with_ooda(tenant_id=tenant_id)
         stats["plan_items_added"] = int(result.get("plan_items_added") or 0)
     except Exception as e:
         logger.warning(f"[autopilot {tenant_id}] analyze failed: {e}")
 
-    # 2. Generate ideas (batch). Re-implementing the route inline keeps us off
-    #    Request-scoped state so we can call it from the scheduler without
-    #    fabricating a fake FastAPI Request object.
     try:
         from shared.config import settings as _settings
         import anthropic
         ideas_count = max(1, min(int(ap_cfg.get("ideas_per_run", 6)), 12))
 
-        # Pull brand context the same way the route does.
         brand = {}
         try:
             row = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
@@ -244,7 +232,6 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
         except Exception:
             ideas = _json.loads(text.split("```")[1].lstrip("json").strip()) if "```" in text else []
 
-        # Dedupe by keyword against existing plan rows.
         existing = sb.table("content_plan_items").select("target_keyword").eq("tenant_id", tenant_id).execute()
         existing_kw = {(r.get("target_keyword") or "").strip().lower() for r in (existing.data or [])}
         rows = []
@@ -272,7 +259,6 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
     except Exception as e:
         logger.warning(f"[autopilot {tenant_id}] generate failed: {e}")
 
-    # 3. Draft the top-N pending ideas (priority-sorted).
     top_n = max(0, min(int(ap_cfg.get("auto_draft_top_n", 3)), 6))
     if top_n > 0:
         try:
@@ -328,7 +314,6 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                     }).eq("id", item["id"]).execute()
                     stats["drafted"] += 1
 
-                    # 4. Decide between auto-publish and queue-for-approval.
                     score = _heuristic_checks(piece_data)["score"]
                     min_score = int(ap_cfg.get("min_score_for_publish", 70))
                     if ap_cfg.get("auto_publish") and score >= min_score:
@@ -346,7 +331,6 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             stats["published"] += 1
                             continue
 
-                    # Queue for human approval otherwise.
                     sb.table("pending_approvals").insert({
                         "tenant_id": tenant_id,
                         "kind": "content",
@@ -368,13 +352,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
 
 
 async def _run_content_autopilot():
-    """Fan out content autopilot to every tenant that has it enabled.
-
-    Reads ``user_settings.settings.content_autopilot``. Tenants with
-    ``enabled=true`` get the full chain run for them. Cadence ('weekly' vs
-    'biweekly') is honoured by skipping every other Wednesday — we use
-    ISO week parity as a cheap deterministic check.
-    """
+    """Fan out content autopilot to every tenant that has it enabled."""
     logger.info("[scheduler] Running content autopilot fan-out...")
     try:
         from shared.database import get_supabase
@@ -387,7 +365,6 @@ async def _run_content_autopilot():
                 continue
             cadence = (cfg.get("cadence") or "weekly").lower()
             if cadence == "biweekly":
-                # Skip on odd ISO weeks so we run every other week.
                 if datetime.now(timezone.utc).isocalendar().week % 2 != 0:
                     continue
             tenants.append((row["user_id"], cfg))
@@ -481,7 +458,6 @@ async def _run_daily_digest():
         from shared.database import get_supabase
         sb = get_supabase()
 
-        # Count today's activity
         from datetime import datetime, timedelta
         today = (datetime.utcnow() - timedelta(hours=24)).isoformat()
 
@@ -582,12 +558,7 @@ async def _run_daily_lead_scoring():
 
 
 async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
-    """
-    Fan-out: for every tenant where (agent_name, schedule) matches the row in
-    tenant_agent_config AND enabled is true, dispatch a cycle. Each tenant's
-    run is recorded in agent_runs and executes independently in the background
-    so one tenant's failure doesn't block the others.
-    """
+    """Fan-out: per-tenant cycles based on tenant_agent_config."""
     job_id = f"tenants_{agent_name}_{schedule}"
     logger.info(f"[scheduler] {job_id}: fan-out start")
     try:
@@ -673,6 +644,29 @@ async def _run_publish_due_social_posts():
         await _notify_failure(job_id, str(e))
 
 
+async def _run_due_content_drafts():
+    """Process content_plan_items where scheduled_for <= now().
+
+    Drafts the article via Claude. If auto_publish_on_schedule=true, also
+    raises a GitHub PR + flips status='published' on both the piece and
+    the plan row. Runs hourly so calendar dates land within an hour.
+    """
+    job_id = "hourly_due_content_drafts"
+    try:
+        from api.routes.content_plan import process_due_scheduled_items
+        stats = await process_due_scheduled_items()
+        if stats.get("drafted") or stats.get("published") or stats.get("failed"):
+            logger.info(
+                f"[scheduler] due-content-drafts — drafted {stats.get('drafted',0)}, "
+                f"published {stats.get('published',0)}, failed {stats.get('failed',0)}"
+            )
+        _record(job_id, "success")
+    except Exception as e:
+        logger.error(f"[scheduler] {job_id} failed: {e}")
+        _record(job_id, "error", str(e))
+        await _notify_failure(job_id, str(e))
+
+
 async def _run_watchdog() -> None:
     """Mark agent_runs that have been 'running' too long as failed."""
     try:
@@ -687,129 +681,38 @@ async def _run_watchdog() -> None:
 def start():
     """Register all jobs and start the scheduler."""
     # Daily keyword tracking — 02:00 UTC every day
-    scheduler.add_job(
-        _run_daily_keyword_tracking,
-        CronTrigger(hour=2, minute=0),
-        id="daily_keyword_tracking",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_daily_keyword_tracking, CronTrigger(hour=2, minute=0), id="daily_keyword_tracking", replace_existing=True)
     # Weekly SEO audit — Mondays 03:00 UTC
-    scheduler.add_job(
-        _run_weekly_seo_audit,
-        CronTrigger(day_of_week="mon", hour=3, minute=0),
-        id="weekly_seo_audit",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_weekly_seo_audit, CronTrigger(day_of_week="mon", hour=3, minute=0), id="weekly_seo_audit", replace_existing=True)
     # Daily workflow (reviews + social) — 06:00 UTC every day
-    scheduler.add_job(
-        _run_daily_workflow,
-        CronTrigger(hour=6, minute=0),
-        id="daily_workflow",
-        replace_existing=True,
-    )
-
-    # Daily metrics collection — 04:00 UTC every day (after keyword tracking)
-    scheduler.add_job(
-        _run_daily_metrics,
-        CronTrigger(hour=4, minute=0),
-        id="daily_metrics",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_daily_workflow, CronTrigger(hour=6, minute=0), id="daily_workflow", replace_existing=True)
+    # Daily metrics collection — 04:00 UTC every day
+    scheduler.add_job(_run_daily_metrics, CronTrigger(hour=4, minute=0), id="daily_metrics", replace_existing=True)
     # Daily ads check — 08:00 UTC every day
-    scheduler.add_job(
-        _run_daily_ads_check,
-        CronTrigger(hour=8, minute=0),
-        id="daily_ads_check",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_daily_ads_check, CronTrigger(hour=8, minute=0), id="daily_ads_check", replace_existing=True)
     # Weekly content gap analysis — Wednesdays 05:00 UTC
-    scheduler.add_job(
-        _run_weekly_content_analysis,
-        CronTrigger(day_of_week="wed", hour=5, minute=0),
-        id="weekly_content_analysis",
-        replace_existing=True,
-    )
-
-    # Content autopilot — Wednesdays 06:00 UTC (1h after the analysis so its
-    # gaps are already in the plan when the autopilot drafts them).
-    scheduler.add_job(
-        _run_content_autopilot,
-        CronTrigger(day_of_week="wed", hour=6, minute=0),
-        id="weekly_content_autopilot",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_weekly_content_analysis, CronTrigger(day_of_week="wed", hour=5, minute=0), id="weekly_content_analysis", replace_existing=True)
+    # Content autopilot — Wednesdays 06:00 UTC
+    scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
+    # Hourly: pick up plan items whose scheduled_for has passed.
+    scheduler.add_job(_run_due_content_drafts, CronTrigger(minute=0), id="hourly_due_content_drafts", replace_existing=True)
     # Midday review check — 14:00 UTC every day
-    scheduler.add_job(
-        _run_midday_review_check,
-        CronTrigger(hour=14, minute=0),
-        id="midday_review_check",
-        replace_existing=True,
-    )
-
-    # Daily reflection — 22:00 UTC (review completed actions)
-    scheduler.add_job(
-        _run_daily_reflection,
-        CronTrigger(hour=22, minute=0),
-        id="daily_reflection",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_midday_review_check, CronTrigger(hour=14, minute=0), id="midday_review_check", replace_existing=True)
+    # Daily reflection — 22:00 UTC
+    scheduler.add_job(_run_daily_reflection, CronTrigger(hour=22, minute=0), id="daily_reflection", replace_existing=True)
     # Daily digest notification — 17:00 UTC
-    scheduler.add_job(
-        _run_daily_digest,
-        CronTrigger(hour=17, minute=0),
-        id="daily_digest",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_daily_digest, CronTrigger(hour=17, minute=0), id="daily_digest", replace_existing=True)
     # Weekly goal review — Fridays 09:00 UTC
-    scheduler.add_job(
-        _run_weekly_goal_review,
-        CronTrigger(day_of_week="fri", hour=9, minute=0),
-        id="weekly_goal_review",
-        replace_existing=True,
-    )
-
-    # Daily agent self-reports — 05:00 UTC (before dev health check)
-    scheduler.add_job(
-        _run_daily_agent_reports,
-        CronTrigger(hour=5, minute=0),
-        id="daily_agent_reports",
-        replace_existing=True,
-    )
-
-    # Daily dev health check — 05:30 UTC (after reports, before main agent jobs)
-    scheduler.add_job(
-        _run_daily_dev_health_check,
-        CronTrigger(hour=5, minute=30),
-        id="daily_dev_health_check",
-        replace_existing=True,
-    )
-
+    scheduler.add_job(_run_weekly_goal_review, CronTrigger(day_of_week="fri", hour=9, minute=0), id="weekly_goal_review", replace_existing=True)
+    # Daily agent self-reports — 05:00 UTC
+    scheduler.add_job(_run_daily_agent_reports, CronTrigger(hour=5, minute=0), id="daily_agent_reports", replace_existing=True)
+    # Daily dev health check — 05:30 UTC
+    scheduler.add_job(_run_daily_dev_health_check, CronTrigger(hour=5, minute=30), id="daily_dev_health_check", replace_existing=True)
     # Weekly social analysis — Tuesdays 11:00 UTC
-    scheduler.add_job(
-        _run_weekly_social_analysis,
-        CronTrigger(day_of_week="tue", hour=11, minute=0),
-        id="weekly_social_analysis",
-        replace_existing=True,
-    )
+    scheduler.add_job(_run_weekly_social_analysis, CronTrigger(day_of_week="tue", hour=11, minute=0), id="weekly_social_analysis", replace_existing=True)
+    # Daily lead scoring — 07:00 UTC
+    scheduler.add_job(_run_daily_lead_scoring, CronTrigger(hour=7, minute=0), id="daily_lead_scoring", replace_existing=True)
 
-    scheduler.add_job(
-        _run_daily_lead_scoring,
-        CronTrigger(hour=7, minute=0),
-        id="daily_lead_scoring",
-        replace_existing=True,
-    )
-
-    # ── Multi-tenant agent fan-out ────────────────────────────────────────
-    # Each (agent_name, schedule) combination iterates tenant_agent_config
-    # and dispatches a per-tenant cycle. The legacy global jobs above only
-    # serve the home brand; these jobs serve every paying tenant.
     tenant_fanout_jobs = [
         ("seo", "daily", CronTrigger(hour=2, minute=30)),
         ("analytics", "daily", CronTrigger(hour=4, minute=30)),
@@ -817,36 +720,22 @@ def start():
         ("reviews", "daily", CronTrigger(hour=14, minute=30)),
         ("content", "weekly", CronTrigger(day_of_week="wed", hour=5, minute=30)),
         ("geo", "weekly", CronTrigger(day_of_week="thu", hour=10, minute=30)),
-        # Strategy runs Sunday 18:00 UTC, after a full week of domain activity.
         ("strategy", "weekly", CronTrigger(day_of_week="sun", hour=18, minute=0)),
     ]
     for agent_name, schedule_kind, trigger in tenant_fanout_jobs:
         job_id = f"tenants_{agent_name}_{schedule_kind}"
-        scheduler.add_job(
-            _run_for_all_tenants,
-            trigger,
-            args=[agent_name, schedule_kind],
-            id=job_id,
-            replace_existing=True,
-        )
+        scheduler.add_job(_run_for_all_tenants, trigger, args=[agent_name, schedule_kind], id=job_id, replace_existing=True)
 
-    # Watchdog: reap orphaned "running" rows every 5 minutes so a process
-    # restart mid-cycle doesn't leave the dashboard stuck on a spinner.
-    scheduler.add_job(
-        _run_watchdog,
-        CronTrigger(minute="*/5"),
-        id="agent_runs_watchdog",
-        replace_existing=True,
-    )
+    # Watchdog — every 5 min
+    scheduler.add_job(_run_watchdog, CronTrigger(minute="*/5"), id="agent_runs_watchdog", replace_existing=True)
 
     scheduler.start()
     logger.info(
         "[scheduler] Started — "
-        "keywords 02:00, SEO OODA Mon 03:00, metrics 04:00, "
-        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads OODA 08:00, "
-        "social OODA Tue 11:00, "
-        "reviews OODA 14:00, content OODA Wed 05:00, content autopilot Wed 06:00, "
-        "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
+        "keywords 02:00, SEO Mon 03:00, metrics 04:00, "
+        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, "
+        "social Tue 11:00, reviews 14:00, content Wed 05:00, autopilot Wed 06:00, "
+        "due-content-drafts hourly, digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
 
 
