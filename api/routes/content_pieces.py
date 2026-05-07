@@ -4,8 +4,9 @@ CRUD for content pieces (blog articles, landing pages, etc.) scoped by tenant.
 """
 
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -177,4 +178,126 @@ async def delete_content_piece(piece_id: str):
         return {"success": True}
     except Exception as e:
         logger.error(f"delete_content_piece error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ── Publish ──────────────────────────────────────────────────────────────────
+
+def _slugify(text: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (text or "").lower())).strip("-")
+
+
+@router.post("/pieces/{piece_id}/publish")
+async def publish_content_piece(piece_id: str, request: Request):
+    """Publish a content piece by raising a GitHub PR + flipping status.
+
+    The dashboard's editor calls this from the "Approve & Publish" button.
+    Steps:
+    1. Load the piece, ensure tenant ownership and status != published.
+    2. Pick the right helper based on content_type
+       (create_comparison_page_pr / create_blog_post_pr).
+    3. On success, set status='published' and target_url, and propagate
+       status='published' to any linked plan_item.
+    4. Publish a content_published event so the social agent can promote it.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("content_pieces")
+            .select("*")
+            .eq("id", piece_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return {"success": False, "error": "Piece not found"}
+        piece = rows[0]
+
+        if piece.get("status") == "published":
+            return {"success": True, "already_published": True, "target_url": piece.get("target_url")}
+
+        title = piece.get("title") or "Untitled"
+        content = piece.get("content") or ""
+        ctype = piece.get("content_type") or "blog_article"
+        keyword = piece.get("target_keyword") or ""
+        meta_description = piece.get("meta_description") or ""
+
+        github_result: Dict[str, Any]
+
+        if ctype == "comparison":
+            # Try to extract a competitor name from the title — same convention
+            # the existing execute() flow uses ("Successifier vs <competitor>").
+            from shared.github_helper import create_comparison_page_pr
+            m = re.search(r"vs\s+([A-Za-z0-9_\- ]+)", title)
+            competitor = (m.group(1).strip().lower().split()[0] if m else (keyword or "competitor"))
+            github_result = await create_comparison_page_pr(competitor=competitor, content=content)
+            slug = competitor.replace(" ", "-")
+            target_url = f"https://successifier.com/vs/{slug}"
+        else:
+            from shared.github_helper import create_blog_post_pr
+            slug = _slugify(title)
+            github_result = await create_blog_post_pr(
+                title=title,
+                content=content,
+                slug=slug,
+                excerpt=meta_description[:160],
+                keywords=[keyword] if keyword else [],
+                meta_description=meta_description,
+                author="SAMA Content Agent",
+            )
+            target_url = f"https://successifier.com/blog/{slug}"
+
+        if not github_result.get("success"):
+            return {"success": False, "error": github_result.get("error") or "GitHub publish failed", "github": github_result}
+
+        # Reflect the new state.
+        sb.table("content_pieces").update({
+            "status": "published",
+            "target_url": target_url,
+        }).eq("id", piece_id).execute()
+
+        # Mark any linked plan item as published too.
+        try:
+            sb.table("content_plan_items").update({"status": "published"}).eq(
+                "content_piece_id", piece_id
+            ).execute()
+        except Exception as e:
+            logger.debug(f"Failed to update plan_item status: {e}")
+
+        # Mark any pending_approval row for this piece as published.
+        try:
+            sb.table("pending_approvals").update({
+                "status": "published",
+                "published_at": datetime.now(timezone.utc).isoformat(),
+            }).contains("metadata", {"piece_id": piece_id}).execute()
+        except Exception as e:
+            logger.debug(f"Failed to update pending_approvals: {e}")
+
+        # Promote on social channels.
+        try:
+            from shared.event_bus_registry import get_event_bus
+            bus = get_event_bus()
+            if bus:
+                await bus.publish("content_published", "sama_social", {
+                    "title": title,
+                    "url": target_url,
+                    "type": "comparison" if ctype == "comparison" else "blog_post",
+                    "keyword": keyword,
+                    "pr_url": github_result.get("pr_url", ""),
+                })
+        except Exception as e:
+            logger.debug(f"Failed to publish content_published event: {e}")
+
+        return {
+            "success": True,
+            "piece_id": piece_id,
+            "target_url": target_url,
+            "pr_url": github_result.get("pr_url", ""),
+            "github": github_result,
+        }
+    except Exception as e:
+        logger.error(f"publish_content_piece error: {e}")
         return {"success": False, "error": str(e)}
