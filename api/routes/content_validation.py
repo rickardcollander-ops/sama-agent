@@ -7,8 +7,11 @@ dashboard can show a quality indicator and the auto-publisher can gate on it.
 
 Auto-publish: if the tenant has ``auto_publish_blog_posts`` enabled and the
 validation score is at or above ``auto_publish_min_score`` (default 70), the
-piece is marked ``published`` and pushed via the tenant's CMS API when
-configured. Otherwise it stays as ``draft``.
+piece is marked ``published`` and either pushed to the tenant's CMS (when
+``cms_api_url`` is set) or shipped via a GitHub Pull Request through the
+``shared.github_helper`` flow used by the rest of the agent. Otherwise the
+piece stays as ``draft`` and the editor's "Approve & Publish" button is
+disabled until the score crosses the threshold.
 """
 
 import logging
@@ -93,6 +96,7 @@ def _heuristic_checks(piece: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── /pieces/{id}/validate ───────────────────────────────────────────────────
 
+
 class ValidateResponse(BaseModel):
     score: int
     notes: List[str]
@@ -138,8 +142,14 @@ async def validate_piece(piece_id: str, request: Request):
 
 # ── /pieces/{id}/publish — manual or auto-publish ───────────────────────────
 
+
 class PublishPayload(BaseModel):
     force: bool = False  # Skip the score gate
+    via: Optional[str] = None  # "cms" | "github" — default: prefer CMS, fall back to GitHub
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (text or "").lower())).strip("-")
 
 
 async def _push_to_cms(cms_api_url: str, cms_api_key: str, piece: Dict[str, Any]) -> Optional[str]:
@@ -169,8 +179,67 @@ async def _push_to_cms(cms_api_url: str, cms_api_key: str, piece: Dict[str, Any]
     return None
 
 
+async def _publish_via_github(piece: Dict[str, Any]) -> Dict[str, Any]:
+    """Raise a GitHub PR with the article. Returns dict with success + pr_url + url."""
+    title = piece.get("title") or "Untitled"
+    content = piece.get("content") or ""
+    keyword = piece.get("target_keyword") or ""
+    meta_description = piece.get("meta_description") or ""
+    ctype = piece.get("content_type") or "blog_article"
+
+    if ctype == "comparison":
+        from shared.github_helper import create_comparison_page_pr
+        m = re.search(r"vs\s+([A-Za-z0-9_\- ]+)", title)
+        competitor = (m.group(1).strip().lower().split()[0] if m else (keyword or "competitor"))
+        result = await create_comparison_page_pr(competitor=competitor, content=content)
+        url = f"https://successifier.com/vs/{competitor.replace(' ', '-')}"
+    else:
+        from shared.github_helper import create_blog_post_pr
+        slug = _slugify(title)
+        result = await create_blog_post_pr(
+            title=title,
+            content=content,
+            slug=slug,
+            excerpt=meta_description[:160],
+            keywords=[keyword] if keyword else [],
+            meta_description=meta_description,
+            author="SAMA Content Agent",
+        )
+        url = f"https://successifier.com/blog/{slug}"
+
+    if result.get("success"):
+        result["url"] = url
+    return result
+
+
+async def _post_publish_sync(sb, piece_id: str) -> None:
+    """Mark linked plan_item + pending_approvals row as published, fire event."""
+    try:
+        sb.table("content_plan_items").update({"status": "published"}).eq(
+            "content_piece_id", piece_id
+        ).execute()
+    except Exception as e:
+        logger.debug(f"Failed to update plan_item status: {e}")
+
+    try:
+        sb.table("pending_approvals").update({
+            "status": "published",
+            "published_at": datetime.now(timezone.utc).isoformat(),
+        }).contains("metadata", {"piece_id": piece_id}).execute()
+    except Exception as e:
+        logger.debug(f"Failed to update pending_approvals: {e}")
+
+
 @router.post("/pieces/{piece_id}/publish")
 async def publish_piece(piece_id: str, payload: PublishPayload, request: Request):
+    """Publish a content piece — gates on validation score, then ships.
+
+    Shipping path resolution:
+    1. If ``payload.via == 'github'`` → always GitHub PR.
+    2. Else, if tenant has ``cms_api_url`` configured → CMS push.
+    3. Otherwise → GitHub PR fallback (so single-tenant default-mode works
+       out of the box without per-tenant CMS configuration).
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
     cfg = await get_tenant_config(tenant_id) if tenant_id != "default" else None
 
@@ -191,6 +260,13 @@ async def publish_piece(piece_id: str, payload: PublishPayload, request: Request
     if not piece:
         raise HTTPException(status_code=404, detail="Piece not found")
 
+    if piece.get("status") == "published":
+        return {
+            "success": True,
+            "already_published": True,
+            "external_url": piece.get("external_url") or piece.get("target_url"),
+        }
+
     min_score = int((cfg.get_raw("auto_publish_min_score", 70) if cfg else 70) or 70)
     score = piece.get("validation_score")
     if score is None:
@@ -203,9 +279,24 @@ async def publish_piece(piece_id: str, payload: PublishPayload, request: Request
             detail=f"Validation score {score} below minimum {min_score}. Use force=true to override.",
         )
 
-    external_url = None
-    if cfg:
-        external_url = await _push_to_cms(cfg.cms_api_url, cfg.cms_api_key, piece)
+    cms_url = cfg.cms_api_url if cfg else None
+    via = payload.via or ("cms" if cms_url else "github")
+
+    external_url: Optional[str] = None
+    pr_url: Optional[str] = None
+    github_result: Optional[Dict[str, Any]] = None
+
+    if via == "cms" and cms_url:
+        external_url = await _push_to_cms(cms_url, cfg.cms_api_key if cfg else "", piece)
+    else:
+        github_result = await _publish_via_github(piece)
+        if not github_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=github_result.get("error") or "GitHub publish failed",
+            )
+        external_url = github_result.get("url")
+        pr_url = github_result.get("pr_url")
 
     update = {
         "status": "published",
@@ -213,9 +304,33 @@ async def publish_piece(piece_id: str, payload: PublishPayload, request: Request
     }
     if external_url:
         update["external_url"] = external_url
+        update["target_url"] = external_url
 
     sb.table("content_pieces").update(update).eq("id", piece_id).execute()
-    return {"success": True, "score": score, "external_url": external_url}
+    await _post_publish_sync(sb, piece_id)
+
+    # Promote on social channels.
+    try:
+        from shared.event_bus_registry import get_event_bus
+        bus = get_event_bus()
+        if bus:
+            await bus.publish("content_published", "sama_social", {
+                "title": piece.get("title", ""),
+                "url": external_url or "",
+                "type": "comparison" if piece.get("content_type") == "comparison" else "blog_post",
+                "keyword": piece.get("target_keyword", ""),
+                "pr_url": pr_url or "",
+            })
+    except Exception as e:
+        logger.debug(f"Failed to publish content_published event: {e}")
+
+    return {
+        "success": True,
+        "score": score,
+        "external_url": external_url,
+        "pr_url": pr_url,
+        "via": via,
+    }
 
 
 # ── /auto-publish — sweep all draft pieces and publish those that qualify ───
@@ -272,6 +387,7 @@ async def auto_publish(request: Request):
         if external_url:
             update["external_url"] = external_url
         sb.table("content_pieces").update(update).eq("id", piece["id"]).execute()
+        await _post_publish_sync(sb, piece["id"])
         published += 1
 
     return {"published": published, "skipped": skipped, "min_score": min_score}
