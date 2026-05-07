@@ -86,7 +86,9 @@ def _get_github_config(tenant_id: str) -> Optional[dict]:
 # treated as safe. Source files outside this list are rejected to keep the
 # agent narrowly scoped to website-content changes.
 _ALLOWED_PATTERNS = [
-    r"\.(html?|md|mdx|tsx?|jsx?|css|scss|json|ya?ml|txt|svg)$",
+    r"\.(html?|md|mdx|tsx?|jsx?|css|scss|json|ya?ml|toml|txt|svg)$",
+    r"(^|/)_headers$",
+    r"(^|/)_redirects$",
     r"^public/.*",
     r"^src/.*",
     r"^app/.*",
