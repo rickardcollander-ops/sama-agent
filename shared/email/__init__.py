@@ -1,1 +1,1 @@
-"""Email infrastructure (Resend client, templates, weekly status reports)."""
+"""Email rendering + send helpers."""
