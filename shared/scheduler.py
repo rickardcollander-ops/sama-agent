@@ -45,6 +45,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_agent_reports":    {"last_run": None, "last_status": None, "last_error": None},
     "weekly_social_analysis": {"last_run": None, "last_status": None, "last_error": None},
     "daily_lead_scoring":     {"last_run": None, "last_status": None, "last_error": None},
+    "weekly_status_email":    {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -357,6 +358,31 @@ async def _run_daily_lead_scoring():
         await _notify_failure("daily_lead_scoring", str(e))
 
 
+async def _run_weekly_status_email():
+    """Send the weekly status email to every opted-in user."""
+    logger.info("[scheduler] Running weekly status email batch...")
+    try:
+        from shared.weekly_email import send_weekly_status_for_all
+        # send_weekly_status_for_all() does blocking Supabase + Resend calls;
+        # run it off the event loop so other scheduled coroutines can progress.
+        result = await asyncio.to_thread(send_weekly_status_for_all)
+        sent = result.get("sent", 0)
+        skipped = result.get("skipped", 0)
+        errors = result.get("errors", 0)
+        logger.info(
+            f"[scheduler] Weekly status email done — sent={sent} skipped={skipped} errors={errors}"
+        )
+        _record(
+            "weekly_status_email",
+            "success" if errors == 0 else "partial",
+            f"errors={errors}" if errors else None,
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] Weekly status email failed: {e}")
+        _record("weekly_status_email", "error", str(e))
+        await _notify_failure("weekly_status_email", str(e))
+
+
 async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
     """
     Fan-out: for every tenant where (agent_name, schedule) matches the row in
@@ -573,6 +599,16 @@ def start():
         replace_existing=True,
     )
 
+    # Weekly status email — Mondays 09:00 UTC.
+    # Runs after the weekend so users open the week with a recap of
+    # what the agents did and what's pending their approval.
+    scheduler.add_job(
+        _run_weekly_status_email,
+        CronTrigger(day_of_week="mon", hour=9, minute=0),
+        id="weekly_status_email",
+        replace_existing=True,
+    )
+
     # ── Multi-tenant agent fan-out ────────────────────────────────────────
     # Each (agent_name, schedule) combination iterates tenant_agent_config
     # and dispatches a per-tenant cycle. The legacy global jobs above only
@@ -611,7 +647,7 @@ def start():
         "[scheduler] Started — "
         "keywords 02:00, SEO OODA Mon 03:00, metrics 04:00, "
         "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads OODA 08:00, "
-        "social OODA Tue 11:00, "
+        "weekly-email Mon 09:00, social OODA Tue 11:00, "
         "reviews OODA 14:00, content OODA Wed 05:00, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
