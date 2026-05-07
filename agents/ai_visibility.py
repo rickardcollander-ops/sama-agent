@@ -10,6 +10,7 @@ Tracks how often Successifier is mentioned by AI assistants.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -314,7 +315,9 @@ class AIVisibilityAgent:
              brand context than leak someone else's competitor names.
         """
         if self.tenant_config and self.tenant_config.geo_queries:
-            return {"user_query": list(self.tenant_config.geo_queries)}
+            saved = self._strip_brand_from_prompts(list(self.tenant_config.geo_queries))
+            if saved:
+                return {"user_query": saved}
 
         if self.tenant_config:
             generated = self._generate_default_queries()
@@ -326,43 +329,70 @@ class AIVisibilityAgent:
     def _generate_default_queries(self) -> List[str]:
         """Build a small starter set of monitoring prompts from tenant context.
 
-        We avoid the global MONITORING_PROMPTS list because those reference
-        Successifier's competitive set (Gainsight, ChurnZero, …). Instead we
-        derive prompts from this tenant's brand, domain and competitors so
-        the GEO check is actually relevant to their market.
+        These prompts are sent verbatim to AI engines (ChatGPT, Claude,
+        Perplexity, Gemini, Copilot) to test whether the brand surfaces
+        unprompted. They MUST NOT contain the brand name or domain — if the
+        AI sees the brand in the query, the response is biased and tells us
+        nothing about organic visibility.
         """
         cfg = self.tenant_config
         if not cfg:
             return []
 
-        brand = (getattr(cfg, "brand_name", "") or "").strip()
-        domain = (getattr(cfg, "domain", "") or "").strip()
         competitors = list(getattr(cfg, "competitors", None) or [])
         category = (cfg.get_raw("business_type", "") or "").strip()
-        if not brand:
-            # Nothing to anchor the prompts on — let the caller decide what
-            # to do (the dashboard typically prompts the user to add saved
-            # queries before running).
-            return []
+        audience = (cfg.get_raw("target_audience", "") or "").strip()
 
-        descriptor = category or "tools"
+        descriptor = category or "tools in this category"
+        for_audience = audience or "small businesses"
+
         queries: List[str] = [
-            f"What does {brand} do?",
-            f"Is {brand} a good choice for {descriptor}?",
-            f"Best {descriptor} for small businesses",
+            f"Best {descriptor} for {for_audience}",
+            f"Top {descriptor} in 2025",
+            f"How to choose {descriptor}",
+            f"{descriptor} reviews and recommendations",
         ]
-        if domain:
-            queries.append(f"Tell me about {domain}")
+        # Competitor-anchored prompts surface the brand if AI engines list it
+        # as an alternative — without naming the brand in the prompt itself.
         for competitor in competitors[:3]:
-            queries.append(f"{brand} vs {competitor}")
-        # De-duplicate while preserving order.
+            queries.append(f"Best alternatives to {competitor}")
+        if len(competitors) >= 2:
+            queries.append(f"{competitors[0]} vs {competitors[1]}")
+
+        # De-duplicate while preserving order, then strip anything that still
+        # leaked the brand name or domain (defense in depth).
         seen: set[str] = set()
         deduped: List[str] = []
         for q in queries:
             if q not in seen:
                 seen.add(q)
                 deduped.append(q)
-        return deduped
+        return self._strip_brand_from_prompts(deduped)
+
+    def _brand_identity_tokens(self) -> List[str]:
+        """Tokens that must never appear in prompts sent to AI engines."""
+        cfg = self.tenant_config
+        if not cfg:
+            return []
+        tokens: List[str] = []
+        brand = (getattr(cfg, "brand_name", "") or "").strip().lower()
+        if len(brand) >= 3:
+            tokens.append(brand)
+        domain = (getattr(cfg, "domain", "") or "").strip().lower()
+        if domain:
+            host = re.sub(r"^https?://", "", domain).split("/")[0]
+            if host:
+                tokens.append(host)
+                root = host.split(".")[0]
+                if root and len(root) >= 3:
+                    tokens.append(root)
+        return list(dict.fromkeys(tokens))
+
+    def _strip_brand_from_prompts(self, prompts: List[str]) -> List[str]:
+        tokens = self._brand_identity_tokens()
+        if not tokens:
+            return prompts
+        return [p for p in prompts if not any(tok in p.lower() for tok in tokens)]
 
     async def run_monitoring(self, run_id_for_progress: Optional[str] = None) -> Dict[str, Any]:
         """Run a full monitoring round: each prompt x each AI engine.
