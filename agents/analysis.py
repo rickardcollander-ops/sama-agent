@@ -105,19 +105,25 @@ class AnalysisAgent:
             audience = (self.tenant_config.get_raw("target_audience") or "").strip()
             description = (self.tenant_config.get_raw("brand_description") or "").strip()
 
-        prompt = f"""Generate {count} buyer-intent search queries that prospects would ask Google or AI assistants when looking for a tool like {self.brand_name}.
+        prompt = f"""Generate {count} buyer-intent search queries that prospects would ask Google or AI assistants when looking for a tool in this category.
 
+Brand context (for relevance only — DO NOT mention in the queries):
 Brand: {self.brand_name}
 Domain: {self.domain}
 Description: {description or "—"}
 Target audience: {audience or "—"}
 USP: {usp or "—"}
 
-Mix:
-- Comparison ("X vs Y", "best alternative to Y")
-- Discovery ("best tool for ...", "top tools for ...")
-- Decision ("is X worth it", "X pricing", "X reviews")
-- Use-case ("how to ...", "tool that does ...")
+CRITICAL: These queries are sent verbatim to AI assistants (ChatGPT, Claude, Perplexity, Gemini)
+to measure unbiased brand visibility. The queries MUST NOT contain the brand name "{self.brand_name}"
+or the domain "{self.domain}" — if the AI sees the brand in the prompt, the result is biased and
+worthless. Phrase every query from the perspective of a buyer who has NOT yet heard of the brand.
+
+Mix (all phrased generically, never naming the brand):
+- Comparison ("best alternative to <competitor>", "<competitor A> vs <competitor B>")
+- Discovery ("best tool for <use case>", "top tools for <audience>")
+- Decision ("is <category> worth it", "<category> pricing benchmarks", "<category> reviews")
+- Use-case ("how to <job-to-be-done>", "tool that does <X>")
 
 Respond with JSON only — an array of {count} strings. No prose, no markdown fences.
 """.strip()
@@ -133,10 +139,37 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
             text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
             queries = json.loads(text)
             if isinstance(queries, list):
-                return [str(q) for q in queries if q][:count]
+                cleaned = self._strip_brand_queries([str(q) for q in queries if q])
+                if cleaned:
+                    return cleaned[:count]
         except Exception as e:
             logger.warning(f"AnalysisAgent.generate_queries LLM call failed: {e}")
         return self._fallback_queries(count)
+
+    def _brand_identity_tokens(self) -> List[str]:
+        """Tokens that must not appear in queries sent to AI assistants —
+        the brand name and the domain root would bias the response."""
+        tokens: List[str] = []
+        if self.brand_name:
+            t = self.brand_name.strip().lower()
+            if len(t) >= 3:
+                tokens.append(t)
+        if self.domain:
+            host = self.domain.strip().lower()
+            host = re.sub(r"^https?://", "", host)
+            host = host.split("/")[0]
+            if host:
+                tokens.append(host)
+                root = host.split(".")[0]
+                if root and len(root) >= 3:
+                    tokens.append(root)
+        return list(dict.fromkeys(tokens))
+
+    def _strip_brand_queries(self, queries: List[str]) -> List[str]:
+        tokens = self._brand_identity_tokens()
+        if not tokens:
+            return queries
+        return [q for q in queries if not any(tok in q.lower() for tok in tokens)]
 
     async def run(self, queries: List[str], platforms: List[str]) -> Dict[str, Any]:
         """
@@ -387,17 +420,36 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
     # ── Fallbacks ───────────────────────────────────────────────────────────
 
     def _fallback_queries(self, count: int) -> List[str]:
-        seed = self.brand_name or "your brand"
+        # Templates intentionally avoid the brand name and domain — these queries
+        # are sent to AI assistants to measure unbiased visibility, so the AI
+        # must not see the brand in the prompt.
+        audience = ""
+        category = ""
+        if self.tenant_config:
+            audience = (self.tenant_config.get_raw("target_audience") or "").strip()
+            category = (self.tenant_config.get_raw("category") or "").strip()
+        audience = audience or "B2B teams"
+        category = category or "tools in this category"
+        first_competitor = self.competitors[0] if self.competitors else None
+
         templates = [
-            f"What is the best {seed} alternative?",
-            f"{seed} vs competitors",
-            f"How does {seed} compare to other tools in the market?",
-            f"Top tools for B2B teams",
-            f"Is {seed} worth it?",
-            f"{seed} pricing and plans",
-            f"{seed} reviews and ratings",
-            f"Best alternatives to {seed}",
-            f"{seed} use cases",
-            f"Why choose {seed}?",
+            f"Best {category} for {audience}",
+            f"Top {category} for {audience} in 2025",
+            f"How to choose {category}",
+            f"{category} pricing benchmarks",
+            f"{category} reviews and ratings",
+            f"Most popular {category}",
+            f"What should I look for when buying {category}?",
+            f"{category} use cases for {audience}",
         ]
-        return templates[:count]
+        if first_competitor:
+            templates.extend([
+                f"Best alternatives to {first_competitor}",
+                f"{first_competitor} vs competitors",
+            ])
+        else:
+            templates.extend([
+                f"Leading vendors in {category}",
+                f"Recommended {category} for growing teams",
+            ])
+        return self._strip_brand_queries(templates)[:count]
