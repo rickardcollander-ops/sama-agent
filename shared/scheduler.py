@@ -38,6 +38,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "weekly_content_analysis": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_content_autopilot": {"last_run": None, "last_status": None, "last_error": None},
     "hourly_due_content_drafts": {"last_run": None, "last_status": None, "last_error": None},
+    "hourly_social_posts_email": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_ai_visibility":   {"last_run": None, "last_status": None, "last_error": None},
     "midday_review_check":    {"last_run": None, "last_status": None, "last_error": None},
     "daily_reflection":       {"last_run": None, "last_status": None, "last_error": None},
@@ -58,7 +59,6 @@ def get_job_history() -> Dict[str, Dict[str, Any]]:
     result = {}
     for job_id, info in _job_history.items():
         entry = dict(info)
-        # Add next_run from APScheduler if available
         try:
             job = scheduler.get_job(job_id)
             if job and job.next_run_time:
@@ -80,13 +80,12 @@ def _record(job_id: str, status: str, error: Optional[str] = None):
 
 
 async def _run_daily_keyword_tracking():
-    """Fetch fresh GSC ranking data for all tracked keywords."""
     logger.info("[scheduler] Running daily keyword tracking...")
     try:
         from agents.seo import seo_agent
         result = await seo_agent.track_keyword_rankings()
         tracked = len(result) if isinstance(result, list) else result.get("keywords_updated", 0)
-        logger.info(f"[scheduler] Keyword tracking done — {tracked} keywords updated")
+        logger.info(f"[scheduler] Keyword tracking done -- {tracked} keywords updated")
         _record("daily_keyword_tracking", "success")
     except Exception as e:
         logger.error(f"[scheduler] Keyword tracking failed: {e}")
@@ -95,13 +94,12 @@ async def _run_daily_keyword_tracking():
 
 
 async def _run_weekly_seo_audit():
-    """Run full SEO OODA cycle — observe data, orient analysis, decide actions."""
     logger.info("[scheduler] Running weekly SEO OODA analysis...")
     try:
         from api.routes.seo_analyze_ooda import run_seo_analysis_with_ooda
         result = await run_seo_analysis_with_ooda()
         total = result.get("summary", {}).get("total_actions", 0)
-        logger.info(f"[scheduler] SEO OODA done — {total} actions generated")
+        logger.info(f"[scheduler] SEO OODA done -- {total} actions generated")
         _record("weekly_seo_audit", "success")
     except Exception as e:
         logger.error(f"[scheduler] Weekly SEO OODA failed: {e}")
@@ -110,11 +108,6 @@ async def _run_weekly_seo_audit():
 
 
 async def _run_daily_workflow():
-    """
-    Daily workflow:
-    1. Monitor reviews
-    2. Generate a social post
-    """
     logger.info("[scheduler] Running daily workflow...")
     errors = []
 
@@ -145,13 +138,12 @@ async def _run_daily_workflow():
 
 
 async def _run_daily_metrics():
-    """Collect daily metrics from all channels into the daily_metrics table."""
     logger.info("[scheduler] Running daily metrics collection...")
     try:
         from agents.analytics import analytics_agent
         result = await analytics_agent.collect_daily_metrics()
         channels = result.get("total_channels", 0)
-        logger.info(f"[scheduler] Daily metrics collected — {channels} channels")
+        logger.info(f"[scheduler] Daily metrics collected -- {channels} channels")
         _record("daily_metrics", "success")
     except Exception as e:
         logger.error(f"[scheduler] Daily metrics collection failed: {e}")
@@ -160,13 +152,12 @@ async def _run_daily_metrics():
 
 
 async def _run_daily_ads_check():
-    """Run ads OODA cycle — observe campaigns, orient analysis, decide actions."""
     logger.info("[scheduler] Running daily ads OODA analysis...")
     try:
         from api.routes.ads_analyze_ooda import run_ads_analysis_with_ooda
         result = await run_ads_analysis_with_ooda()
         total = result.get("summary", {}).get("total_actions", 0)
-        logger.info(f"[scheduler] Ads OODA done — {total} actions generated")
+        logger.info(f"[scheduler] Ads OODA done -- {total} actions generated")
         _record("daily_ads_check", "success")
     except Exception as e:
         logger.error(f"[scheduler] Daily ads OODA failed: {e}")
@@ -175,13 +166,12 @@ async def _run_daily_ads_check():
 
 
 async def _run_weekly_content_analysis():
-    """Run content OODA cycle — observe gaps, orient analysis, decide actions."""
     logger.info("[scheduler] Running weekly content OODA analysis...")
     try:
         from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
         result = await run_content_analysis_with_ooda()
         total = result.get("summary", {}).get("total_actions", 0)
-        logger.info(f"[scheduler] Content OODA done — {total} actions generated")
+        logger.info(f"[scheduler] Content OODA done -- {total} actions generated")
         _record("weekly_content_analysis", "success")
     except Exception as e:
         logger.error(f"[scheduler] Weekly content OODA failed: {e}")
@@ -190,7 +180,6 @@ async def _run_weekly_content_analysis():
 
 
 async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, Any]) -> Dict[str, int]:
-    """Run the full content autopilot chain for a single tenant."""
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
     from api.routes.content_validation import _heuristic_checks
     from shared.database import get_supabase
@@ -353,7 +342,6 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
 
 
 async def _run_content_autopilot():
-    """Fan out content autopilot to every tenant that has it enabled."""
     logger.info("[scheduler] Running content autopilot fan-out...")
     try:
         from shared.database import get_supabase
@@ -380,7 +368,7 @@ async def _run_content_autopilot():
             except Exception as e:
                 logger.error(f"[autopilot {tenant_id}] failed: {e}")
 
-        logger.info(f"[scheduler] autopilot done — drafted {totals['drafted']}, queued {totals['queued']}, published {totals['published']}")
+        logger.info(f"[scheduler] autopilot done -- drafted {totals['drafted']}, queued {totals['queued']}, published {totals['published']}")
         _record("weekly_content_autopilot", "success")
     except Exception as e:
         logger.error(f"[scheduler] content autopilot failed: {e}")
@@ -389,13 +377,12 @@ async def _run_content_autopilot():
 
 
 async def _run_weekly_ai_visibility():
-    """Check AI visibility across ChatGPT, Claude, Gemini, Perplexity."""
     logger.info("[scheduler] Running weekly AI visibility check...")
     try:
         from agents.ai_visibility import ai_visibility_agent
         result = await ai_visibility_agent.check_visibility()
         score = result.get("overall_score", 0) if isinstance(result, dict) else 0
-        logger.info(f"[scheduler] AI visibility check done — score: {score}")
+        logger.info(f"[scheduler] AI visibility check done -- score: {score}")
         _record("weekly_ai_visibility", "success")
     except Exception as e:
         logger.error(f"[scheduler] AI visibility check failed: {e}")
@@ -404,13 +391,12 @@ async def _run_weekly_ai_visibility():
 
 
 async def _run_midday_review_check():
-    """Run reviews OODA cycle — fetch reviews, analyze sentiment, decide responses."""
     logger.info("[scheduler] Running midday reviews OODA analysis...")
     try:
         from api.routes.reviews_analyze_ooda import run_reviews_analysis_with_ooda
         result = await run_reviews_analysis_with_ooda()
         total = result.get("summary", {}).get("total_actions", 0)
-        logger.info(f"[scheduler] Reviews OODA done — {total} actions generated")
+        logger.info(f"[scheduler] Reviews OODA done -- {total} actions generated")
         _record("midday_review_check", "success")
     except Exception as e:
         logger.error(f"[scheduler] Reviews OODA failed: {e}")
@@ -419,13 +405,12 @@ async def _run_midday_review_check():
 
 
 async def _run_weekly_social_analysis():
-    """Run social OODA cycle — observe engagement, orient trends, decide posts."""
     logger.info("[scheduler] Running weekly social OODA analysis...")
     try:
         from api.routes.social_analyze_ooda import run_social_analysis_with_ooda
         result = await run_social_analysis_with_ooda()
         total = result.get("summary", {}).get("total_actions", 0)
-        logger.info(f"[scheduler] Social OODA done — {total} actions generated")
+        logger.info(f"[scheduler] Social OODA done -- {total} actions generated")
         _record("weekly_social_analysis", "success")
     except Exception as e:
         logger.error(f"[scheduler] Social OODA failed: {e}")
@@ -434,7 +419,6 @@ async def _run_weekly_social_analysis():
 
 
 async def _run_daily_reflection():
-    """Run reflection on completed actions across all agents."""
     logger.info("[scheduler] Running daily reflection...")
     try:
         from shared.memory import AgentMemory
@@ -443,7 +427,7 @@ async def _run_daily_reflection():
             memory = AgentMemory(agent_name)
             count = await memory.run_reflection_for_completed_actions()
             total += count
-        logger.info(f"[scheduler] Reflection done — {total} actions reflected on")
+        logger.info(f"[scheduler] Reflection done -- {total} actions reflected on")
         _record("daily_reflection", "success")
     except Exception as e:
         logger.error(f"[scheduler] Daily reflection failed: {e}")
@@ -452,7 +436,6 @@ async def _run_daily_reflection():
 
 
 async def _run_daily_digest():
-    """Send daily activity digest notification."""
     logger.info("[scheduler] Running daily digest...")
     try:
         from shared.notifications import notification_service
@@ -489,12 +472,11 @@ async def _run_daily_digest():
 
 
 async def _run_daily_agent_reports():
-    """Generate daily self-reports for all agents."""
     logger.info("[scheduler] Running daily agent reports...")
     try:
         from shared.agent_report import generate_all_reports
         reports = await generate_all_reports()
-        logger.info(f"[scheduler] Agent reports done — {len(reports)} reports generated")
+        logger.info(f"[scheduler] Agent reports done -- {len(reports)} reports generated")
         _record("daily_agent_reports", "success")
     except Exception as e:
         logger.error(f"[scheduler] Agent reports failed: {e}")
@@ -503,7 +485,6 @@ async def _run_daily_agent_reports():
 
 
 async def _run_daily_dev_health_check():
-    """Run the dev agent's full system health check."""
     logger.info("[scheduler] Running daily dev health check...")
     try:
         from agents.dev_agent import dev_agent
@@ -511,7 +492,7 @@ async def _run_daily_dev_health_check():
         await dev_agent.save_report(report)
         status = report["summary"]["status"]
         pct = report["summary"]["health_pct"]
-        logger.info(f"[scheduler] Dev health check done — {pct}% healthy ({status})")
+        logger.info(f"[scheduler] Dev health check done -- {pct}% healthy ({status})")
         _record("daily_dev_health_check", "success")
     except Exception as e:
         logger.error(f"[scheduler] Dev health check failed: {e}")
@@ -520,7 +501,6 @@ async def _run_daily_dev_health_check():
 
 
 async def _run_weekly_goal_review():
-    """Review progress on all active goals."""
     logger.info("[scheduler] Running weekly goal review...")
     try:
         from shared.goals import goal_tracker
@@ -528,7 +508,7 @@ async def _run_weekly_goal_review():
         for goal in goals:
             status = await goal_tracker.check_goal_status(goal)
             logger.info(f"[scheduler] Goal '{goal.get('goal_text', '')[:40]}': {status}")
-        logger.info(f"[scheduler] Goal review done — {len(goals)} goals reviewed")
+        logger.info(f"[scheduler] Goal review done -- {len(goals)} goals reviewed")
         _record("weekly_goal_review", "success")
     except Exception as e:
         logger.error(f"[scheduler] Weekly goal review failed: {e}")
@@ -537,7 +517,6 @@ async def _run_weekly_goal_review():
 
 
 async def _run_daily_lead_scoring():
-    """Re-score all active leads to catch behavioral changes."""
     try:
         from shared.database import get_supabase
         from shared.lead_scoring import score_lead, check_and_escalate
@@ -550,7 +529,7 @@ async def _run_daily_lead_scoring():
                 sb.table("leads").update({"score": new_score}).eq("id", lead["id"]).execute()
                 await check_and_escalate(lead["id"], new_score)
                 updated += 1
-        logger.info(f"[scheduler] Lead re-scoring done — {updated}/{len(leads.data or [])} scores updated")
+        logger.info(f"[scheduler] Lead re-scoring done -- {updated}/{len(leads.data or [])} scores updated")
         _record("daily_lead_scoring", "success")
     except Exception as e:
         logger.error(f"[scheduler] Lead scoring failed: {e}")
@@ -559,18 +538,15 @@ async def _run_daily_lead_scoring():
 
 
 async def _run_weekly_status_email():
-    """Send the weekly status email to every opted-in user."""
     logger.info("[scheduler] Running weekly status email batch...")
     try:
         from shared.weekly_email import send_weekly_status_for_all
-        # send_weekly_status_for_all() does blocking Supabase + Resend calls;
-        # run it off the event loop so other scheduled coroutines can progress.
         result = await asyncio.to_thread(send_weekly_status_for_all)
         sent = result.get("sent", 0)
         skipped = result.get("skipped", 0)
         errors = result.get("errors", 0)
         logger.info(
-            f"[scheduler] Weekly status email done — sent={sent} skipped={skipped} errors={errors}"
+            f"[scheduler] Weekly status email done -- sent={sent} skipped={skipped} errors={errors}"
         )
         _record(
             "weekly_status_email",
@@ -584,7 +560,6 @@ async def _run_weekly_status_email():
 
 
 async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
-    """Fan-out: per-tenant cycles based on tenant_agent_config."""
     job_id = f"tenants_{agent_name}_{schedule}"
     logger.info(f"[scheduler] {job_id}: fan-out start")
     try:
@@ -625,7 +600,6 @@ async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
 
 
 async def _run_publish_due_social_posts():
-    """Publish any social_posts whose scheduled_for has passed."""
     job_id = "publish_due_social_posts"
     try:
         from datetime import datetime, timezone
@@ -671,19 +645,14 @@ async def _run_publish_due_social_posts():
 
 
 async def _run_due_content_drafts():
-    """Process content_plan_items where scheduled_for <= now().
-
-    Drafts the article via Claude. If auto_publish_on_schedule=true, also
-    raises a GitHub PR + flips status='published' on both the piece and
-    the plan row. Runs hourly so calendar dates land within an hour.
-    """
+    """Process content_plan_items where scheduled_for <= now()."""
     job_id = "hourly_due_content_drafts"
     try:
         from api.routes.content_plan import process_due_scheduled_items
         stats = await process_due_scheduled_items()
         if stats.get("drafted") or stats.get("published") or stats.get("failed"):
             logger.info(
-                f"[scheduler] due-content-drafts — drafted {stats.get('drafted',0)}, "
+                f"[scheduler] due-content-drafts -- drafted {stats.get('drafted',0)}, "
                 f"published {stats.get('published',0)}, failed {stats.get('failed',0)}"
             )
         _record(job_id, "success")
@@ -693,8 +662,32 @@ async def _run_due_content_drafts():
         await _notify_failure(job_id, str(e))
 
 
+async def _run_social_posts_email():
+    """Send social-posts emails 24h after each article publishes.
+
+    Looks for content_pieces with status='published' whose published_at
+    is more than 24h ago and which have social children that haven't
+    been emailed yet. Fills in the article URL and ships one HTML email
+    per article via Brevo.
+    """
+    job_id = "hourly_social_posts_email"
+    try:
+        from shared.social_email_dispatcher import dispatch_due_social_emails
+        stats = await dispatch_due_social_emails()
+        if stats.get("sent") or stats.get("errors"):
+            logger.info(
+                f"[scheduler] social-posts-email -- checked {stats.get('checked',0)}, "
+                f"sent {stats.get('sent',0)}, skipped {stats.get('skipped',0)}, "
+                f"errors {stats.get('errors',0)}"
+            )
+        _record(job_id, "success")
+    except Exception as e:
+        logger.error(f"[scheduler] {job_id} failed: {e}")
+        _record(job_id, "error", str(e))
+        await _notify_failure(job_id, str(e))
+
+
 async def _run_watchdog() -> None:
-    """Mark agent_runs that have been 'running' too long as failed."""
     try:
         from api.routes.tenant_activation import reap_stale_runs
         n = await reap_stale_runs()
@@ -706,37 +699,24 @@ async def _run_watchdog() -> None:
 
 def start():
     """Register all jobs and start the scheduler."""
-    # Daily keyword tracking — 02:00 UTC every day
     scheduler.add_job(_run_daily_keyword_tracking, CronTrigger(hour=2, minute=0), id="daily_keyword_tracking", replace_existing=True)
-    # Weekly SEO audit — Mondays 03:00 UTC
     scheduler.add_job(_run_weekly_seo_audit, CronTrigger(day_of_week="mon", hour=3, minute=0), id="weekly_seo_audit", replace_existing=True)
-    # Daily workflow (reviews + social) — 06:00 UTC every day
     scheduler.add_job(_run_daily_workflow, CronTrigger(hour=6, minute=0), id="daily_workflow", replace_existing=True)
-    # Daily metrics collection — 04:00 UTC every day
     scheduler.add_job(_run_daily_metrics, CronTrigger(hour=4, minute=0), id="daily_metrics", replace_existing=True)
-    # Daily ads check — 08:00 UTC every day
     scheduler.add_job(_run_daily_ads_check, CronTrigger(hour=8, minute=0), id="daily_ads_check", replace_existing=True)
-    # Weekly content gap analysis — Wednesdays 05:00 UTC
     scheduler.add_job(_run_weekly_content_analysis, CronTrigger(day_of_week="wed", hour=5, minute=0), id="weekly_content_analysis", replace_existing=True)
-    # Content autopilot — Wednesdays 06:00 UTC
     scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
-    # Hourly: pick up plan items whose scheduled_for has passed.
     scheduler.add_job(_run_due_content_drafts, CronTrigger(minute=0), id="hourly_due_content_drafts", replace_existing=True)
-    # Midday review check — 14:00 UTC every day
+    # Social-posts email dispatcher: hourly at minute=15 so it doesn't
+    # collide with the due-content-drafts job at minute=0.
+    scheduler.add_job(_run_social_posts_email, CronTrigger(minute=15), id="hourly_social_posts_email", replace_existing=True)
     scheduler.add_job(_run_midday_review_check, CronTrigger(hour=14, minute=0), id="midday_review_check", replace_existing=True)
-    # Daily reflection — 22:00 UTC
     scheduler.add_job(_run_daily_reflection, CronTrigger(hour=22, minute=0), id="daily_reflection", replace_existing=True)
-    # Daily digest notification — 17:00 UTC
     scheduler.add_job(_run_daily_digest, CronTrigger(hour=17, minute=0), id="daily_digest", replace_existing=True)
-    # Weekly goal review — Fridays 09:00 UTC
     scheduler.add_job(_run_weekly_goal_review, CronTrigger(day_of_week="fri", hour=9, minute=0), id="weekly_goal_review", replace_existing=True)
-    # Daily agent self-reports — 05:00 UTC
     scheduler.add_job(_run_daily_agent_reports, CronTrigger(hour=5, minute=0), id="daily_agent_reports", replace_existing=True)
-    # Daily dev health check — 05:30 UTC
     scheduler.add_job(_run_daily_dev_health_check, CronTrigger(hour=5, minute=30), id="daily_dev_health_check", replace_existing=True)
-    # Weekly social analysis — Tuesdays 11:00 UTC
     scheduler.add_job(_run_weekly_social_analysis, CronTrigger(day_of_week="tue", hour=11, minute=0), id="weekly_social_analysis", replace_existing=True)
-    # Daily lead scoring — 07:00 UTC
     scheduler.add_job(_run_daily_lead_scoring, CronTrigger(hour=7, minute=0), id="daily_lead_scoring", replace_existing=True)
 
     tenant_fanout_jobs = [
@@ -752,16 +732,16 @@ def start():
         job_id = f"tenants_{agent_name}_{schedule_kind}"
         scheduler.add_job(_run_for_all_tenants, trigger, args=[agent_name, schedule_kind], id=job_id, replace_existing=True)
 
-    # Watchdog — every 5 min
     scheduler.add_job(_run_watchdog, CronTrigger(minute="*/5"), id="agent_runs_watchdog", replace_existing=True)
 
     scheduler.start()
     logger.info(
-        "[scheduler] Started — "
+        "[scheduler] Started -- "
         "keywords 02:00, SEO Mon 03:00, metrics 04:00, "
         "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, "
         "social Tue 11:00, reviews 14:00, content Wed 05:00, autopilot Wed 06:00, "
-        "due-content-drafts hourly, digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
+        "due-content-drafts hourly :00, social-emails hourly :15, "
+        "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
 
 
