@@ -7,15 +7,19 @@ A persistent plan of content ideas. Each idea lives in
 and an optional FK to a row in ``content_pieces`` once the idea has been
 materialised into a full article.
 
-This is the backend half of the dashboard's "Content Plan" view — the
-UI lists every idea, lets the user click into one, expand it to a
-draft article, and keep iterating with the AI editor.
+Each row carries a ``source`` column so the dashboard can render one
+unified "what to write next" list with filter chips:
+
+* ``manual``         — user added by hand
+* ``ai_generated``   — produced by /api/content/plan/generate
+* ``analysis_gap``   — auto-fed from the OODA content analysis loop
+* ``competitor_gap`` — auto-fed from competitor coverage analysis
 """
 
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
@@ -38,6 +42,7 @@ class PlanItemCreate(BaseModel):
     reason: Optional[str] = None
     priority: str = "medium"
     status: str = "idea"
+    source: str = "manual"
 
 
 class PlanItemUpdate(BaseModel):
@@ -93,6 +98,7 @@ def _row(item: dict) -> dict:
         "reason": item.get("reason") or "",
         "priority": item.get("priority") or "medium",
         "status": item.get("status") or "idea",
+        "source": item.get("source") or "manual",
         "content_piece_id": item.get("content_piece_id"),
         "metadata": item.get("metadata") or {},
         "created_at": item.get("created_at"),
@@ -100,10 +106,101 @@ def _row(item: dict) -> dict:
     }
 
 
+def upsert_analysis_gap_items(
+    tenant_id: str,
+    actions: List[Dict[str, Any]],
+    cycle_id: Optional[str] = None,
+) -> int:
+    """Insert plan rows for analysis gap actions, skipping duplicates by keyword.
+
+    Called from the OODA cycle on completion. Quietly skips rows that
+    would violate the (tenant_id, lower(target_keyword)) unique index
+    so re-running the analysis doesn't grow the plan unboundedly.
+
+    Returns the number of rows that were actually inserted.
+    """
+    if not actions:
+        return 0
+
+    sb = get_supabase()
+
+    # Pull existing keywords once to avoid N round-trips.
+    try:
+        existing = (
+            sb.table("content_plan_items")
+            .select("target_keyword,content_piece_id")
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
+        existing_keywords = {
+            (r.get("target_keyword") or "").strip().lower()
+            for r in (existing.data or [])
+            if r.get("target_keyword")
+        }
+    except Exception as e:
+        logger.debug(f"upsert_analysis_gap_items: existing fetch failed: {e}")
+        existing_keywords = set()
+
+    rows: List[Dict[str, Any]] = []
+    for action in actions:
+        atype = action.get("type") or action.get("action_type") or ""
+        # Only feed the "produce a new article" action types into the plan.
+        # optimize/meta/publish are quick fixes — handled separately in UI.
+        if atype not in {"blog_post", "blog_article", "comparison"}:
+            continue
+
+        kw = (action.get("keyword") or "").strip()
+        if kw and kw.lower() in existing_keywords:
+            continue
+
+        is_competitor = bool(action.get("competitor"))
+        source = "competitor_gap" if is_competitor else "analysis_gap"
+
+        rows.append({
+            "tenant_id": tenant_id,
+            "title": str(action.get("title") or f"Cover keyword '{kw}'")[:300],
+            "topic": str(action.get("description") or "")[:1000],
+            "content_type": "blog_article" if atype != "comparison" else "comparison",
+            "target_keyword": kw[:200] or None,
+            "priority": str(action.get("priority") or "medium"),
+            "reason": str(action.get("action") or action.get("description") or "")[:500],
+            "status": "idea",
+            "source": source,
+            "source_run_id": cycle_id,
+            "metadata": {
+                "competitor": action.get("competitor"),
+                "pillar": action.get("pillar"),
+                "from_action_id": action.get("id"),
+            },
+        })
+        if kw:
+            existing_keywords.add(kw.lower())  # de-dup within batch too
+
+    if not rows:
+        return 0
+
+    # Insert; the partial unique index will reject duplicates that slipped past
+    # our in-memory check (race conditions). We swallow per-row failures so a
+    # single conflict doesn't abort the whole batch.
+    inserted = 0
+    for r in rows:
+        try:
+            sb.table("content_plan_items").insert(r).execute()
+            inserted += 1
+        except Exception as e:
+            logger.debug(f"upsert_analysis_gap_items skipped row: {e}")
+    return inserted
+
+
 # ── List ─────────────────────────────────────────────────────────────────────
 
 @router.get("/plan")
-async def list_plan(request: Request, status: Optional[str] = None, limit: int = 200):
+async def list_plan(
+    request: Request,
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 200,
+):
     """List content plan items for the current tenant."""
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
@@ -117,6 +214,8 @@ async def list_plan(request: Request, status: Optional[str] = None, limit: int =
         )
         if status:
             q = q.eq("status", status)
+        if source:
+            q = q.eq("source", source)
         result = q.execute()
         return {"items": [_row(x) for x in (result.data or [])]}
     except Exception as e:
@@ -186,15 +285,9 @@ async def delete_plan_item(item_id: str, request: Request):
 
 @router.post("/plan/generate")
 async def generate_plan(request: Request, payload: PlanGenerateRequest):
-    """Use Claude to generate N content ideas and persist them as plan items.
-
-    Unlike the existing ``/suggest-topics`` (which just returns a list and
-    forgets it), this writes the ideas to ``content_plan_items`` so the
-    user's plan grows over time and survives reloads.
-    """
+    """Use Claude to generate N content ideas and persist them as plan items."""
     tenant_id = getattr(request.state, "tenant_id", "default")
 
-    # Fill in brand context from user_settings if the caller didn't provide it.
     s = _load_brand_context(tenant_id)
     brand_name = payload.brand_name or s.get("brand_name", "")
     domain = payload.domain or s.get("domain", "")
@@ -264,30 +357,56 @@ Return ONLY a JSON array (no markdown, no code fences) of {count} objects:
             except Exception as e:
                 logger.debug(f"Failed to archive existing ideas: {e}")
 
+        # Pre-load existing keywords so duplicates from generate are skipped too,
+        # not just from analysis. Same dedupe contract everywhere.
+        try:
+            existing = (
+                sb.table("content_plan_items")
+                .select("target_keyword")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+            existing_keywords = {
+                (r.get("target_keyword") or "").strip().lower()
+                for r in (existing.data or [])
+                if r.get("target_keyword")
+            }
+        except Exception:
+            existing_keywords = set()
+
         rows = []
+        skipped = 0
         for raw in ideas:
             if not isinstance(raw, dict):
+                continue
+            kw = str(raw.get("target_keyword") or "").strip()
+            if kw and kw.lower() in existing_keywords:
+                skipped += 1
                 continue
             rows.append({
                 "tenant_id": tenant_id,
                 "title": str(raw.get("title") or "Untitled idea")[:300],
                 "topic": str(raw.get("topic") or "")[:1000],
                 "content_type": str(raw.get("content_type") or "blog_article"),
-                "target_keyword": str(raw.get("target_keyword") or "")[:200],
+                "target_keyword": kw[:200] or None,
                 "pillar": str(raw.get("pillar") or "")[:100],
                 "priority": str(raw.get("priority") or "medium"),
                 "reason": str(raw.get("reason") or "")[:500],
                 "status": "idea",
+                "source": "ai_generated",
                 "metadata": {"generator": "claude", "model": settings.CLAUDE_MODEL},
             })
+            if kw:
+                existing_keywords.add(kw.lower())
 
         if not rows:
-            return {"success": False, "error": "No usable ideas in AI response", "items": []}
+            return {"success": False, "error": "No new ideas (all keywords already in plan)", "items": [], "skipped": skipped}
 
         result = sb.table("content_plan_items").insert(rows).execute()
         return {
             "success": True,
             "items": [_row(x) for x in (result.data or [])],
+            "skipped": skipped,
         }
     except Exception as e:
         logger.error(f"generate_plan error: {e}")
@@ -298,16 +417,10 @@ Return ONLY a JSON array (no markdown, no code fences) of {count} objects:
 
 @router.post("/plan/{item_id}/draft")
 async def draft_plan_item(item_id: str, request: Request):
-    """Turn a plan item into a full article and link them.
-
-    Generates the article body via Claude, inserts a row in
-    ``content_pieces``, and updates the plan item to status='draft' with
-    ``content_piece_id`` pointing at the new article. The dashboard then
-    routes the user to /content/<piece_id> for editing.
-    """
+    """Turn a plan item into a full article and link them."""
     tenant_id = getattr(request.state, "tenant_id", "default")
+    sb = get_supabase()
     try:
-        sb = get_supabase()
         result = (
             sb.table("content_plan_items")
             .select("*")
@@ -321,10 +434,8 @@ async def draft_plan_item(item_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Plan item not found")
         item = rows[0]
 
-        # Mark as drafting so concurrent clicks don't duplicate the article.
         sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item_id).execute()
 
-        # Generate the article via Claude.
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         ctype = item.get("content_type") or "blog_article"
@@ -383,7 +494,6 @@ Return ONLY a JSON object (no markdown fences):
         piece = (piece_result.data or [{}])[0]
         piece_id = piece.get("id")
 
-        # Link the plan item back to the article.
         sb.table("content_plan_items").update({
             "status": "draft",
             "content_piece_id": piece_id,
@@ -396,7 +506,6 @@ Return ONLY a JSON object (no markdown fences):
             "piece": piece,
         }
     except HTTPException:
-        # Roll the status back so the user can retry.
         try:
             sb.table("content_plan_items").update({"status": "idea"}).eq("id", item_id).execute()
         except Exception:
@@ -409,3 +518,38 @@ Return ONLY a JSON object (no markdown fences):
         except Exception:
             pass
         return {"success": False, "error": str(e)}
+
+
+# ── Lineage: idea → draft → published ────────────────────────────────────────
+
+@router.get("/pieces/{piece_id}/lineage")
+async def get_piece_lineage(piece_id: str, request: Request):
+    """Return the plan idea (if any) that produced this piece + status timeline."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+        plan_q = (
+            sb.table("content_plan_items")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("content_piece_id", piece_id)
+            .limit(1)
+            .execute()
+        )
+        plan_rows = plan_q.data or []
+        plan_item = _row(plan_rows[0]) if plan_rows else None
+
+        piece_q = (
+            sb.table("content_pieces")
+            .select("status,created_at,target_url,title")
+            .eq("id", piece_id)
+            .limit(1)
+            .execute()
+        )
+        piece_rows = piece_q.data or []
+        piece = piece_rows[0] if piece_rows else None
+
+        return {"plan_item": plan_item, "piece": piece}
+    except Exception as e:
+        logger.error(f"get_piece_lineage error: {e}")
+        return {"plan_item": None, "piece": None, "error": str(e)}
