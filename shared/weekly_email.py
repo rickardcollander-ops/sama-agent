@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 LOOKBACK_DAYS = 7
 PENDING_APPROVAL_LIMIT = 50
+# How recently a non-test send blocks another non-test send. 6 days is short
+# enough to allow a Monday → Monday cadence even with a few hours of drift,
+# and long enough to absorb a duplicated scheduler tick or an ops re-run.
+DEDUPE_WINDOW_DAYS = 6
 
 # Order matches the dashboard sidebar so users see a familiar shape.
 AGENT_ORDER = ("seo", "content", "ads", "social", "reviews", "analytics", "ai_visibility")
@@ -293,6 +297,38 @@ def _settings_for_user(user_id: str) -> dict:
         return {}
 
 
+def _recently_sent(user_id: str) -> Optional[str]:
+    """Return the ISO timestamp of the last successful, non-test weekly send
+    within the dedupe window, or None if there is none.
+
+    Used to make `send_weekly_status_for_all` idempotent if the scheduler
+    fires twice (manual run-now plus the cron tick, or a process restart that
+    happens to land on the cron minute).
+    """
+    sb = get_supabase()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=DEDUPE_WINDOW_DAYS)).isoformat()
+    try:
+        result = (
+            sb.table("email_send_log")
+            .select("created_at")
+            .eq("user_id", user_id)
+            .eq("kind", "weekly_status")
+            .eq("status", "sent")
+            .eq("test", False)
+            .gte("created_at", cutoff)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0]["created_at"] if rows else None
+    except Exception as e:
+        # If the table doesn't exist yet (migration not applied), treat as
+        # "never sent" so the scheduler still works on day one.
+        logger.warning(f"[weekly-email] dedupe lookup failed: {e}")
+        return None
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -316,6 +352,21 @@ def send_weekly_status_for_user(
     if not recipient:
         logger.info(f"[weekly-email] no recipient for user {user_id}; skipping")
         return {"sent": False, "skipped": True, "reason": "no_recipient", "user_id": user_id}
+
+    # Dedupe: skip if we already sent a real (non-test) weekly within the
+    # dedupe window. Test sends bypass this so the dashboard "send test"
+    # button always works.
+    if not test:
+        last_sent = _recently_sent(user_id)
+        if last_sent:
+            logger.info(f"[weekly-email] already sent to {user_id} at {last_sent}; skipping")
+            return {
+                "sent": False,
+                "skipped": True,
+                "reason": "already_sent_this_week",
+                "user_id": user_id,
+                "last_sent_at": last_sent,
+            }
 
     composed = _compose_email(
         user_id=user_id,
