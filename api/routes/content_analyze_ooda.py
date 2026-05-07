@@ -11,9 +11,14 @@ from agents.brand_voice import brand_voice
 logger = logging.getLogger(__name__)
 
 
-async def run_content_analysis_with_ooda() -> Dict[str, Any]:
-    """Run Content analysis using OODA loop"""
-    
+async def run_content_analysis_with_ooda(tenant_id: str = "default") -> Dict[str, Any]:
+    """Run Content analysis using OODA loop.
+
+    On completion, blog/comparison actions are auto-fed into
+    ``content_plan_items`` so the dashboard's plan tab grows as the
+    agent surfaces new gaps — no manual transfer step.
+    """
+
     async def observe():
         """OBSERVE: Fetch content and keyword data, run competitor gap analysis"""
         observations = {}
@@ -52,7 +57,7 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
             observations["competitor_gaps"] = {"gaps": [], "coverage": {}, "total_gaps": 0}
 
         return observations
-    
+
     async def orient(observations):
         """ORIENT: Analyze content gaps, competitor themes, and opportunities"""
         analysis = create_analysis_structure()
@@ -105,14 +110,14 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
             add_pattern(analysis, "unpublished_content", {"count": len(drafts)})
 
         return analysis
-    
+
     async def decide(analysis, observations):
         """DECIDE: Generate content actions"""
         actions = []
         content_pieces = observations.get("content_pieces", [])
         keywords = observations.get("keywords", [])
         competitors = observations.get("competitors", [])
-        
+
         # Actions for content gaps
         existing_keywords = {cp.get("target_keyword", "").lower() for cp in content_pieces if cp.get("target_keyword")}
         for kw in keywords:
@@ -121,7 +126,7 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
                 impressions = kw.get("current_impressions", 0)
                 position = kw.get("current_position", 0)
                 priority = "high" if impressions > 100 else "medium"
-                
+
                 actions.append(create_action(
                     f"content-gap-{keyword[:30]}",
                     "blog_post",
@@ -132,7 +137,7 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
                     {"type": "traffic_increase", "target_impressions": impressions * 1.5},
                     keyword=keyword
                 ))
-        
+
         # Actions for thin content
         for cp in content_pieces:
             word_count = cp.get("word_count", 0)
@@ -148,7 +153,7 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
                     content_id=cp.get("id", ""),
                     keyword=cp.get("target_keyword", "")
                 ))
-        
+
         # Actions for missing meta descriptions
         for cp in content_pieces:
             if not cp.get("meta_description"):
@@ -163,7 +168,7 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
                     content_id=cp.get("id", ""),
                     keyword=cp.get("target_keyword", "")
                 ))
-        
+
         # Actions for draft content
         for cp in content_pieces:
             if cp.get("status") == "draft":
@@ -177,7 +182,7 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
                     {"type": "content_published", "expected_traffic": 100},
                     content_id=cp.get("id", "")
                 ))
-        
+
         # Actions for competitor comparisons
         existing_comparisons = [cp for cp in content_pieces if cp.get("content_type") == "comparison"]
         existing_comp_names = [cp.get("title", "").lower() for cp in existing_comparisons]
@@ -195,16 +200,14 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
                 ))
 
         # Actions from competitor content gap analysis
-        # These are de-duplicated against the keyword-gap actions above to
-        # avoid recommending the same content twice.
         existing_action_keywords = {a.get("keyword", "").lower() for a in actions if a.get("keyword")}
         competitor_gaps = observations.get("competitor_gaps", {})
         for gap in competitor_gaps.get("gaps", []):
             target_kw = gap.get("target_keyword", "")
             if target_kw.lower() in existing_action_keywords:
-                continue  # already covered by a keyword-gap action
+                continue
             if target_kw.lower() in existing_keywords:
-                continue  # we already have content for this keyword
+                continue
 
             comp_name = gap.get("competitor", "")
             theme = gap.get("theme", "")
@@ -234,15 +237,27 @@ async def run_content_analysis_with_ooda() -> Dict[str, Any]:
         # Sort by priority
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         actions.sort(key=lambda a: priority_order.get(a.get("priority", "low"), 3))
-        
+
         return actions
-    
+
     result = await run_agent_ooda_cycle("content", observe, orient, decide)
-    
+
     # Save actions to database
     from shared.actions_db import save_actions
     if result.get("success") and result.get("actions"):
         action_ids = await save_actions("content", result["actions"])
         result["actions_saved"] = len(action_ids)
-    
+
+        # Auto-feed gap actions into the persistent content plan so the
+        # dashboard's plan tab is always up to date — no need for the user
+        # to manually transfer ideas across.
+        try:
+            from api.routes.content_plan import upsert_analysis_gap_items
+            cycle_id = result.get("cycle_id") or result.get("run_id")
+            inserted = upsert_analysis_gap_items(tenant_id, result["actions"], cycle_id=cycle_id)
+            result["plan_items_added"] = inserted
+        except Exception as e:
+            logger.debug(f"Auto-feed to content_plan_items failed: {e}")
+            result["plan_items_added"] = 0
+
     return result
