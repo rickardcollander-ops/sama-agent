@@ -30,6 +30,7 @@ from api.routes import (
     content_plan as content_plan_routes,
     content_ai_edit as content_ai_edit_routes,
     content_analysis_cache as content_analysis_cache_routes,
+    weekly_email as weekly_email_routes,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan manager"""
     logger.info("🚀 Starting SAMA 2.0...")
-    
+
     # Initialize Supabase connection
     try:
         get_supabase()
@@ -68,7 +69,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.info(f"✅ Reaped {reaped} orphaned agent_runs on startup")
     except Exception as e:
         logger.warning(f"⚠️ Startup reap failed: {e}")
-    
+
     # Initialize event bus (Redis with local fallback)
     event_bus = None
     try:
@@ -244,6 +245,11 @@ app.include_router(
     integrations_gsc_routes.router,
     prefix="/api/integrations/gsc",
     tags=["integrations-gsc"],
+)
+app.include_router(
+    weekly_email_routes.router,
+    prefix="/api/email",
+    tags=["email"],
 )
 
 
