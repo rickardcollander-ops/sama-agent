@@ -36,6 +36,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "daily_metrics":          {"last_run": None, "last_status": None, "last_error": None},
     "daily_ads_check":        {"last_run": None, "last_status": None, "last_error": None},
     "weekly_content_analysis": {"last_run": None, "last_status": None, "last_error": None},
+    "weekly_content_autopilot": {"last_run": None, "last_status": None, "last_error": None},
     "weekly_ai_visibility":   {"last_run": None, "last_status": None, "last_error": None},
     "midday_review_check":    {"last_run": None, "last_status": None, "last_error": None},
     "daily_reflection":       {"last_run": None, "last_status": None, "last_error": None},
@@ -185,6 +186,229 @@ async def _run_weekly_content_analysis():
         logger.error(f"[scheduler] Weekly content OODA failed: {e}")
         _record("weekly_content_analysis", "error", str(e))
         await _notify_failure("weekly_content_analysis", str(e))
+
+
+async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, Any]) -> Dict[str, int]:
+    """Run the full content autopilot chain for a single tenant.
+
+    Pipeline:
+        1. analyze       — content OODA, auto-feeds gaps into the plan
+        2. generate      — AI-batch ideas, deduped against existing plan
+        3. draft top N   — materialise top-priority plan items
+        4. queue/publish — auto-publish if validation_score passes & enabled,
+                           otherwise queue in pending_approvals for the editor
+    """
+    from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
+    from api.routes.content_validation import _heuristic_checks
+    from shared.database import get_supabase
+
+    stats = {"plan_items_added": 0, "ideas_generated": 0, "drafted": 0, "queued": 0, "published": 0}
+    sb = get_supabase()
+
+    # 1. Analyze (auto-feeds analysis_gap rows into content_plan_items)
+    try:
+        result = await run_content_analysis_with_ooda(tenant_id=tenant_id)
+        stats["plan_items_added"] = int(result.get("plan_items_added") or 0)
+    except Exception as e:
+        logger.warning(f"[autopilot {tenant_id}] analyze failed: {e}")
+
+    # 2. Generate ideas (batch). Re-implementing the route inline keeps us off
+    #    Request-scoped state so we can call it from the scheduler without
+    #    fabricating a fake FastAPI Request object.
+    try:
+        from shared.config import settings as _settings
+        import anthropic
+        ideas_count = max(1, min(int(ap_cfg.get("ideas_per_run", 6)), 12))
+
+        # Pull brand context the same way the route does.
+        brand = {}
+        try:
+            row = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+            brand = (row.data or {}).get("settings", {}) if row.data else {}
+        except Exception:
+            brand = {}
+
+        client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
+        prompt = (
+            f"You are a B2B SaaS content strategist. Generate {ideas_count} content ideas.\n"
+            f"Brand: {brand.get('brand_name','')}\n"
+            f"Description: {brand.get('brand_description','')}\n"
+            f"Audience: {brand.get('target_audience','')}\n"
+            f"Mix: 60% blog_article, 25% linkedin_post, 15% email.\n"
+            'Return ONLY a JSON array of objects {title, topic, content_type, target_keyword, pillar, priority, reason}.'
+        )
+        msg = client.messages.create(model=_settings.CLAUDE_MODEL, max_tokens=2048, messages=[{"role": "user", "content": prompt}])
+        import json as _json
+        text = msg.content[0].text.strip()
+        try:
+            ideas = _json.loads(text)
+        except Exception:
+            ideas = _json.loads(text.split("```")[1].lstrip("json").strip()) if "```" in text else []
+
+        # Dedupe by keyword against existing plan rows.
+        existing = sb.table("content_plan_items").select("target_keyword").eq("tenant_id", tenant_id).execute()
+        existing_kw = {(r.get("target_keyword") or "").strip().lower() for r in (existing.data or [])}
+        rows = []
+        for raw in ideas if isinstance(ideas, list) else []:
+            kw = str((raw or {}).get("target_keyword") or "").strip()
+            if kw and kw.lower() in existing_kw:
+                continue
+            rows.append({
+                "tenant_id": tenant_id,
+                "title": str(raw.get("title") or "Untitled idea")[:300],
+                "topic": str(raw.get("topic") or "")[:1000],
+                "content_type": str(raw.get("content_type") or "blog_article"),
+                "target_keyword": kw[:200] or None,
+                "pillar": str(raw.get("pillar") or "")[:100],
+                "priority": str(raw.get("priority") or "medium"),
+                "reason": str(raw.get("reason") or "")[:500],
+                "status": "idea",
+                "source": "ai_generated",
+                "metadata": {"generator": "claude", "model": _settings.CLAUDE_MODEL, "from": "autopilot"},
+            })
+            existing_kw.add(kw.lower())
+        if rows:
+            sb.table("content_plan_items").insert(rows).execute()
+        stats["ideas_generated"] = len(rows)
+    except Exception as e:
+        logger.warning(f"[autopilot {tenant_id}] generate failed: {e}")
+
+    # 3. Draft the top-N pending ideas (priority-sorted).
+    top_n = max(0, min(int(ap_cfg.get("auto_draft_top_n", 3)), 6))
+    if top_n > 0:
+        try:
+            ideas_q = (
+                sb.table("content_plan_items")
+                .select("*")
+                .eq("tenant_id", tenant_id)
+                .eq("status", "idea")
+                .limit(50)
+                .execute()
+            )
+            ideas = ideas_q.data or []
+            order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+            ideas.sort(key=lambda x: order.get((x.get("priority") or "medium").lower(), 3))
+            picked = ideas[:top_n]
+
+            for item in picked:
+                try:
+                    sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item["id"]).execute()
+                    ctype = item.get("content_type") or "blog_article"
+                    target_words = "1500-2200 words" if ctype == "blog_article" else "120-180 words" if ctype == "linkedin_post" else "300-500 words"
+                    p = (
+                        f"Write a {ctype.replace('_',' ')}.\n"
+                        f"Title: {item.get('title','')}\nTopic: {item.get('topic','')}\n"
+                        f"Target keyword: {item.get('target_keyword','')}\n"
+                        f"Pillar: {item.get('pillar','')}\nLength: {target_words}.\n"
+                        'Return ONLY a JSON object {title, content, meta_title, meta_description, word_count}.'
+                    )
+                    m = client.messages.create(model=_settings.CLAUDE_MODEL, max_tokens=4096, messages=[{"role": "user", "content": p}])
+                    raw = m.content[0].text.strip()
+                    try:
+                        article = _json.loads(raw)
+                    except Exception:
+                        article = _json.loads(raw.split("```")[1].lstrip("json").strip()) if "```" in raw else {"title": item.get("title"), "content": raw}
+
+                    piece_data = {
+                        "tenant_id": tenant_id,
+                        "title": article.get("title") or item.get("title") or "Untitled",
+                        "content": article.get("content") or "",
+                        "content_type": ctype,
+                        "meta_title": article.get("meta_title") or "",
+                        "meta_description": article.get("meta_description") or "",
+                        "target_keyword": item.get("target_keyword") or "",
+                        "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+                        "status": "draft",
+                    }
+                    inserted = sb.table("content_pieces").insert(piece_data).execute()
+                    piece = (inserted.data or [{}])[0]
+                    piece_id = piece.get("id")
+                    sb.table("content_plan_items").update({
+                        "status": "draft",
+                        "content_piece_id": piece_id,
+                    }).eq("id", item["id"]).execute()
+                    stats["drafted"] += 1
+
+                    # 4. Decide between auto-publish and queue-for-approval.
+                    score = _heuristic_checks(piece_data)["score"]
+                    min_score = int(ap_cfg.get("min_score_for_publish", 70))
+                    if ap_cfg.get("auto_publish") and score >= min_score:
+                        from api.routes.content_validation import _publish_via_github
+                        gh = await _publish_via_github(piece_data)
+                        if gh.get("success"):
+                            sb.table("content_pieces").update({
+                                "status": "published",
+                                "published_at": datetime.now(timezone.utc).isoformat(),
+                                "external_url": gh.get("url"),
+                                "target_url": gh.get("url"),
+                                "validation_score": score,
+                            }).eq("id", piece_id).execute()
+                            sb.table("content_plan_items").update({"status": "published"}).eq("content_piece_id", piece_id).execute()
+                            stats["published"] += 1
+                            continue
+
+                    # Queue for human approval otherwise.
+                    sb.table("pending_approvals").insert({
+                        "tenant_id": tenant_id,
+                        "kind": "content",
+                        "channel": ctype,
+                        "agent_name": "content_autopilot",
+                        "title": piece_data["title"],
+                        "body": piece_data["content"][:8000],
+                        "metadata": {"piece_id": piece_id, "score": score, "min_score": min_score},
+                        "status": "pending",
+                    }).execute()
+                    stats["queued"] += 1
+                except Exception as e:
+                    logger.warning(f"[autopilot {tenant_id}] draft failed for {item.get('id')}: {e}")
+                    sb.table("content_plan_items").update({"status": "idea"}).eq("id", item["id"]).execute()
+        except Exception as e:
+            logger.warning(f"[autopilot {tenant_id}] draft phase failed: {e}")
+
+    return stats
+
+
+async def _run_content_autopilot():
+    """Fan out content autopilot to every tenant that has it enabled.
+
+    Reads ``user_settings.settings.content_autopilot``. Tenants with
+    ``enabled=true`` get the full chain run for them. Cadence ('weekly' vs
+    'biweekly') is honoured by skipping every other Wednesday — we use
+    ISO week parity as a cheap deterministic check.
+    """
+    logger.info("[scheduler] Running content autopilot fan-out...")
+    try:
+        from shared.database import get_supabase
+        sb = get_supabase()
+        rows = sb.table("user_settings").select("user_id,settings").execute()
+        tenants = []
+        for row in (rows.data or []):
+            cfg = (row.get("settings") or {}).get("content_autopilot") or {}
+            if not cfg.get("enabled"):
+                continue
+            cadence = (cfg.get("cadence") or "weekly").lower()
+            if cadence == "biweekly":
+                # Skip on odd ISO weeks so we run every other week.
+                if datetime.now(timezone.utc).isocalendar().week % 2 != 0:
+                    continue
+            tenants.append((row["user_id"], cfg))
+
+        logger.info(f"[scheduler] autopilot: {len(tenants)} tenant(s) opted in")
+        totals = {"drafted": 0, "queued": 0, "published": 0}
+        for tenant_id, cfg in tenants:
+            try:
+                stats = await _run_content_autopilot_for_tenant(tenant_id, cfg)
+                for k in totals:
+                    totals[k] += stats.get(k, 0)
+            except Exception as e:
+                logger.error(f"[autopilot {tenant_id}] failed: {e}")
+
+        logger.info(f"[scheduler] autopilot done — drafted {totals['drafted']}, queued {totals['queued']}, published {totals['published']}")
+        _record("weekly_content_autopilot", "success")
+    except Exception as e:
+        logger.error(f"[scheduler] content autopilot failed: {e}")
+        _record("weekly_content_autopilot", "error", str(e))
+        await _notify_failure("weekly_content_autopilot", str(e))
 
 
 async def _run_weekly_ai_visibility():
@@ -536,6 +760,15 @@ def start():
         replace_existing=True,
     )
 
+    # Content autopilot — Wednesdays 06:00 UTC (1h after the analysis so its
+    # gaps are already in the plan when the autopilot drafts them).
+    scheduler.add_job(
+        _run_content_autopilot,
+        CronTrigger(day_of_week="wed", hour=6, minute=0),
+        id="weekly_content_autopilot",
+        replace_existing=True,
+    )
+
     # Midday review check — 14:00 UTC every day
     scheduler.add_job(
         _run_midday_review_check,
@@ -648,7 +881,7 @@ def start():
         "keywords 02:00, SEO OODA Mon 03:00, metrics 04:00, "
         "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads OODA 08:00, "
         "weekly-email Mon 09:00, social OODA Tue 11:00, "
-        "reviews OODA 14:00, content OODA Wed 05:00, "
+        "reviews OODA 14:00, content OODA Wed 05:00, content autopilot Wed 06:00, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
 
