@@ -14,14 +14,14 @@ load_dotenv(".env.local")
 
 class Settings(BaseSettings):
     """Application settings"""
-    
+
     # Environment
     ENVIRONMENT: str = "development"
     LOG_LEVEL: str = "INFO"
-    
+
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
-    
+
     # Google APIs
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
@@ -32,19 +32,19 @@ class Settings(BaseSettings):
     GOOGLE_ADS_REFRESH_TOKEN: str = ""
     GOOGLE_ADS_CUSTOMER_ID: str = ""
     GOOGLE_OAUTH_REDIRECT_URI: str = "https://web-production-5324a.up.railway.app/api/auth/google/callback"
-    
+
     # SEO APIs
     SEMRUSH_API_KEY: str = ""
     AHREFS_API_KEY: str = ""
     VALUESERP_API_KEY: str = ""  # valueserp.com - for SERP analysis
-    
+
     # Social Media
     TWITTER_API_KEY: str = ""
     TWITTER_API_SECRET: str = ""
     TWITTER_ACCESS_TOKEN: str = ""
     TWITTER_ACCESS_SECRET: str = ""
     TWITTER_BEARER_TOKEN: str = ""
-    
+
     # LinkedIn
     LINKEDIN_ACCESS_TOKEN: str = ""
     LINKEDIN_ORG_ID: str = ""
@@ -54,37 +54,37 @@ class Settings(BaseSettings):
     REDDIT_CLIENT_SECRET: str = ""
     REDDIT_USERNAME: str = ""
     REDDIT_PASSWORD: str = ""
-    
+
     # Google Analytics 4
     GA4_PROPERTY_ID: str = ""
-    
+
     # Database
     DATABASE_URL: str = "postgresql://localhost:5432/sama"
     PGVECTOR_ENABLED: bool = True
-    
+
     # Supabase
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
-    
+
     # Vector Store
     PINECONE_API_KEY: str = ""
     PINECONE_ENVIRONMENT: str = ""
     PINECONE_INDEX_NAME: str = "sama-memory"
-    
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
-    
+
     # Temporal
     TEMPORAL_HOST: str = "localhost:7233"
     TEMPORAL_NAMESPACE: str = "sama"
-    
+
     # Perplexity
     PERPLEXITY_API_KEY: str = ""
 
     # Monitoring
     SENTRY_DSN: str = ""
     DATADOG_API_KEY: str = ""
-    
+
     # GitHub
     GITHUB_TOKEN: str = ""
     GITHUB_OWNER: str = "successifier"
@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     # Deployment
     RAILWAY_API_TOKEN: str = ""
     RAILWAY_PROJECT_ID: str = ""
-    
+
     # Application
     SUCCESSIFIER_DOMAIN: str = "successifier.com"
     SUCCESSIFIER_SITE_URL: str = "https://successifier.com"
@@ -102,6 +102,9 @@ class Settings(BaseSettings):
 
     # SAMA API (self-reference for FORGE tool calls)
     SAMA_API_URL: str = "https://web-production-5324a.up.railway.app"
+
+    # Dashboard (used in transactional email links)
+    DASHBOARD_BASE_URL: str = "https://app.successifier.com"
 
     # AI Model
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
@@ -117,17 +120,23 @@ class Settings(BaseSettings):
     # Budget Optimizer
     MIN_ROAS_THRESHOLD: float = 2.0
     MIN_CAMPAIGN_BUDGET: float = 10.0
-    
+
     # LinkedIn Agent Integration
     LINKEDIN_AGENT_EVENT_BUS_ENABLED: bool = True
     LINKEDIN_AGENT_API_URL: str = "https://growth.successifier.com/api"
     GROWTH_HUB_BRIDGE_API_KEY: str = ""
-    
+
     # Lead Generation
     CALCOM_BOOKING_URL: str = ""  # e.g. https://cal.com/successifier/demo
     CALCOM_WEBHOOK_SECRET: str = ""
     BREVO_API_KEY: str = ""
     LEAD_CAPTURE_FORM_URL: str = ""  # URL to hosted lead capture form
+
+    # Email (Resend) — used for weekly status emails and other transactional sends
+    RESEND_API_KEY: str = ""
+    EMAIL_FROM_ADDRESS: str = ""           # e.g. notifications@successifier.com
+    EMAIL_FROM_NAME: str = "Sama"
+    EMAIL_REPLY_TO: str = ""
 
     # Human-in-the-Loop
     AUTO_PUBLISH_BLOG_POSTS: bool = False
@@ -136,7 +145,7 @@ class Settings(BaseSettings):
     AUTO_RESPOND_REVIEWS_POSITIVE: bool = True
     AUTO_RESPOND_REVIEWS_NEGATIVE: bool = False
     BUDGET_CHANGE_APPROVAL_THRESHOLD: float = 0.30
-    
+
     # Demo Mode - when True, GET endpoints return realistic seed data
     DEMO_MODE: bool = False
 
@@ -149,7 +158,7 @@ class Settings(BaseSettings):
         "https://sama-dashboard.vercel.app",
         "https://*.vercel.app"  # Allow all Vercel preview deployments
     ]
-    
+
     class Config:
         env_file = ".env.local"
         case_sensitive = True
