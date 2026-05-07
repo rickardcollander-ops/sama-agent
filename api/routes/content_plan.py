@@ -14,6 +14,11 @@ unified "what to write next" list with filter chips:
 * ``ai_generated``   — produced by /api/content/plan/generate
 * ``analysis_gap``   — auto-fed from the OODA content analysis loop
 * ``competitor_gap`` — auto-fed from competitor coverage analysis
+
+Each row may also carry a ``scheduled_for`` timestamp + an
+``auto_publish_on_schedule`` flag. The scheduler picks these up
+hourly: when ``scheduled_for <= now()``, the idea is drafted, and if
+the flag is set the resulting article is also published.
 """
 
 import json
@@ -43,6 +48,8 @@ class PlanItemCreate(BaseModel):
     priority: str = "medium"
     status: str = "idea"
     source: str = "manual"
+    scheduled_for: Optional[datetime] = None
+    auto_publish_on_schedule: bool = False
 
 
 class PlanItemUpdate(BaseModel):
@@ -55,6 +62,8 @@ class PlanItemUpdate(BaseModel):
     priority: Optional[str] = None
     status: Optional[str] = None
     content_piece_id: Optional[str] = None
+    scheduled_for: Optional[datetime] = None
+    auto_publish_on_schedule: Optional[bool] = None
 
 
 class PlanGenerateRequest(BaseModel):
@@ -65,7 +74,20 @@ class PlanGenerateRequest(BaseModel):
     target_audience: Optional[str] = None
     competitors: List[str] = []
     pillar: Optional[str] = None
-    replace: bool = False  # if True, archive existing 'idea' rows first
+    replace: bool = False
+
+
+class CalendarItemCreate(BaseModel):
+    """Quick-add from the calendar UI: schedule + maybe draft now."""
+    title: str
+    scheduled_for: datetime
+    content_type: str = "blog_article"
+    target_keyword: Optional[str] = None
+    topic: Optional[str] = None
+    pillar: Optional[str] = None
+    priority: str = "medium"
+    auto_publish_on_schedule: bool = False
+    draft_now: bool = False  # if True, materialise the article immediately
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -100,6 +122,8 @@ def _row(item: dict) -> dict:
         "status": item.get("status") or "idea",
         "source": item.get("source") or "manual",
         "content_piece_id": item.get("content_piece_id"),
+        "scheduled_for": item.get("scheduled_for"),
+        "auto_publish_on_schedule": bool(item.get("auto_publish_on_schedule") or False),
         "metadata": item.get("metadata") or {},
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
@@ -111,20 +135,12 @@ def upsert_analysis_gap_items(
     actions: List[Dict[str, Any]],
     cycle_id: Optional[str] = None,
 ) -> int:
-    """Insert plan rows for analysis gap actions, skipping duplicates by keyword.
-
-    Called from the OODA cycle on completion. Quietly skips rows that
-    would violate the (tenant_id, lower(target_keyword)) unique index
-    so re-running the analysis doesn't grow the plan unboundedly.
-
-    Returns the number of rows that were actually inserted.
-    """
+    """Insert plan rows for analysis gap actions, skipping duplicates by keyword."""
     if not actions:
         return 0
 
     sb = get_supabase()
 
-    # Pull existing keywords once to avoid N round-trips.
     try:
         existing = (
             sb.table("content_plan_items")
@@ -144,8 +160,6 @@ def upsert_analysis_gap_items(
     rows: List[Dict[str, Any]] = []
     for action in actions:
         atype = action.get("type") or action.get("action_type") or ""
-        # Only feed the "produce a new article" action types into the plan.
-        # optimize/meta/publish are quick fixes — handled separately in UI.
         if atype not in {"blog_post", "blog_article", "comparison"}:
             continue
 
@@ -174,14 +188,11 @@ def upsert_analysis_gap_items(
             },
         })
         if kw:
-            existing_keywords.add(kw.lower())  # de-dup within batch too
+            existing_keywords.add(kw.lower())
 
     if not rows:
         return 0
 
-    # Insert; the partial unique index will reject duplicates that slipped past
-    # our in-memory check (race conditions). We swallow per-row failures so a
-    # single conflict doesn't abort the whole batch.
     inserted = 0
     for r in rows:
         try:
@@ -223,6 +234,45 @@ async def list_plan(
         return {"items": [], "error": str(e)}
 
 
+@router.get("/plan/calendar")
+async def list_plan_for_calendar(request: Request, start: str, end: str):
+    """Return all plan items + content pieces scheduled in [start, end].
+
+    Powers the calendar month grid. The dashboard sends ISO dates for the
+    visible window; we return both rows that have a scheduled_for inside
+    the window AND content_pieces that were created/published inside the
+    window (so finished work shows up too).
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+
+        scheduled = (
+            sb.table("content_plan_items")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .gte("scheduled_for", start)
+            .lte("scheduled_for", end)
+            .execute()
+        )
+        pieces_published = (
+            sb.table("content_pieces")
+            .select("id,title,content_type,status,published_at,target_url,external_url,created_at")
+            .eq("tenant_id", tenant_id)
+            .eq("status", "published")
+            .gte("published_at", start)
+            .lte("published_at", end)
+            .execute()
+        )
+        return {
+            "scheduled": [_row(x) for x in (scheduled.data or [])],
+            "published_pieces": pieces_published.data or [],
+        }
+    except Exception as e:
+        logger.error(f"list_plan_for_calendar error: {e}")
+        return {"scheduled": [], "published_pieces": [], "error": str(e)}
+
+
 # ── Create one ───────────────────────────────────────────────────────────────
 
 @router.post("/plan")
@@ -231,7 +281,7 @@ async def create_plan_item(request: Request, payload: PlanItemCreate):
     try:
         sb = get_supabase()
         data = {
-            **payload.model_dump(exclude_none=True),
+            **payload.model_dump(exclude_none=True, mode="json"),
             "tenant_id": tenant_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -242,6 +292,56 @@ async def create_plan_item(request: Request, payload: PlanItemCreate):
         return {"success": False, "error": str(e)}
 
 
+# ── Calendar quick-add: schedule + (optionally) draft right away ─────────────
+
+@router.post("/plan/calendar")
+async def calendar_create(request: Request, payload: CalendarItemCreate):
+    """Add a row to the plan from the calendar UI.
+
+    Always sets scheduled_for. If draft_now=true, immediately runs the
+    drafting flow (same as POST /plan/:id/draft) so the editor opens with
+    a complete article. The scheduler still owns the publish step on the
+    target date — unless auto_publish_on_schedule=false, in which case it
+    stays as a draft and the user clicks Approve & Publish manually.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    sb = get_supabase()
+
+    plan_data = {
+        "tenant_id": tenant_id,
+        "title": payload.title[:300],
+        "topic": (payload.topic or "")[:1000] or None,
+        "content_type": payload.content_type,
+        "target_keyword": (payload.target_keyword or "")[:200] or None,
+        "pillar": (payload.pillar or "")[:100] or None,
+        "priority": payload.priority,
+        "status": "idea",
+        "source": "manual",
+        "scheduled_for": payload.scheduled_for.isoformat() if payload.scheduled_for else None,
+        "auto_publish_on_schedule": bool(payload.auto_publish_on_schedule),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        result = sb.table("content_plan_items").insert(plan_data).execute()
+        item = (result.data or [{}])[0]
+        item_id = item.get("id")
+    except Exception as e:
+        logger.error(f"calendar_create insert failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    if not payload.draft_now:
+        return {"success": True, "item": _row(item)}
+
+    # Draft inline so the editor opens with a real article.
+    try:
+        draft_result = await _materialise_idea(sb, tenant_id, item)
+        return {"success": True, "item": _row(item), **draft_result}
+    except Exception as e:
+        logger.error(f"calendar_create draft_now failed: {e}")
+        return {"success": True, "item": _row(item), "draft_error": str(e)}
+
+
 # ── Update ───────────────────────────────────────────────────────────────────
 
 @router.patch("/plan/{item_id}")
@@ -249,7 +349,7 @@ async def update_plan_item(item_id: str, payload: PlanItemUpdate, request: Reque
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        update_data = {k: v for k, v in payload.model_dump(mode="json").items() if v is not None}
         if not update_data:
             return {"success": True, "message": "Nothing to update"}
         result = (
@@ -357,8 +457,6 @@ Return ONLY a JSON array (no markdown, no code fences) of {count} objects:
             except Exception as e:
                 logger.debug(f"Failed to archive existing ideas: {e}")
 
-        # Pre-load existing keywords so duplicates from generate are skipped too,
-        # not just from analysis. Same dedupe contract everywhere.
         try:
             existing = (
                 sb.table("content_plan_items")
@@ -413,6 +511,83 @@ Return ONLY a JSON array (no markdown, no code fences) of {count} objects:
         return {"success": False, "error": str(e), "items": []}
 
 
+# ── Materialiser (shared between /plan/:id/draft and calendar/scheduler) ─────
+
+async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a content_piece from a plan idea via Claude. Returns piece info."""
+    item_id = item["id"]
+    sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item_id).execute()
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    ctype = item.get("content_type") or "blog_article"
+    target_words = (
+        "1500-2200 words" if ctype == "blog_article" else
+        "120-180 words" if ctype == "linkedin_post" else
+        "300-500 words"
+    )
+    prompt = f"""You are an expert B2B SaaS marketer. Write a {ctype.replace('_', ' ')}.
+
+Title: {item.get('title') or ''}
+Topic: {item.get('topic') or ''}
+Target keyword: {item.get('target_keyword') or ''}
+Pillar: {item.get('pillar') or ''}
+Length: {target_words}.
+
+Return ONLY a JSON object (no markdown fences):
+{{
+  "title": "Final title (may refine the input)",
+  "content": "Full article in markdown",
+  "meta_title": "<= 60 chars",
+  "meta_description": "150-160 chars",
+  "word_count": <number>
+}}
+"""
+    message = client.messages.create(
+        model=settings.CLAUDE_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = message.content[0].text.strip()
+    try:
+        article = json.loads(text)
+    except json.JSONDecodeError:
+        if "```" in text:
+            fenced = text.split("```")[1]
+            if fenced.startswith("json"):
+                fenced = fenced[4:]
+            article = json.loads(fenced.strip())
+        else:
+            article = {"title": item.get("title"), "content": text, "word_count": len(text.split())}
+
+    piece_data = {
+        "tenant_id": tenant_id,
+        "title": article.get("title") or item.get("title") or "Untitled",
+        "content": article.get("content") or "",
+        "content_type": ctype,
+        "meta_title": article.get("meta_title") or "",
+        "meta_description": article.get("meta_description") or "",
+        "target_keyword": item.get("target_keyword") or "",
+        "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+        "status": "draft",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    piece_result = sb.table("content_pieces").insert(piece_data).execute()
+    piece = (piece_result.data or [{}])[0]
+    piece_id = piece.get("id")
+
+    sb.table("content_plan_items").update({
+        "status": "draft",
+        "content_piece_id": piece_id,
+    }).eq("id", item_id).execute()
+
+    return {
+        "plan_item_id": item_id,
+        "content_piece_id": piece_id,
+        "piece": piece,
+    }
+
+
 # ── Materialise an idea into a content_piece (drafted full article) ──────────
 
 @router.post("/plan/{item_id}/draft")
@@ -434,77 +609,8 @@ async def draft_plan_item(item_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Plan item not found")
         item = rows[0]
 
-        sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item_id).execute()
-
-        import anthropic
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        ctype = item.get("content_type") or "blog_article"
-        target_words = (
-            "1500-2200 words" if ctype == "blog_article" else
-            "120-180 words" if ctype == "linkedin_post" else
-            "300-500 words"
-        )
-        prompt = f"""You are an expert B2B SaaS marketer. Write a {ctype.replace('_', ' ')}.
-
-Title: {item.get('title') or ''}
-Topic: {item.get('topic') or ''}
-Target keyword: {item.get('target_keyword') or ''}
-Pillar: {item.get('pillar') or ''}
-Length: {target_words}.
-
-Return ONLY a JSON object (no markdown fences):
-{{
-  "title": "Final title (may refine the input)",
-  "content": "Full article in markdown",
-  "meta_title": "<= 60 chars",
-  "meta_description": "150-160 chars",
-  "word_count": <number>
-}}
-"""
-        message = client.messages.create(
-            model=settings.CLAUDE_MODEL,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = message.content[0].text.strip()
-        try:
-            article = json.loads(text)
-        except json.JSONDecodeError:
-            if "```" in text:
-                fenced = text.split("```")[1]
-                if fenced.startswith("json"):
-                    fenced = fenced[4:]
-                article = json.loads(fenced.strip())
-            else:
-                article = {"title": item.get("title"), "content": text, "word_count": len(text.split())}
-
-        piece_data = {
-            "tenant_id": tenant_id,
-            "title": article.get("title") or item.get("title") or "Untitled",
-            "content": article.get("content") or "",
-            "content_type": ctype,
-            "meta_title": article.get("meta_title") or "",
-            "meta_description": article.get("meta_description") or "",
-            "target_keyword": item.get("target_keyword") or "",
-            "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
-            "status": "draft",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        piece_result = sb.table("content_pieces").insert(piece_data).execute()
-        piece = (piece_result.data or [{}])[0]
-        piece_id = piece.get("id")
-
-        sb.table("content_plan_items").update({
-            "status": "draft",
-            "content_piece_id": piece_id,
-        }).eq("id", item_id).execute()
-
-        return {
-            "success": True,
-            "plan_item_id": item_id,
-            "content_piece_id": piece_id,
-            "piece": piece,
-        }
+        result_data = await _materialise_idea(sb, tenant_id, item)
+        return {"success": True, **result_data}
     except HTTPException:
         try:
             sb.table("content_plan_items").update({"status": "idea"}).eq("id", item_id).execute()
@@ -553,3 +659,68 @@ async def get_piece_lineage(piece_id: str, request: Request):
     except Exception as e:
         logger.error(f"get_piece_lineage error: {e}")
         return {"plan_item": None, "piece": None, "error": str(e)}
+
+
+# ── Scheduler hook: process due scheduled items ──────────────────────────────
+
+async def process_due_scheduled_items() -> Dict[str, int]:
+    """Find plan items whose scheduled_for has passed; draft (and optionally
+    publish) them. Called from shared.scheduler hourly.
+    """
+    sb = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    stats = {"drafted": 0, "published": 0, "failed": 0}
+
+    try:
+        result = (
+            sb.table("content_plan_items")
+            .select("*")
+            .lte("scheduled_for", now_iso)
+            .in_("status", ["idea"])
+            .limit(50)
+            .execute()
+        )
+        due = result.data or []
+    except Exception as e:
+        logger.error(f"process_due_scheduled_items: query failed: {e}")
+        return stats
+
+    for item in due:
+        tenant_id = item.get("tenant_id") or "default"
+        try:
+            mat = await _materialise_idea(sb, tenant_id, item)
+            stats["drafted"] += 1
+
+            if not item.get("auto_publish_on_schedule"):
+                continue
+
+            piece_id = mat.get("content_piece_id")
+            if not piece_id:
+                continue
+
+            # Publish via the canonical content_validation flow.
+            try:
+                from api.routes.content_validation import _publish_via_github
+                gh = await _publish_via_github(mat["piece"])
+                if gh.get("success"):
+                    sb.table("content_pieces").update({
+                        "status": "published",
+                        "published_at": now_iso,
+                        "external_url": gh.get("url"),
+                        "target_url": gh.get("url"),
+                    }).eq("id", piece_id).execute()
+                    sb.table("content_plan_items").update({"status": "published"}).eq(
+                        "id", item["id"]
+                    ).execute()
+                    stats["published"] += 1
+            except Exception as e:
+                logger.warning(f"scheduled publish for piece {piece_id} failed: {e}")
+        except Exception as e:
+            logger.warning(f"scheduled draft for item {item.get('id')} failed: {e}")
+            stats["failed"] += 1
+            try:
+                sb.table("content_plan_items").update({"status": "idea"}).eq("id", item["id"]).execute()
+            except Exception:
+                pass
+
+    return stats
