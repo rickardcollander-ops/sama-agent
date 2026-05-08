@@ -154,6 +154,7 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://localhost:3003",
         "https://app.successifier.com",
+        "https://sama.successifier.com",
         "https://sama-dashboard-alpha.vercel.app",
         "https://sama-dashboard.vercel.app",
         "https://*.vercel.app"  # Allow all Vercel preview deployments
