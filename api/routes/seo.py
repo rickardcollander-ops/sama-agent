@@ -48,11 +48,33 @@ async def _get_tenant_brand(sb, tenant_id: str) -> dict:
         return {}
 
 
+_EMPTY_STATS = {
+    "total_keywords": 0,
+    "avg_position": 0,
+    "total_clicks": 0,
+    "total_impressions": 0,
+    "avg_ctr": 0,
+    "top_10": 0,
+    "top_3": 0,
+}
+
+
+def _is_legacy_default(tenant_id: str) -> bool:
+    """The legacy 'default' tenant holds the original Successifier rows that
+    pre-date multi-tenancy. Any request that lands here did so via the
+    middleware fallback (no JWT, no X-Sama-Account-Id, no allowlisted
+    X-Tenant-ID) — i.e. we don't know who they are. Don't hand them another
+    tenant's data."""
+    return not tenant_id or tenant_id == "default"
+
+
 @router.get("/stats")
 async def get_seo_stats(request: Request):
     """Return aggregated SEO statistics for the dashboard."""
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
+    if _is_legacy_default(tenant_id):
+        return dict(_EMPTY_STATS)
 
     try:
         sb = get_supabase()
@@ -221,12 +243,19 @@ async def get_keywords(request: Request, limit: int = 1000, offset: int = 0):
     """
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
+    if _is_legacy_default(tenant_id):
+        return {
+            "total": 0,
+            "tenant_id": tenant_id,
+            "gsc_connected": False,
+            "keywords": [],
+        }
 
     try:
         sb = get_supabase()
 
         gsc_connected = await _has_active_gsc_sync(sb, tenant_id)
-        if not gsc_connected and tenant_id != "default":
+        if not gsc_connected:
             return {
                 "total": 0,
                 "tenant_id": tenant_id,
@@ -281,6 +310,8 @@ async def get_top_performers(request: Request):
     """Get top performing keywords (position <= 10)"""
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
+    if _is_legacy_default(tenant_id):
+        return {"count": 0, "keywords": []}
 
     try:
         sb = get_supabase()
@@ -908,6 +939,8 @@ async def _gsc_queries_payload(request: Request, limit: int) -> dict:
     """Shared handler for the canonical /gsc/queries endpoint and its aliases."""
     from shared.database import get_supabase
     tenant_id = getattr(request.state, "tenant_id", "default")
+    if _is_legacy_default(tenant_id):
+        return {"tenant_id": tenant_id, "total": 0, "queries": []}
     sb = get_supabase()
 
     result = (
