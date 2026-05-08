@@ -75,6 +75,9 @@ def init_sentry() -> None:
     if not dsn:
         logger.info("Sentry not configured (SENTRY_DSN unset); observability skipped")
         return
+    if not dsn.lower().startswith(("http://", "https://")):
+        logger.warning("Sentry DSN missing http(s) scheme; observability skipped")
+        return
     try:
         import sentry_sdk
         from sentry_sdk.integrations.asyncio import AsyncioIntegration
@@ -85,19 +88,23 @@ def init_sentry() -> None:
         return
 
     environment = os.getenv("SENTRY_ENVIRONMENT") or os.getenv("ENVIRONMENT", "production")
-    sentry_sdk.init(
-        dsn=dsn,
-        environment=environment,
-        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.05")),
-        send_default_pii=False,
-        max_breadcrumbs=50,
-        integrations=[
-            StarletteIntegration(transaction_style="endpoint"),
-            FastApiIntegration(transaction_style="endpoint"),
-            AsyncioIntegration(),
-        ],
-        before_send=lambda event, _hint: _scrub(event),
-    )
+    try:
+        sentry_sdk.init(
+            dsn=dsn,
+            environment=environment,
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.05")),
+            send_default_pii=False,
+            max_breadcrumbs=50,
+            integrations=[
+                StarletteIntegration(transaction_style="endpoint"),
+                FastApiIntegration(transaction_style="endpoint"),
+                AsyncioIntegration(),
+            ],
+            before_send=lambda event, _hint: _scrub(event),
+        )
+    except Exception as e:
+        logger.warning("Sentry init failed (%s); observability skipped", e)
+        return
     logger.info("Sentry initialised env=%s", environment)
 
 
