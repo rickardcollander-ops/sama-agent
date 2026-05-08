@@ -329,18 +329,27 @@ async def create_plan_from_analysis(
 
     sb = get_supabase()
 
-    # 1. Load analysis run
-    run_q = (
-        sb.table("analysis_runs")
-        .select("id,payload,domain,brand_name,tenant_id")
-        .eq("id", analysis_run_id)
-        .eq("tenant_id", tenant_id)
-        .single()
-        .execute()
-    )
-    if not run_q.data:
+    # 1. Load analysis run. We use limit(1) instead of .single() so a missing
+    # row produces our friendly RuntimeError rather than the raw PostgREST
+    # "Cannot coerce the result to a single JSON object" error bubbling up to
+    # the agent_runs row.
+    try:
+        run_q = (
+            sb.table("analysis_runs")
+            .select("id,payload,domain,brand_name,tenant_id")
+            .eq("id", analysis_run_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not load analysis_run {analysis_run_id} for tenant {tenant_id}: {e}"
+        ) from e
+    rows = run_q.data or []
+    if not rows:
         raise RuntimeError(f"analysis_run {analysis_run_id} not found for tenant {tenant_id}")
-    run = run_q.data
+    run = rows[0]
     payload = run.get("payload") or {}
 
     # 2. Brand context
