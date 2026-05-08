@@ -134,8 +134,15 @@ def upsert_analysis_gap_items(
     tenant_id: str,
     actions: List[Dict[str, Any]],
     cycle_id: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> int:
-    """Insert plan rows for analysis gap actions, skipping duplicates by keyword."""
+    """Insert plan rows for analysis gap actions, skipping duplicates by keyword.
+
+    When ``source`` is provided it overrides the auto-detected source label
+    (e.g. ``"ai_visibility_gap"`` for GEO-derived gaps). Otherwise we infer
+    ``competitor_gap`` for actions tagged with a competitor and fall back to
+    ``analysis_gap``.
+    """
     if not actions:
         return 0
 
@@ -168,7 +175,7 @@ def upsert_analysis_gap_items(
             continue
 
         is_competitor = bool(action.get("competitor"))
-        source = "competitor_gap" if is_competitor else "analysis_gap"
+        row_source = source or ("competitor_gap" if is_competitor else "analysis_gap")
 
         rows.append({
             "tenant_id": tenant_id,
@@ -179,7 +186,7 @@ def upsert_analysis_gap_items(
             "priority": str(action.get("priority") or "medium"),
             "reason": str(action.get("action") or action.get("description") or "")[:500],
             "status": "idea",
-            "source": source,
+            "source": row_source,
             "source_run_id": cycle_id,
             "metadata": {
                 "competitor": action.get("competitor"),
@@ -378,6 +385,102 @@ async def delete_plan_item(item_id: str, request: Request):
         return {"success": True}
     except Exception as e:
         logger.error(f"delete_plan_item error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ── Bulk schedule + per-item cadence ─────────────────────────────────────────
+
+class BulkScheduleEntry(BaseModel):
+    item_id: str
+    scheduled_for: datetime
+    auto_publish_on_schedule: bool = False
+
+
+class BulkScheduleRequest(BaseModel):
+    entries: List[BulkScheduleEntry]
+    # item_id -> {"count": N, "interval_days": D}
+    repeats: Optional[Dict[str, Dict[str, int]]] = None
+
+
+@router.post("/plan/bulk-schedule")
+async def bulk_schedule(request: Request, payload: BulkScheduleRequest):
+    """Apply scheduled_for to multiple plan items in one round-trip.
+
+    For items listed in ``repeats``, also clones each row N-1 times at
+    ``interval_days`` apart (e.g. weekly LinkedIn series). Repeated rows
+    drop ``target_keyword`` to bypass the keyword dedupe constraint.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    if not payload.entries:
+        return {"success": True, "items": [], "count": 0}
+
+    try:
+        from datetime import timedelta
+        sb = get_supabase()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        affected: List[Dict[str, Any]] = []
+
+        for entry in payload.entries:
+            try:
+                upd = (
+                    sb.table("content_plan_items")
+                    .update({
+                        "scheduled_for": entry.scheduled_for.isoformat(),
+                        "auto_publish_on_schedule": entry.auto_publish_on_schedule,
+                        "status": "scheduled",
+                        "updated_at": now_iso,
+                    })
+                    .eq("id", entry.item_id)
+                    .eq("tenant_id", tenant_id)
+                    .execute()
+                )
+            except Exception as e:
+                logger.debug(f"bulk_schedule update {entry.item_id}: {e}")
+                continue
+            if not upd.data:
+                continue
+            affected.extend(upd.data)
+
+            repeats = (payload.repeats or {}).get(entry.item_id) or {}
+            count = int(repeats.get("count") or 1)
+            interval = int(repeats.get("interval_days") or 7)
+            if count <= 1 or interval <= 0:
+                continue
+
+            original = upd.data[0]
+            for n in range(1, count):
+                sched = entry.scheduled_for + timedelta(days=interval * n)
+                row = {
+                    "tenant_id": tenant_id,
+                    "source": original.get("source", "manual"),
+                    "source_run_id": original.get("source_run_id"),
+                    "title": original.get("title"),
+                    "topic": original.get("topic"),
+                    "content_type": original.get("content_type", "blog_article"),
+                    # Drop keyword on repeats so the dedupe index doesn't fire.
+                    "target_keyword": None,
+                    "pillar": original.get("pillar"),
+                    "reason": original.get("reason"),
+                    "priority": original.get("priority"),
+                    "status": "scheduled",
+                    "scheduled_for": sched.isoformat(),
+                    "auto_publish_on_schedule": entry.auto_publish_on_schedule,
+                    "metadata": {
+                        "repeat_of": entry.item_id,
+                        "repeat_n": n,
+                        "repeat_count": count,
+                    },
+                }
+                try:
+                    r = sb.table("content_plan_items").insert(row).execute()
+                    if r.data:
+                        affected.extend(r.data)
+                except Exception as e:
+                    logger.debug(f"bulk_schedule repeat n={n} skipped: {e}")
+
+        return {"success": True, "items": affected, "count": len(affected)}
+    except Exception as e:
+        logger.error(f"bulk_schedule error: {e}")
         return {"success": False, "error": str(e)}
 
 

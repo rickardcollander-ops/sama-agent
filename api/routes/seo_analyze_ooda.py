@@ -508,6 +508,33 @@ async def run_seo_analysis_with_ooda() -> Dict[str, Any]:
         action_ids = await save_actions("seo", actions)
 
         content_actions   = [a for a in actions if a.get("type") == "content"]
+
+        # Auto-feed: SEO content actions become plan items so the user can
+        # pick them up on the unified plan list. The same dedupe (per
+        # tenant + lower(keyword)) used by content-OODA applies here.
+        try:
+            if content_actions:
+                # SEO actions sometimes mark only `keyword` and rely on a
+                # separate `content_brief.content_type`; normalise the type
+                # so upsert classifies them as comparison/blog correctly.
+                normalised = []
+                for a in content_actions:
+                    brief = a.get("content_brief") or {}
+                    bt = (brief.get("content_type") if isinstance(brief, dict) else None) or ""
+                    if "comparison" in (bt or "").lower():
+                        a = {**a, "type": "comparison"}
+                    else:
+                        a = {**a, "type": "blog_article"}
+                    normalised.append(a)
+                from api.routes.content_plan import upsert_analysis_gap_items
+                added = upsert_analysis_gap_items(
+                    tenant_id="default",
+                    actions=normalised,
+                    cycle_id=cycle_id,
+                )
+                logger.info(f"✅ SEO → plan: {added} content gap items added")
+        except Exception as e:
+            logger.debug(f"SEO → plan auto-feed failed: {e}")
         technical_actions = [a for a in actions if a.get("type") == "technical"]
         onpage_actions    = [a for a in actions if a.get("type") == "on_page"]
 
