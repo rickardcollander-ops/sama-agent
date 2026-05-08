@@ -31,10 +31,23 @@ logger = logging.getLogger(__name__)
 
 class GenerateQueriesPayload(BaseModel):
     count: int = 10
+    # When ``mode="suggest"`` the endpoint returns LLM-generated suggestions in
+    # the tenant's language — used by the AI Assistant page to populate the
+    # "suggested queries" picker before the user saves them. The default
+    # ``mode="saved"`` returns whatever is already saved under
+    # ``tenant_config.geo_queries``: that's what feeds the Insights page, and
+    # it must never include unsaved auto-generated prompts because the
+    # measurement guarantee is "only what you put in AI Assistant gets
+    # measured".
+    mode: str = "saved"
 
 
 class RunPayload(BaseModel):
-    queries: List[str]
+    # ``queries`` is intentionally optional — the endpoint pulls the queries
+    # from saved ``geo_queries`` so the dashboard can't accidentally measure
+    # something that was never added in AI Assistant. The field is kept for
+    # backward compatibility with existing clients and is silently ignored.
+    queries: Optional[List[str]] = None
     platforms: Optional[List[str]] = None
     # Optional overrides — when the user just typed these on the analysis
     # page they should win over whatever's stored in tenant settings.
@@ -47,13 +60,29 @@ class RunPayload(BaseModel):
 
 @router.post("/generate-queries")
 async def generate_queries(payload: GenerateQueriesPayload, request: Request):
-    """LLM-suggest buyer-intent queries based on tenant brand context."""
+    """Return the queries that drive the Insights page.
+
+    ``mode="saved"`` (default): returns the list saved under
+    ``tenant_config.geo_queries`` — exactly what the user added in AI
+    Assistant. Nothing else is ever surfaced to Insights.
+
+    ``mode="suggest"``: returns LLM-generated buyer-intent suggestions in the
+    tenant's language. The AI Assistant page calls this to show suggestions a
+    user can review and explicitly save; suggestions returned here are never
+    measured until the user persists them via user_settings.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
     config = await get_tenant_config(tenant_id)
-    from agents.analysis import AnalysisAgent
-    agent = AnalysisAgent(tenant_config=config)
-    queries = await agent.generate_queries(count=max(1, min(payload.count, 25)))
-    return {"queries": queries}
+    count = max(1, min(payload.count, 25))
+
+    if payload.mode == "suggest":
+        from agents.analysis import AnalysisAgent
+        agent = AnalysisAgent(tenant_config=config)
+        queries = await agent.generate_queries(count=count)
+        return {"queries": queries, "mode": "suggest"}
+
+    saved = list(getattr(config, "geo_queries", []) or [])
+    return {"queries": saved[:count], "mode": "saved"}
 
 
 # ── POST /run ────────────────────────────────────────────────────────────────
@@ -64,17 +93,31 @@ async def run_analysis(payload: RunPayload, request: Request):
     Kick off an analysis. Persists a row immediately, runs the orchestration
     in the background, and returns the row id so the dashboard can poll
     /runs/{id}.
+
+    The queries that get measured are *always* the tenant's saved
+    ``geo_queries`` (set in AI Assistant). ``payload.queries`` is accepted
+    for backward compatibility but ignored — letting clients send arbitrary
+    queries here would silently bypass the "only what you put in AI Assistant
+    gets measured" guarantee that the rest of the product depends on.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
-    queries = [q.strip() for q in (payload.queries or []) if q and q.strip()]
+    config = await get_tenant_config(tenant_id)
+
+    queries = [q.strip() for q in (getattr(config, "geo_queries", []) or []) if q and q.strip()]
     if not queries:
-        raise HTTPException(status_code=400, detail="queries required")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No queries configured. Add the prompts you want measured "
+                "under AI Assistant before running an analysis."
+            ),
+        )
     if len(queries) > 25:
-        raise HTTPException(status_code=400, detail="max 25 queries per run")
+        # geo_queries is the source of truth; cap silently so the user never
+        # ends up in a state where the run endpoint refuses their saved list.
+        queries = queries[:25]
 
     platforms = payload.platforms or ["chatgpt", "claude", "perplexity", "google_aio"]
-
-    config = await get_tenant_config(tenant_id)
     sb = get_supabase()
 
     # Apply per-request overrides (what the user just typed) over the
