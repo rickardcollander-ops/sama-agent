@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -363,6 +364,45 @@ def _social_schedule_dates(
     return out
 
 
+# PostgREST returns schema-cache misses with a recognisable message.
+# Older prod schemas may not have all the columns the agent populates
+# (e.g. migration 039's source_analysis_run_id), so we strip the offending
+# column and retry instead of dropping the whole row.
+_PGRST_MISSING_COL_RE = re.compile(
+    r"Could not find the ['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]? column",
+)
+
+
+def _safe_insert(
+    sb: Any, table: str, data: Dict[str, Any], max_retries: int = 8,
+) -> Optional[Dict[str, Any]]:
+    """Insert ``data`` into ``table``; on "unknown column" errors, drop the
+    offending column and retry. Returns the first inserted row, or ``None``
+    if the insert keeps failing for unrelated reasons.
+    """
+    payload = dict(data)
+    for _ in range(max_retries):
+        try:
+            row = sb.table(table).insert(payload).execute()
+            return (row.data or [{}])[0] or None
+        except Exception as e:
+            msg = str(e)
+            match = _PGRST_MISSING_COL_RE.search(msg)
+            if not match:
+                logger.error(f"{table} insert failed: {e}")
+                return None
+            missing = match.group(1)
+            if missing not in payload:
+                logger.error(f"{table} insert failed (col {missing!r} not in payload): {e}")
+                return None
+            logger.warning(
+                f"{table} insert: dropping unknown column {missing!r} and retrying"
+            )
+            payload.pop(missing, None)
+    logger.error(f"{table} insert: gave up after {max_retries} retries")
+    return None
+
+
 def _nearest_article(
     articles: List[Dict[str, Any]], when: datetime
 ) -> Optional[Dict[str, Any]]:
@@ -569,12 +609,8 @@ async def create_plan_from_analysis(
             "source_gap_title": rationale[:500] if rationale else None,
             "created_at": now_iso,
         }
-        try:
-            piece_row = sb.table("content_pieces").insert(piece_data).execute()
-            piece_id = (piece_row.data or [{}])[0].get("id")
-        except Exception as e:
-            logger.error(f"content_pieces insert failed: {e}")
-            continue
+        piece_row = _safe_insert(sb, "content_pieces", piece_data)
+        piece_id = piece_row.get("id") if piece_row else None
         if not piece_id:
             continue
 
@@ -601,12 +637,8 @@ async def create_plan_from_analysis(
             },
             "created_at": now_iso,
         }
-        try:
-            plan_row = sb.table("content_plan_items").insert(plan_data).execute()
-            article_plan_id = (plan_row.data or [{}])[0].get("id")
-        except Exception as e:
-            logger.error(f"plan_items insert failed: {e}")
-            article_plan_id = None
+        plan_row = _safe_insert(sb, "content_plan_items", plan_data)
+        article_plan_id = plan_row.get("id") if plan_row else None
 
         articles_created += 1
         if article_date > (last_date or article_date):
@@ -660,12 +692,8 @@ async def create_plan_from_analysis(
                     "source_analysis_run_id": analysis_run_id,
                     "created_at": now_iso,
                 }
-                try:
-                    social_row = sb.table("content_pieces").insert(social_piece_data).execute()
-                    social_piece_id = (social_row.data or [{}])[0].get("id")
-                except Exception as e:
-                    logger.error(f"social content_pieces insert failed: {e}")
-                    continue
+                social_row = _safe_insert(sb, "content_pieces", social_piece_data)
+                social_piece_id = social_row.get("id") if social_row else None
                 if not social_piece_id:
                     continue
 
@@ -688,13 +716,10 @@ async def create_plan_from_analysis(
                     },
                     "created_at": now_iso,
                 }
-                try:
-                    sb.table("content_plan_items").insert(social_plan_data).execute()
+                if _safe_insert(sb, "content_plan_items", social_plan_data) is not None:
                     social_created += 1
                     if social_date > (last_date or social_date):
                         last_date = social_date
-                except Exception as e:
-                    logger.error(f"social plan_items insert failed: {e}")
 
     return {
         "plan_id": analysis_run_id,
