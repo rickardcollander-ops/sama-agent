@@ -312,13 +312,55 @@ def _schedule_dates(
     return out
 
 
+def _social_schedule_dates(
+    posts_per_week: int,
+    start: Optional[datetime] = None,
+    weeks: int = 13,
+) -> List[datetime]:
+    """Return ``posts_per_week × weeks`` datetimes spread across 90 days.
+
+    Slots within a week land on Mon, Wed, Fri, Tue, Thu, Sat, Sun (in that
+    order) so 1/week defaults to Monday and 3/week ends up on Mon/Wed/Fri.
+    """
+    if posts_per_week <= 0 or weeks <= 0:
+        return []
+    start = start or datetime.now(timezone.utc).replace(
+        hour=10, minute=0, second=0, microsecond=0
+    )
+    week_offsets = [0, 2, 4, 1, 3, 5, 6][: max(0, min(7, posts_per_week))]
+    monday = start - timedelta(days=start.weekday())
+    if monday < start:
+        monday = monday + timedelta(days=7)
+    out: List[datetime] = []
+    for w in range(weeks):
+        base = monday + timedelta(days=7 * w)
+        for off in week_offsets:
+            out.append(base + timedelta(days=off))
+    return out
+
+
+def _nearest_article(
+    articles: List[Dict[str, Any]], when: datetime
+) -> Optional[Dict[str, Any]]:
+    """Pick the article whose ``scheduled_for`` is closest to ``when``."""
+    if not articles:
+        return None
+    return min(articles, key=lambda a: abs(a["scheduled_for"] - when))
+
+
 async def create_plan_from_analysis(
     tenant_id: str,
     analysis_run_id: str,
     articles_per_week: int,
     social_platforms: List[str],
+    social_posts_per_week: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Main entry point. Returns counts of created articles + social posts."""
+    """Main entry point. Returns counts of created articles + social posts.
+
+    ``social_posts_per_week`` controls how often we publish to each chosen
+    platform. ``None`` keeps the legacy behaviour (one social per article)
+    so older callers don't break. ``0`` disables social posts entirely.
+    """
     if not tenant_id or tenant_id == "default":
         raise ValueError("tenant_id is required and must not be 'default'")
     if articles_per_week < 1 or articles_per_week > 5:
@@ -326,6 +368,11 @@ async def create_plan_from_analysis(
 
     platforms = [p.lower().strip() for p in (social_platforms or []) if p]
     platforms = [p for p in platforms if p in SUPPORTED_PLATFORMS]
+
+    if social_posts_per_week is None:
+        social_per_week = articles_per_week
+    else:
+        social_per_week = max(0, min(7, int(social_posts_per_week)))
 
     sb = get_supabase()
 
@@ -427,6 +474,11 @@ async def create_plan_from_analysis(
     social_created = 0
     last_date: Optional[datetime] = None
 
+    # Articles built so far, in publish order. Social posts later pick a
+    # parent from this list so each post stays anchored to a real article
+    # instead of inventing one of its own.
+    article_records: List[Dict[str, Any]] = []
+
     schedule_cursor: Dict[str, int] = {"30": 0, "60": 0, "90": 0}
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -520,69 +572,87 @@ async def create_plan_from_analysis(
         elif last_date is None:
             last_date = article_date
 
-        # 6d. Generate social posts for each chosen platform
-        social_date = article_date + timedelta(days=1)
+        article_records.append({
+            "piece_id": piece_id,
+            "plan_id": article_plan_id,
+            "title": piece_data["title"],
+            "content": article.get("content") or "",
+            "target_keyword": target_keyword,
+            "scheduled_for": article_date,
+            "priority": priority,
+        })
+
+    # 7. Generate social posts for each platform on its own cadence,
+    # decoupled from the article cadence. Each post is anchored to the
+    # nearest article (by publish date) so the link/parent is stable.
+    if article_records and platforms and social_per_week > 0:
+        social_dates = _social_schedule_dates(social_per_week)
         for platform in platforms:
-            try:
-                social_piece = await generate_for_article(
-                    tenant_id=tenant_id,
-                    voice=voice,
-                    brand_name=brand_name,
-                    article_title=piece_data["title"],
-                    article_summary=(article.get("content") or "")[:1500],
-                    platform=platform,
-                    link_placeholder="{{ARTICLE_URL}}",
-                )
-            except Exception as e:
-                logger.warning(f"social generation failed ({platform}): {e}")
-                continue
+            for slot_idx, social_date in enumerate(social_dates):
+                parent = _nearest_article(article_records, social_date) \
+                    or article_records[slot_idx % len(article_records)]
+                try:
+                    social_piece = await generate_for_article(
+                        tenant_id=tenant_id,
+                        voice=voice,
+                        brand_name=brand_name,
+                        article_title=parent["title"],
+                        article_summary=parent["content"][:1500],
+                        platform=platform,
+                        link_placeholder="{{ARTICLE_URL}}",
+                    )
+                except Exception as e:
+                    logger.warning(f"social generation failed ({platform}): {e}")
+                    continue
 
-            social_piece_data = {
-                "tenant_id": tenant_id,
-                "title": f"{platform.title()} post: {piece_data['title']}"[:300],
-                "content": social_piece["content"],
-                "content_type": f"social_{platform}",
-                "target_keyword": target_keyword[:200],
-                "word_count": len(social_piece["content"].split()),
-                "status": "draft",
-                "created_by": "sama_social",
-                "parent_content_id": piece_id,
-                "source_analysis_run_id": analysis_run_id,
-                "created_at": now_iso,
-            }
-            try:
-                social_row = sb.table("content_pieces").insert(social_piece_data).execute()
-                social_piece_id = (social_row.data or [{}])[0].get("id")
-            except Exception as e:
-                logger.error(f"social content_pieces insert failed: {e}")
-                continue
-            if not social_piece_id:
-                continue
+                social_piece_data = {
+                    "tenant_id": tenant_id,
+                    "title": f"{platform.title()} post: {parent['title']}"[:300],
+                    "content": social_piece["content"],
+                    "content_type": f"social_{platform}",
+                    "target_keyword": parent["target_keyword"][:200],
+                    "word_count": len(social_piece["content"].split()),
+                    "status": "draft",
+                    "created_by": "sama_social",
+                    "parent_content_id": parent["piece_id"],
+                    "source_analysis_run_id": analysis_run_id,
+                    "created_at": now_iso,
+                }
+                try:
+                    social_row = sb.table("content_pieces").insert(social_piece_data).execute()
+                    social_piece_id = (social_row.data or [{}])[0].get("id")
+                except Exception as e:
+                    logger.error(f"social content_pieces insert failed: {e}")
+                    continue
+                if not social_piece_id:
+                    continue
 
-            social_plan_data = {
-                "tenant_id": tenant_id,
-                "title": social_piece_data["title"][:300],
-                "content_type": f"social_{platform}",
-                "target_keyword": target_keyword[:200],
-                "priority": priority,
-                "status": "draft",
-                "source": "analysis_gap",
-                "source_run_id": analysis_run_id,
-                "content_piece_id": social_piece_id,
-                "parent_plan_item_id": article_plan_id,
-                "scheduled_for": social_date.isoformat(),
-                "auto_publish_on_schedule": False,
-                "metadata": {
-                    "platform": platform,
-                    "parent_content_id": piece_id,
-                },
-                "created_at": now_iso,
-            }
-            try:
-                sb.table("content_plan_items").insert(social_plan_data).execute()
-                social_created += 1
-            except Exception as e:
-                logger.error(f"social plan_items insert failed: {e}")
+                social_plan_data = {
+                    "tenant_id": tenant_id,
+                    "title": social_piece_data["title"][:300],
+                    "content_type": f"social_{platform}",
+                    "target_keyword": parent["target_keyword"][:200],
+                    "priority": parent["priority"],
+                    "status": "draft",
+                    "source": "analysis_gap",
+                    "source_run_id": analysis_run_id,
+                    "content_piece_id": social_piece_id,
+                    "parent_plan_item_id": parent["plan_id"],
+                    "scheduled_for": social_date.isoformat(),
+                    "auto_publish_on_schedule": False,
+                    "metadata": {
+                        "platform": platform,
+                        "parent_content_id": parent["piece_id"],
+                    },
+                    "created_at": now_iso,
+                }
+                try:
+                    sb.table("content_plan_items").insert(social_plan_data).execute()
+                    social_created += 1
+                    if social_date > (last_date or social_date):
+                        last_date = social_date
+                except Exception as e:
+                    logger.error(f"social plan_items insert failed: {e}")
 
     return {
         "plan_id": analysis_run_id,
