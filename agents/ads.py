@@ -401,14 +401,14 @@ Format as JSON:
 }}
 """
         
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=2048,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=2048,
+        )
         
         try:
             rsa_data = json.loads(response.content[0].text)

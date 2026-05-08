@@ -129,11 +129,12 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
 """.strip()
 
         try:
-            msg = await asyncio.to_thread(
-                self.client.messages.create,
+            from shared.llm import call_claude
+            msg = await call_claude(
+                client=self.client,
                 model=self.model,
-                max_tokens=1500,
                 messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500,
             )
             text = msg.content[0].text.strip()
             text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
@@ -309,13 +310,14 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
     async def _claude_proxy_call(self, query: str, platform: str) -> str:
         if not self.client:
             return ""
+        from shared.llm import call_claude
         system = _ENGINE_PERSONAS.get(platform, _ENGINE_PERSONAS["claude"])
-        msg = await asyncio.to_thread(
-            self.client.messages.create,
+        msg = await call_claude(
+            client=self.client,
             model=self.model,
-            max_tokens=600,
             system=system,
             messages=[{"role": "user", "content": query}],
+            max_tokens=600,
         )
         return msg.content[0].text or ""
 

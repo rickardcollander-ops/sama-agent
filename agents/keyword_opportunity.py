@@ -322,17 +322,17 @@ Mix the 20 across:
 
 Avoid duplicates of phrases the site already targets unless extending into a long-tail variant. Output ONLY a JSON array — no prose, no markdown fences."""
 
-        def _call() -> str:
-            client = Anthropic(api_key=self.anthropic_key)
-            msg = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return msg.content[0].text or ""
+        from shared.llm import call_claude
+        client = Anthropic(api_key=self.anthropic_key)
 
         try:
-            text = await asyncio.to_thread(_call)
+            msg = await call_claude(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2200,
+            )
+            text = msg.content[0].text or ""
         except Exception as e:
             logger.info(f"keyword_opportunity LLM call failed: {e}")
             return self._fallback_suggestions(host, current_keywords)
