@@ -55,6 +55,17 @@ _BYPASS_PREFIXES = (
     "/openapi.json",
 )
 
+
+def _legacy_allowlist() -> set[str]:
+    """Tenants still allowed to use the unverified X-Tenant-ID legacy header.
+
+    Set ``LEGACY_TENANT_HEADERS_ALLOW`` to a comma-separated list of
+    tenant_ids during the deprecation window. Empty (default) means the
+    legacy header is rejected on protected paths once a JWT is required.
+    """
+    raw = os.getenv("LEGACY_TENANT_HEADERS_ALLOW", "")
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
 # Routes where tenant context is required when REQUIRE_TENANT_HEADERS is on.
 # The historical anonymous-call leak (any unauth caller saw the default
 # Successifier tenant's data) all happened through these prefixes.
@@ -68,6 +79,38 @@ _PROTECTED_PREFIXES = (
 
 def _truthy(val: Optional[str]) -> bool:
     return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_site_owner_cache: dict[str, tuple[str, float]] = {}
+_SITE_CACHE_TTL_S = 60.0
+
+
+def _site_belongs_to_account(site_id: str, account_id: str) -> bool:
+    """Cheap, cached check that ``site_id`` belongs to ``account_id``."""
+    import time
+
+    cached = _site_owner_cache.get(site_id)
+    now = time.monotonic()
+    if cached and cached[1] > now:
+        return cached[0] == account_id
+    try:
+        from shared.database import get_supabase  # local import — avoids cycle
+        sb = get_supabase()
+        if not sb:
+            return True  # fail-open if DB not configured (e.g. tests)
+        res = (
+            sb.table("user_sites")
+            .select("user_id")
+            .eq("id", site_id)
+            .limit(1)
+            .execute()
+        )
+        owner = (res.data[0]["user_id"] if res.data else "")
+        _site_owner_cache[site_id] = (owner, now + _SITE_CACHE_TTL_S)
+        return owner == account_id
+    except Exception as e:
+        logger.warning("site_owner_lookup_failed site=%s err=%s", site_id, e)
+        return True  # fail-open — log and let through; alerts surface this
 
 
 def _verify_supabase_jwt(token: str) -> Optional[str]:
@@ -128,45 +171,82 @@ class TenantMiddleware(BaseHTTPMiddleware):
             if token:
                 verified_account = _verify_supabase_jwt(token)
 
+        is_protected = any(path.startswith(p) for p in _PROTECTED_PREFIXES)
+        require_headers = _truthy(os.getenv("REQUIRE_TENANT_HEADERS"))
+        require_auth = _truthy(os.getenv("REQUIRE_AUTHENTICATED_TENANT"))
+
         if verified_account:
             # If the caller also sent X-Sama-Account-Id, reject mismatches —
             # this catches accidental cross-tenant calls and tampering.
             if header_account_id and header_account_id != verified_account:
+                logger.warning(
+                    "tenant_mismatch account=%s header=%s path=%s",
+                    verified_account, header_account_id, path,
+                )
                 return JSONResponse(
                     status_code=403,
-                    content={
-                        "detail": "X-Sama-Account-Id does not match authenticated user",
-                    },
+                    content={"detail": "X-Sama-Account-Id does not match authenticated user"},
                 )
             # Same check for the legacy header so old clients can't slip past.
             if legacy_tid and not header_account_id and legacy_tid != verified_account:
+                logger.warning(
+                    "legacy_tenant_mismatch account=%s legacy=%s path=%s",
+                    verified_account, legacy_tid, path,
+                )
                 return JSONResponse(
                     status_code=403,
-                    content={
-                        "detail": "X-Tenant-ID does not match authenticated user",
-                    },
+                    content={"detail": "X-Tenant-ID does not match authenticated user"},
                 )
+            # If client sent X-Sama-Site-Id, verify the site belongs to the
+            # authenticated account before honouring it. Skipped when
+            # STRICT_SITE_VALIDATION is off to avoid an extra round-trip on
+            # every request — dashboard proxy already validates server-side.
+            if header_site_id and _truthy(os.getenv("STRICT_SITE_VALIDATION")):
+                if not _site_belongs_to_account(header_site_id, verified_account):
+                    logger.warning(
+                        "site_mismatch account=%s site=%s path=%s",
+                        verified_account, header_site_id, path,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "X-Sama-Site-Id does not belong to authenticated account"},
+                    )
             account_id = verified_account
             authenticated = True
         else:
+            # No JWT. Decide what to do with header-only callers.
+            if is_protected and require_auth:
+                logger.info("auth_required path=%s", path)
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required for protected route"},
+                )
+            # Legacy X-Tenant-ID is unverified and trivially spoofable. Only
+            # honour it for tenants on the explicit allowlist during the
+            # deprecation window.
+            if legacy_tid and legacy_tid not in _legacy_allowlist():
+                logger.warning(
+                    "legacy_header_rejected tenant=%s path=%s "
+                    "(add to LEGACY_TENANT_HEADERS_ALLOW or migrate to JWT)",
+                    legacy_tid, path,
+                )
+                legacy_tid = None
+            elif legacy_tid:
+                logger.info("legacy_header_used tenant=%s path=%s", legacy_tid, path)
             account_id = header_account_id or legacy_tid
             authenticated = False
 
         site_id = header_site_id or legacy_tid
 
         # Enforcement: protected routes must carry a tenant context when
-        # REQUIRE_TENANT_HEADERS is on. We only enforce on protected prefixes
-        # so unauthed health/usage calls keep working.
-        require = _truthy(os.getenv("REQUIRE_TENANT_HEADERS"))
-        is_protected = any(path.startswith(p) for p in _PROTECTED_PREFIXES)
-        if require and is_protected and not account_id:
+        # REQUIRE_TENANT_HEADERS is on.
+        if require_headers and is_protected and not account_id:
             return JSONResponse(
                 status_code=400,
                 content={
                     "detail": (
                         "Missing tenant context — send X-Sama-Account-Id "
-                        "(or X-Tenant-ID for legacy callers, or a Supabase "
-                        "Bearer token)."
+                        "(or a Supabase Bearer token)."
                     ),
                 },
             )

@@ -1,15 +1,25 @@
 """
 Database connection and initialization
-Uses Supabase REST API for cloud-hosted PostgreSQL
+Uses Supabase REST API for cloud-hosted PostgreSQL.
+
+The supabase-py client is sync. Calling it from an async route blocks the
+FastAPI event loop until the HTTP round-trip returns; with ~10 RPS this
+exhausts the loop. Helpers below run the sync client on a thread pool via
+``asyncio.to_thread`` — non-breaking and ~ free, lets us keep the existing
+fluent-builder API while unblocking the loop. ``DB_BACKEND=async`` is
+reserved for the eventual asyncpg migration.
 """
 
+import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 from supabase import create_client, Client
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Supabase client (initialized lazily)
 _supabase_client: Optional[Client] = None
@@ -24,6 +34,15 @@ def get_supabase() -> Client:
         _supabase_client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
         logger.info("✅ Supabase client initialized")
     return _supabase_client
+
+
+async def run_db(fn: Callable[[], T]) -> T:
+    """Run a sync supabase-py call on a thread so the event loop stays free.
+
+    Usage:
+        result = await run_db(lambda: get_supabase().table("x").select("*").execute())
+    """
+    return await asyncio.to_thread(fn)
 
 
 # Backwards compatibility aliases
@@ -155,41 +174,51 @@ class SupabaseDB:
     @staticmethod
     async def insert(table: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Insert a row"""
-        result = get_supabase().table(table).insert(data).execute()
+        def _exec():
+            return get_supabase().table(table).insert(data).execute()
+        result = await run_db(_exec)
         return result.data[0] if result.data else {}
-    
+
     @staticmethod
     async def select(table: str, columns: str = "*", filters: Optional[Dict] = None, limit: int = 100) -> List[Dict]:
         """Select rows"""
-        query = get_supabase().table(table).select(columns).limit(limit)
-        if filters:
-            for key, value in filters.items():
-                query = query.eq(key, value)
-        result = query.execute()
+        def _exec():
+            query = get_supabase().table(table).select(columns).limit(limit)
+            if filters:
+                for key, value in filters.items():
+                    query = query.eq(key, value)
+            return query.execute()
+        result = await run_db(_exec)
         return result.data or []
-    
+
     @staticmethod
     async def update(table: str, filters: Dict[str, Any], data: Dict[str, Any]) -> List[Dict]:
         """Update rows"""
-        query = get_supabase().table(table).update(data)
-        for key, value in filters.items():
-            query = query.eq(key, value)
-        result = query.execute()
+        def _exec():
+            query = get_supabase().table(table).update(data)
+            for key, value in filters.items():
+                query = query.eq(key, value)
+            return query.execute()
+        result = await run_db(_exec)
         return result.data or []
-    
+
     @staticmethod
     async def delete(table: str, filters: Dict[str, Any]) -> bool:
         """Delete rows"""
-        query = get_supabase().table(table).delete()
-        for key, value in filters.items():
-            query = query.eq(key, value)
-        query.execute()
+        def _exec():
+            query = get_supabase().table(table).delete()
+            for key, value in filters.items():
+                query = query.eq(key, value)
+            return query.execute()
+        await run_db(_exec)
         return True
-    
+
     @staticmethod
     async def upsert(table: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Upsert a row"""
-        result = get_supabase().table(table).upsert(data).execute()
+        def _exec():
+            return get_supabase().table(table).upsert(data).execute()
+        result = await run_db(_exec)
         return result.data[0] if result.data else {}
 
 

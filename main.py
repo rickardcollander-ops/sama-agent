@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
+import os
 import traceback
 from typing import AsyncGenerator
 
@@ -37,6 +38,8 @@ from shared.config import settings
 from shared.database import init_db, get_supabase
 from shared import scheduler as job_scheduler
 from shared.event_bus_registry import set_event_bus, get_event_bus
+from shared.observability import init_sentry, install_logging_redaction
+from shared.structured_log import configure_structured_logging
 from shared.tenant_middleware import TenantMiddleware
 
 # Configure logging
@@ -50,6 +53,9 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan manager"""
+    configure_structured_logging(settings.LOG_LEVEL)
+    init_sentry()
+    install_logging_redaction()
     logger.info("🚀 Starting SAMA 2.0...")
 
     # Initialize Supabase connection
@@ -101,23 +107,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     if hasattr(event_bus, "start_consumer"):
         await event_bus.start_consumer()
 
-    # Start proactive agent monitor loop
-    monitor = None
-    try:
-        from shared.agent_monitor import AgentMonitorLoop, register_default_watchers
-        monitor = AgentMonitorLoop()
-        register_default_watchers(monitor)
-        await monitor.start()
-        logger.info("✅ Agent monitor loop started")
-    except Exception as e:
-        logger.warning(f"⚠️ Monitor loop failed to start: {e}")
+    # Background jobs (scheduler + monitor) only run in the worker process.
+    # Web replicas: leave RUN_BACKGROUND_JOBS unset → scheduler stays off, no
+    # double-fired jobs across replicas. The dedicated `worker.py` entry-point
+    # sets RUN_BACKGROUND_JOBS=1.
+    run_bg = os.getenv("RUN_BACKGROUND_JOBS", "").lower() in ("1", "true", "yes", "on")
 
-    # Start job scheduler
-    try:
-        job_scheduler.start()
-        logger.info("✅ Scheduler started")
-    except Exception as e:
-        logger.warning(f"⚠️ Scheduler failed to start: {e}")
+    monitor = None
+    if run_bg:
+        try:
+            from shared.agent_monitor import AgentMonitorLoop, register_default_watchers
+            monitor = AgentMonitorLoop()
+            register_default_watchers(monitor)
+            await monitor.start()
+            logger.info("✅ Agent monitor loop started")
+        except Exception as e:
+            logger.warning(f"⚠️ Monitor loop failed to start: {e}")
+
+        try:
+            job_scheduler.start()
+            logger.info("✅ Scheduler started")
+        except Exception as e:
+            logger.warning(f"⚠️ Scheduler failed to start: {e}")
+    else:
+        logger.info("ℹ️ Background jobs disabled (RUN_BACKGROUND_JOBS unset). Web-only process.")
 
     logger.info("🎯 SAMA 2.0 is ready!")
 
@@ -129,7 +142,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     if event_bus:
         await event_bus.disconnect()
     set_event_bus(None)
-    job_scheduler.stop()
+    if run_bg:
+        job_scheduler.stop()
     logger.info("👋 SAMA 2.0 shutting down")
 
 
@@ -141,30 +155,69 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Body-size + request-timeout middleware (must register BEFORE CORS so the
+# 413/504 responses still get the right CORS headers from CORSMiddleware).
+from shared.limits_middleware import MaxBodySizeMiddleware, TimeoutMiddleware  # noqa: E402
+app.add_middleware(TimeoutMiddleware)
+app.add_middleware(MaxBodySizeMiddleware)
+
 # Tenant middleware - extracts tenant_id from requests
 app.add_middleware(TenantMiddleware)
 
-# CORS middleware - allow all origins for now to fix deployment issues
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins temporarily
-    allow_credentials=False,  # Must be False when allow_origins is "*"
-    allow_methods=["*"],
-    allow_headers=["*"],
+# CORS — strict allowlist driven by config (CORS_ORIGINS) plus an env override
+# CORS_ALLOWED_ORIGINS for ops to widen/narrow without a deploy. Wildcard is
+# only honoured when CORS_DEV_PERMISSIVE=1 (staging/dev only). Production must
+# never set that flag.
+import os as _os
+
+_origins_env = _os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+_dev_permissive = _os.getenv("CORS_DEV_PERMISSIVE", "").lower() in ("1", "true", "yes", "on")
+
+if _origins_env:
+    _allow_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
+elif _dev_permissive:
+    _allow_origins = ["*"]
+else:
+    _allow_origins = list(settings.CORS_ORIGINS)
+
+# CORS_ORIGINS may contain glob-style entries like "https://*.vercel.app". The
+# stock CORSMiddleware doesn't expand these, so split them into the regex param.
+_exact_origins: list[str] = []
+_regex_parts: list[str] = []
+for o in _allow_origins:
+    if "*" in o:
+        _regex_parts.append(o.replace(".", r"\.").replace("*", "[^/]+"))
+    else:
+        _exact_origins.append(o)
+_allow_origin_regex = "|".join(_regex_parts) if _regex_parts else None
+
+logger.info(
+    "CORS configured: exact=%s regex=%s permissive=%s",
+    _exact_origins, _allow_origin_regex, _dev_permissive,
 )
 
-# Global exception handler - ensures CORS headers are always sent even on crashes
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_exact_origins if not _dev_permissive else ["*"],
+    allow_origin_regex=_allow_origin_regex,
+    allow_credentials=not _dev_permissive,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization", "Content-Type",
+        "X-Sama-Account-Id", "X-Sama-Site-Id", "X-Sama-Site-Domain",
+        "X-Sama-Intent", "X-Tenant-ID", "X-Request-Id",
+    ],
+)
+
+# Global exception handler. The stock CORSMiddleware will attach the right
+# Access-Control-* headers automatically based on the request's Origin, so
+# exception handlers must NOT echo "*" — that bypasses the allowlist above.
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}\n{traceback.format_exc()}")
+    logger.exception("Unhandled error path=%s", request.url.path)
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc), "type": type(exc).__name__},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-        }
+        content={"detail": "Internal server error"},
     )
 
 @app.exception_handler(HTTPException)
@@ -172,11 +225,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-        }
     )
 
 # Include routers
