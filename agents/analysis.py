@@ -35,6 +35,150 @@ logger = logging.getLogger(__name__)
 # Default platforms when caller doesn't specify. Matches frontend defaults.
 DEFAULT_PLATFORMS = ["chatgpt", "claude", "perplexity", "google_aio"]
 
+
+# ISO-639-1 → human-readable name. Used both in the LLM prompt (so Claude
+# generates queries in the right language) and in the deterministic fallback
+# templates below. Mirrors the LANGUAGE_MAP in api/routes/content_generate.py
+# so a tenant's content language and AI-visibility language stay in sync.
+_LANGUAGE_NAMES: Dict[str, str] = {
+    "en": "English",
+    "sv": "Swedish",
+    "nb": "Norwegian",
+    "no": "Norwegian",
+    "da": "Danish",
+    "fi": "Finnish",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "nl": "Dutch",
+    "pt": "Portuguese",
+    "pl": "Polish",
+    "cs": "Czech",
+    "ru": "Russian",
+    "ja": "Japanese",
+    "zh": "Chinese",
+}
+
+
+# Localized templates for the deterministic fallback path (used when the LLM
+# is unavailable or the API call fails). Each entry produces queries in the
+# tenant's language so the fallback never silently regresses to English.
+# {category} and {audience} are interpolated; {competitor} is only used in
+# competitor-anchored slots.
+_FALLBACK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
+    "en": {
+        "core": [
+            "Best {category} for {audience}",
+            "Top {category} for {audience} in 2025",
+            "How to choose {category}",
+            "{category} pricing benchmarks",
+            "{category} reviews and ratings",
+            "Most popular {category}",
+            "What should I look for when buying {category}?",
+            "{category} use cases for {audience}",
+        ],
+        "with_competitor": [
+            "Best alternatives to {competitor}",
+            "{competitor} vs competitors",
+        ],
+        "without_competitor": [
+            "Leading vendors in {category}",
+            "Recommended {category} for growing teams",
+        ],
+        "default_audience": "B2B teams",
+        "default_category": "tools in this category",
+    },
+    "sv": {
+        "core": [
+            "Bästa {category} för {audience}",
+            "Topp {category} för {audience} 2025",
+            "Hur väljer man {category}",
+            "Prisjämförelse för {category}",
+            "Recensioner och betyg av {category}",
+            "Mest populära {category}",
+            "Vad ska man tänka på när man köper {category}",
+            "Användningsfall för {category} för {audience}",
+        ],
+        "with_competitor": [
+            "Bästa alternativen till {competitor}",
+            "{competitor} jämfört med konkurrenter",
+        ],
+        "without_competitor": [
+            "Ledande leverantörer av {category}",
+            "Rekommenderade {category} för växande team",
+        ],
+        "default_audience": "B2B-team",
+        "default_category": "verktyg i den här kategorin",
+    },
+    "nb": {
+        "core": [
+            "Beste {category} for {audience}",
+            "Topp {category} for {audience} i 2025",
+            "Hvordan velge {category}",
+            "Prissammenligning for {category}",
+            "Anmeldelser og vurderinger av {category}",
+            "Mest populære {category}",
+            "Hva bør man se etter når man kjøper {category}",
+            "Bruksområder for {category} for {audience}",
+        ],
+        "with_competitor": [
+            "Beste alternativene til {competitor}",
+            "{competitor} sammenlignet med konkurrenter",
+        ],
+        "without_competitor": [
+            "Ledende leverandører av {category}",
+            "Anbefalte {category} for voksende team",
+        ],
+        "default_audience": "B2B-team",
+        "default_category": "verktøy i denne kategorien",
+    },
+    "da": {
+        "core": [
+            "Bedste {category} til {audience}",
+            "Top {category} til {audience} i 2025",
+            "Sådan vælger du {category}",
+            "Prissammenligning for {category}",
+            "Anmeldelser og vurderinger af {category}",
+            "Mest populære {category}",
+            "Hvad skal man kigge efter, når man køber {category}",
+            "Brugsscenarier for {category} til {audience}",
+        ],
+        "with_competitor": [
+            "Bedste alternativer til {competitor}",
+            "{competitor} sammenlignet med konkurrenter",
+        ],
+        "without_competitor": [
+            "Førende leverandører af {category}",
+            "Anbefalede {category} til voksende teams",
+        ],
+        "default_audience": "B2B-teams",
+        "default_category": "værktøjer i denne kategori",
+    },
+    "de": {
+        "core": [
+            "Beste {category} für {audience}",
+            "Top {category} für {audience} im Jahr 2025",
+            "Wie wählt man {category} aus",
+            "Preisvergleich für {category}",
+            "Bewertungen und Rezensionen von {category}",
+            "Beliebteste {category}",
+            "Worauf sollte man beim Kauf von {category} achten",
+            "Anwendungsfälle für {category} bei {audience}",
+        ],
+        "with_competitor": [
+            "Beste Alternativen zu {competitor}",
+            "{competitor} im Vergleich zu Wettbewerbern",
+        ],
+        "without_competitor": [
+            "Führende Anbieter von {category}",
+            "Empfohlene {category} für wachsende Teams",
+        ],
+        "default_audience": "B2B-Teams",
+        "default_category": "Werkzeuge in dieser Kategorie",
+    },
+}
+
 # Persona prompts for AI engines we don't have direct API access to. We use
 # Claude as a proxy with engine-specific system prompts (same approach as the
 # existing AIVisibilityAgent so output style matches the engine's character).
@@ -85,6 +229,7 @@ class AnalysisAgent:
         self.brand_name = (tenant_config.brand_name if tenant_config else "Successifier") or "Brand"
         self.domain = (tenant_config.domain if tenant_config else "successifier.com") or ""
         self.competitors = list(tenant_config.competitors) if tenant_config else []
+        self.language = (getattr(tenant_config, "language", None) if tenant_config else None) or "en"
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -92,7 +237,9 @@ class AnalysisAgent:
         """
         Use the LLM to generate `count` buyer-intent queries from the tenant's
         brand context. Falls back to deterministic templates if the LLM is
-        unavailable.
+        unavailable. The queries are produced in the tenant's configured
+        language (``content_language`` or domain-TLD inferred), so a customer
+        on ``vexdigitalt.se`` gets Swedish prompts instead of English ones.
         """
         if not self.client:
             return self._fallback_queries(count)
@@ -104,6 +251,8 @@ class AnalysisAgent:
             usp = (self.tenant_config.get_raw("unique_selling_points") or "").strip()
             audience = (self.tenant_config.get_raw("target_audience") or "").strip()
             description = (self.tenant_config.get_raw("brand_description") or "").strip()
+
+        language_name = _LANGUAGE_NAMES.get(self.language, "English")
 
         prompt = f"""Generate {count} buyer-intent search queries that prospects would ask Google or AI assistants when looking for a tool in this category.
 
@@ -119,7 +268,11 @@ to measure unbiased brand visibility. The queries MUST NOT contain the brand nam
 or the domain "{self.domain}" — if the AI sees the brand in the prompt, the result is biased and
 worthless. Phrase every query from the perspective of a buyer who has NOT yet heard of the brand.
 
-Mix (all phrased generically, never naming the brand):
+LANGUAGE: Write every query in {language_name}. Do not mix languages. This must match the
+language a buyer in the brand's market would actually type into Google or ChatGPT — anything
+else underestimates real-world visibility.
+
+Mix (all phrased generically in {language_name}, never naming the brand):
 - Comparison ("best alternative to <competitor>", "<competitor A> vs <competitor B>")
 - Discovery ("best tool for <use case>", "top tools for <audience>")
 - Decision ("is <category> worth it", "<category> pricing benchmarks", "<category> reviews")
@@ -424,34 +577,27 @@ Respond with JSON only — an array of {count} strings. No prose, no markdown fe
     def _fallback_queries(self, count: int) -> List[str]:
         # Templates intentionally avoid the brand name and domain — these queries
         # are sent to AI assistants to measure unbiased visibility, so the AI
-        # must not see the brand in the prompt.
+        # must not see the brand in the prompt. Templates are picked from
+        # _FALLBACK_TEMPLATES by tenant language so a Swedish tenant doesn't
+        # get English fallbacks when the LLM call fails.
+        bundle = _FALLBACK_TEMPLATES.get(self.language) or _FALLBACK_TEMPLATES["en"]
+
         audience = ""
         category = ""
         if self.tenant_config:
             audience = (self.tenant_config.get_raw("target_audience") or "").strip()
             category = (self.tenant_config.get_raw("category") or "").strip()
-        audience = audience or "B2B teams"
-        category = category or "tools in this category"
+        audience = audience or bundle["default_audience"]
+        category = category or bundle["default_category"]
         first_competitor = self.competitors[0] if self.competitors else None
 
-        templates = [
-            f"Best {category} for {audience}",
-            f"Top {category} for {audience} in 2025",
-            f"How to choose {category}",
-            f"{category} pricing benchmarks",
-            f"{category} reviews and ratings",
-            f"Most popular {category}",
-            f"What should I look for when buying {category}?",
-            f"{category} use cases for {audience}",
-        ]
+        templates = [t.format(category=category, audience=audience) for t in bundle["core"]]
         if first_competitor:
-            templates.extend([
-                f"Best alternatives to {first_competitor}",
-                f"{first_competitor} vs competitors",
-            ])
+            templates.extend(
+                t.format(competitor=first_competitor) for t in bundle["with_competitor"]
+            )
         else:
-            templates.extend([
-                f"Leading vendors in {category}",
-                f"Recommended {category} for growing teams",
-            ])
+            templates.extend(
+                t.format(category=category, audience=audience) for t in bundle["without_competitor"]
+            )
         return self._strip_brand_queries(templates)[:count]

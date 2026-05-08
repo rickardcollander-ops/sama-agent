@@ -119,6 +119,64 @@ class TenantConfig:
             return [q for q in val if isinstance(q, str) and q.strip()]
         return []
 
+    # ── Locale ────────────────────────────────────────────────────────────
+    #
+    # Used by the analysis / AI visibility agents to generate buyer-intent
+    # query suggestions in the customer's own language. ``content_language``
+    # already drives content generation; we reuse it here so the dashboard
+    # only has one language switch. When unset, the country-code TLD on the
+    # tenant's domain is a strong hint (e.g. ``.se`` → Swedish), which keeps
+    # auto-suggestions sensible for new tenants who haven't set the field yet.
+
+    _TLD_LANGUAGE_MAP: Dict[str, str] = {
+        "se": "sv",
+        "no": "nb",
+        "dk": "da",
+        "fi": "fi",
+        "de": "de",
+        "at": "de",
+        "ch": "de",
+        "fr": "fr",
+        "es": "es",
+        "it": "it",
+        "nl": "nl",
+        "be": "nl",
+        "pt": "pt",
+        "pl": "pl",
+        "cz": "cs",
+        "ru": "ru",
+        "jp": "ja",
+        "cn": "zh",
+        "br": "pt",
+        "mx": "es",
+    }
+
+    @property
+    def language(self) -> str:
+        """ISO-639-1 code for the tenant's preferred language.
+
+        Resolution order:
+          1. Explicit ``content_language`` in tenant settings (set in the UI)
+          2. Country-code TLD on the configured domain (``.se`` → ``sv`` etc.)
+          3. ``"en"`` as the safe default
+        """
+        explicit = self._str_or_empty(self._settings.get("content_language"))
+        if explicit:
+            return explicit.lower()
+        domain = self.domain.lower()
+        if domain:
+            # Strip scheme and any path so domains stored as "https://x.no/y"
+            # still parse to the bare host before TLD extraction.
+            import re as _re
+            host = _re.sub(r"^https?://", "", domain).split("/")[0]
+            if host.startswith("www."):
+                host = host[4:]
+            if "." in host:
+                tld = host.rsplit(".", 1)[-1]
+                if tld in self._TLD_LANGUAGE_MAP:
+                    return self._TLD_LANGUAGE_MAP[tld]
+        return "en"
+
     # ── Analytics ─────────────────────────────────────────────────────
 
     @property

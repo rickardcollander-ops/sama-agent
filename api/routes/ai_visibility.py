@@ -161,14 +161,26 @@ async def run_check(request: Request):
     Kick off a monitoring run in a background thread.
     For tenant requests, build a per-tenant agent so the run uses the
     user's saved geo_queries, brand name and competitors.
+
+    Tenants without any saved ``geo_queries`` get a 400 instead of a silent
+    auto-generated run — the previous behaviour ran English fallback prompts
+    that no one had configured, which broke the "only what you put in AI
+    Assistant gets measured" contract the dashboard surfaces to users.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
     if tenant_id and tenant_id != "default":
         config = await get_tenant_config(tenant_id)
+        if not config.geo_queries:
+            return {
+                "status": "skipped",
+                "error": "no_saved_queries",
+                "message": (
+                    "No queries configured. Add the prompts you want measured "
+                    "under AI Assistant before running a check."
+                ),
+            }
         agent = AIVisibilityAgent(tenant_config=config)
         label = f"tenant={tenant_id}"
-        if not config.geo_queries:
-            logger.warning(f"Tenant {tenant_id} has no geo_queries configured; falling back to default prompts")
     else:
         agent = ai_visibility_agent
         label = "default"

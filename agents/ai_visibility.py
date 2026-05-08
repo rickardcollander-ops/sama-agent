@@ -299,30 +299,29 @@ class AIVisibilityAgent:
     def _build_prompt_categories(self) -> Dict[str, List[str]]:
         """Return the prompts to monitor for this tenant's brand.
 
-        Order of preference:
-          1. Saved GEO queries from the dashboard (per-site).
-          2. Auto-generated queries built from the tenant's brand_name,
-             domain and competitors. We build them per-tenant so a customer
-             on ``onlinesverige.se`` doesn't see runs for "Successifier vs
-             Notion" — that was the failure mode reported in the GEO panel
-             when no saved queries existed and the agent fell back to
-             MONITORING_PROMPTS.
-          3. ``MONITORING_PROMPTS`` only when there is no tenant_config
-             at all (legacy default-tenant runs). For any real tenant
-             without configured queries we'd rather generate from the
-             brand context than leak someone else's competitor names.
+        We *only* measure queries that the user explicitly saved under
+        AI Assistant (``tenant_config.geo_queries``). Auto-generated and
+        hardcoded English defaults were previously used as fallbacks, but
+        that meant tenants saw English customer-success prompts measured
+        for their Swedish brand without ever opting in. The contract now
+        is: nothing is measured that the user didn't add themselves.
+
+        Returns an empty dict when nothing is saved; callers (run_monitoring)
+        skip the cycle in that case.
         """
         if self.tenant_config and self.tenant_config.geo_queries:
             saved = self._strip_brand_from_prompts(list(self.tenant_config.geo_queries))
             if saved:
                 return {"user_query": saved}
 
-        if self.tenant_config:
-            generated = self._generate_default_queries()
-            if generated:
-                return {"user_query": generated}
+        # Legacy default-tenant path (no tenant_config at all): keep the old
+        # behaviour so internal smoke tests / cron jobs that target the
+        # singleton agent still emit some traffic. Every real tenant has a
+        # tenant_config and therefore takes the "saved-only" branch above.
+        if not self.tenant_config:
+            return MONITORING_PROMPTS
 
-        return MONITORING_PROMPTS
+        return {}
 
     def _generate_default_queries(self) -> List[str]:
         """Build a small starter set of monitoring prompts from tenant context.
@@ -405,13 +404,32 @@ class AIVisibilityAgent:
         (e.g. "3/16 prompts checked"). The ActiveRunsBanner reads that, so
         the user gets live progress instead of a static spinner.
         """
+        tenant_id = self.tenant_config.tenant_id if self.tenant_config else None
+        prompt_categories = self._build_prompt_categories()
+        prompts_total = sum(len(p) for p in prompt_categories.values())
+
+        # Refuse to run when the tenant hasn't saved any queries — measuring
+        # auto-generated prompts here would silently violate the "only what
+        # you put in AI Assistant gets measured" guarantee. Done before the
+        # Supabase handle is grabbed so tests/agents that aren't pointed at a
+        # database can still call run_monitoring as a no-op.
+        if prompts_total == 0:
+            logger.info(
+                "AI visibility: no saved geo_queries for tenant=%s; skipping cycle",
+                tenant_id or "default",
+            )
+            return {
+                "checks_run": 0,
+                "mention_rate": None,
+                "gaps_created": 0,
+                "results": [],
+                "skipped_reason": "no_saved_queries",
+            }
+
         sb = get_supabase()
         results: List[Dict[str, Any]] = []
         gaps_created = 0
         run_id = str(uuid.uuid4())[:8]  # short ID to group this run's checks
-        tenant_id = self.tenant_config.tenant_id if self.tenant_config else None
-        prompt_categories = self._build_prompt_categories()
-        prompts_total = sum(len(p) for p in prompt_categories.values())
         prompts_done = 0
 
         def _publish_progress(latest_prompt: Optional[str] = None) -> None:
