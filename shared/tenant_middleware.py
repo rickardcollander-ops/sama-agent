@@ -13,14 +13,20 @@ Resolution order for ``account_id`` / ``site_id``:
 2. Legacy ``X-Tenant-ID`` header (mapped to *both* account_id and site_id —
    this is the bridge for callers that haven't migrated yet)
 3. Supabase JWT ``sub`` claim (legacy single-tenant deployments)
-4. ``"default"`` fallback (only honoured when ``REQUIRE_TENANT_HEADERS`` is
-   not enabled and the path is unprotected)
+4. ``"default"`` sentinel — set on bypass paths only (health, auth, webhooks).
+   Data-bearing routes never reach this fallback; see enforcement below.
 
-When ``REQUIRE_TENANT_HEADERS`` is set to a truthy value, requests to the
-protected API prefixes below must carry an ``X-Sama-Account-Id`` (or fall back
-to a verified JWT, or the legacy ``X-Tenant-ID``) — anything else gets a
-400. This locks out the anonymous-call class that historically returned
-Successifier data to callers who never identified themselves.
+Protected API prefixes (data-bearing routes) reject any request that doesn't
+resolve to a real ``account_id`` — either a verified Supabase JWT, an
+explicit ``X-Sama-Account-Id`` header, or an allowlisted ``X-Tenant-ID``.
+The fallback to the legacy ``"default"`` tenant is gone by default because
+that partition holds the original Successifier rows from before multi-
+tenancy and was leaking to any caller who arrived without identification.
+
+To restore the historical permissive behaviour (e.g. for ad-hoc scripts
+during a migration window), set ``ALLOW_ANONYMOUS_TENANT_FALLBACK=1``. The
+older ``REQUIRE_TENANT_HEADERS`` flag is still honoured but is now
+redundant — protection is on by default.
 
 ``request.state`` is populated with:
 - ``request.state.tenant_id``   — best-effort tenant identifier (site_id when
@@ -66,14 +72,30 @@ def _legacy_allowlist() -> set[str]:
     raw = os.getenv("LEGACY_TENANT_HEADERS_ALLOW", "")
     return {t.strip() for t in raw.split(",") if t.strip()}
 
-# Routes where tenant context is required when REQUIRE_TENANT_HEADERS is on.
-# The historical anonymous-call leak (any unauth caller saw the default
-# Successifier tenant's data) all happened through these prefixes.
+# Routes where tenant context is required. Anything tagged here that arrives
+# without a resolved account/site context (no JWT, no X-Sama-Account-Id, no
+# allowlisted X-Tenant-ID) is rejected — rather than silently falling
+# through to the legacy ``"default"`` tenant, which holds the original
+# Successifier rows from before multi-tenancy and would leak to any caller.
 _PROTECTED_PREFIXES = (
     "/api/seo/",
     "/api/ai-visibility/",
     "/api/content/",
     "/api/strategy/",
+    "/api/dashboard/",
+    "/api/analytics/",
+    "/api/ads/",
+    "/api/social/",
+    "/api/reviews/",
+    "/api/agents/",
+    "/api/alerts/",
+    "/api/leads/",
+    "/api/notifications/",
+    "/api/automation/",
+    "/api/improvements/",
+    "/api/orchestrator/",
+    "/api/gtm/",
+    "/api/goals/",
 )
 
 
@@ -147,6 +169,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
             request.state.site_id = None
             request.state.site_domain = None
             request.state.authenticated = False
+            request.state.tenant_resolved = False
             return await call_next(request)
 
         # New explicit tenant headers from the dashboard
@@ -172,7 +195,10 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 verified_account = _verify_supabase_jwt(token)
 
         is_protected = any(path.startswith(p) for p in _PROTECTED_PREFIXES)
-        require_headers = _truthy(os.getenv("REQUIRE_TENANT_HEADERS"))
+        # Protection is on by default; the legacy opt-in flag is still
+        # honoured but redundant. Set ALLOW_ANONYMOUS_TENANT_FALLBACK=1 to
+        # restore the old permissive behaviour during a migration window.
+        allow_anon_fallback = _truthy(os.getenv("ALLOW_ANONYMOUS_TENANT_FALLBACK"))
         require_auth = _truthy(os.getenv("REQUIRE_AUTHENTICATED_TENANT"))
 
         if verified_account:
@@ -238,15 +264,20 @@ class TenantMiddleware(BaseHTTPMiddleware):
 
         site_id = header_site_id or legacy_tid
 
-        # Enforcement: protected routes must carry a tenant context when
-        # REQUIRE_TENANT_HEADERS is on.
-        if require_headers and is_protected and not account_id:
+        # Enforcement: protected routes must carry a tenant context. Without
+        # this, anonymous callers fall through to ``DEFAULT_TENANT_ID`` and
+        # see the legacy Successifier partition.
+        if is_protected and not account_id and not allow_anon_fallback:
+            logger.warning(
+                "tenant_required path=%s authenticated=%s",
+                path, authenticated,
+            )
             return JSONResponse(
-                status_code=400,
+                status_code=401,
                 content={
                     "detail": (
-                        "Missing tenant context — send X-Sama-Account-Id "
-                        "(or a Supabase Bearer token)."
+                        "Missing tenant context — send a Supabase Bearer "
+                        "token or X-Sama-Account-Id."
                     ),
                 },
             )
@@ -254,11 +285,13 @@ class TenantMiddleware(BaseHTTPMiddleware):
         # tenant_id is the field every existing route reads. Prefer site_id
         # (the granular dimension), fall back to account_id, then 'default'.
         tenant_id = site_id or account_id or DEFAULT_TENANT_ID
+        tenant_resolved = bool(site_id or account_id)
 
         request.state.tenant_id = tenant_id
         request.state.account_id = account_id
         request.state.site_id = site_id
         request.state.site_domain = header_site_domain
         request.state.authenticated = authenticated
+        request.state.tenant_resolved = tenant_resolved
 
         return await call_next(request)
