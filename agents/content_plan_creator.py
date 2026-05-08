@@ -179,17 +179,15 @@ Return ONLY a JSON array of {len(topics)} objects, in the same order:
   }}
 ]
 """
+    from shared.llm import call_claude
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-    def _call():
-        return client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-
-    response = await asyncio.to_thread(_call)
+    response = await call_claude(
+        client=client,
+        model=MODEL,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=2048,
+    )
     text = response.content[0].text.strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1]
@@ -234,17 +232,15 @@ Return ONLY a JSON object (no markdown fences) with:
 }}
 Reminder: NEVER use em-dashes. Use commas or periods instead.
 """
+    from shared.llm import call_claude
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-    def _call():
-        return client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-
-    response = await asyncio.to_thread(_call)
+    response = await call_claude(
+        client=client,
+        model=MODEL,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=4096,
+    )
     text = response.content[0].text.strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1]

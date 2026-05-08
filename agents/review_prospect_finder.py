@@ -172,15 +172,14 @@ Return JSON:
 }}"""
 
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=3000,
-                    system=self.SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                system=self.SYSTEM_PROMPT,
+                max_tokens=3000,
+            )
             text = response.content[0].text
             json_match = re.search(r'\{[\s\S]*\}', text)
             if json_match:
@@ -237,15 +236,14 @@ Return JSON:
 }}"""
 
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2500,
-                    system=self.SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                system=self.SYSTEM_PROMPT,
+                max_tokens=2500,
+            )
             text = response.content[0].text
             json_match = re.search(r'\{[\s\S]*\}', text)
             if json_match:

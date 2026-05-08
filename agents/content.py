@@ -114,14 +114,14 @@ Format as markdown with proper headings.
 """
         
         # Generate content
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=4096,
+        )
 
         content = response.content[0].text
 
@@ -226,14 +226,14 @@ Requirements:
 Format as markdown.
 """
         
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=4096,
+        )
 
         content = response.content[0].text
         lines = content.split('\n')
@@ -307,14 +307,14 @@ Requirements:
 Format as markdown.
 """
         
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=4096,
+        )
 
         content = response.content[0].text
         title = f"Successifier vs {competitor.title()}"
@@ -399,14 +399,14 @@ Requirements:
 Format: Plain text, no special formatting.
 """
         
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=1024,
+        )
 
         content = response.content[0].text.strip()
 
@@ -487,13 +487,13 @@ Requirements:
 - Engaging and click-worthy
 """
         
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+        )
 
         return response.content[0].text.strip()
     
@@ -596,14 +596,14 @@ ORIGINAL CONTENT:
 Return ONLY the optimized content in markdown format. Do not include any commentary or explanation."""
 
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                )
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                messages=[{"role": "user", "content": user_prompt}],
+                system=system_prompt,
+                max_tokens=4096,
+            )
             optimized = response.content[0].text.strip()
 
             # Validate the optimization didn't drastically shrink the content

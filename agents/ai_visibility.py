@@ -199,15 +199,13 @@ class AIVisibilityAgent:
         if not self.client:
             return ""
         try:
-            msg = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.client.messages.create,
-                    model=settings.CLAUDE_MODEL,
-                    max_tokens=800,
-                    system=engine_config["system"],
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=CLAUDE_CALL_TIMEOUT_S,
+            from shared.llm import call_claude
+            msg = await call_claude(
+                client=self.client,
+                model=settings.CLAUDE_MODEL,
+                system=engine_config["system"],
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
             )
             return msg.content[0].text
         except asyncio.TimeoutError:
@@ -742,14 +740,12 @@ Respond ONLY with valid JSON (no markdown fences).
                 "priority_actions": [],
             }
         try:
-            msg = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.client.messages.create,
-                    model=settings.CLAUDE_MODEL,
-                    max_tokens=3000,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=CLAUDE_ANALYSIS_TIMEOUT_S,
+            from shared.llm import call_claude
+            msg = await call_claude(
+                client=self.client,
+                model=settings.CLAUDE_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=3000,
             )
             text = msg.content[0].text.strip()
             # Strip markdown fences if present
@@ -811,14 +807,12 @@ Respond ONLY as a JSON array with objects having these fields:
         if not self.client:
             return []
         try:
-            msg = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.client.messages.create,
-                    model=settings.CLAUDE_MODEL,
-                    max_tokens=1200,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=CLAUDE_CALL_TIMEOUT_S,
+            from shared.llm import call_claude
+            msg = await call_claude(
+                client=self.client,
+                model=settings.CLAUDE_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1200,
             )
             text = msg.content[0].text.strip()
             if text.startswith("```"):

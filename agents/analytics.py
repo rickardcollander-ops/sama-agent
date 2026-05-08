@@ -1459,14 +1459,14 @@ Focus on:
 - Specific recommendations
 """
 
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-        response = await asyncio.to_thread(_call)
+        from shared.llm import call_claude
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=1024,
+        )
 
         insights_text = response.content[0].text.strip()
         insights = [i.strip() for i in insights_text.split('\n') if i.strip()]

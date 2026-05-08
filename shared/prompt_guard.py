@@ -32,7 +32,8 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("forget", re.compile(r"\bforget\s+(everything|all|previous|earlier)\b", re.I)),
     ("override_system", re.compile(r"\b(override|bypass|exfiltrate)\s+(system|safety|guardrails?)\b", re.I)),
     ("role_takeover", re.compile(r"</?(system|assistant|user)>", re.I)),
-    ("dump_prompt", re.compile(r"\b(dump|reveal|print|show)\s+(your|the)\s+(system\s+)?(prompt|instructions)\b", re.I)),
+    ("dump_prompt", re.compile(r"\b(dump|reveal|print|show|expose|leak)\s+(me\s+|us\s+)?(your|the)\s+(system\s+)?(prompt|instructions)\b", re.I)),
+    ("dump_prompt_alt", re.compile(r"\b(prompt|instructions)\s+(you\s+were\s+given|given\s+to\s+you)\b", re.I)),
     ("jailbreak", re.compile(r"\b(DAN\s+mode|developer\s+mode|do\s+anything\s+now)\b", re.I)),
     ("act_as", re.compile(r"\bact\s+as\s+(if|though)\s+you\s+(are|were)\s+(no\s+longer|not)\b", re.I)),
 )
