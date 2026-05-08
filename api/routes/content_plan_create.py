@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -39,6 +39,13 @@ class CreateFromAnalysisPayload(BaseModel):
     analysis_run_id: str
     articles_per_week: int = Field(default=2, ge=1, le=5)
     social_platforms: List[str] = Field(default_factory=list)
+    # Optional inline copy of the analysis run. The dashboard sends these
+    # when it's working from a locally-cached run that the backend may not
+    # have anymore (saved_analyses_by_tenant fallback). When present we use
+    # them directly and skip the analysis_runs DB lookup.
+    analysis_payload: Optional[Dict[str, Any]] = None
+    analysis_domain: Optional[str] = None
+    analysis_brand_name: Optional[str] = None
 
 
 @router.post("/plan/create-from-analysis", status_code=status.HTTP_202_ACCEPTED)
@@ -83,6 +90,9 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
                 analysis_run_id=payload.analysis_run_id,
                 articles_per_week=payload.articles_per_week,
                 social_platforms=platforms,
+                analysis_payload=payload.analysis_payload,
+                analysis_domain=payload.analysis_domain,
+                analysis_brand_name=payload.analysis_brand_name,
             )
             logger.info(
                 f"plan_create_from_analysis done for tenant={tenant_id}: {result}"
