@@ -353,13 +353,19 @@ async def create_plan_from_analysis(
     analysis_run_id: str,
     articles_per_week: int,
     social_platforms: List[str],
-    social_posts_per_week: Optional[int] = None,
+    analysis_payload: Optional[Dict[str, Any]] = None,
+    analysis_domain: Optional[str] = None,
+    analysis_brand_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Main entry point. Returns counts of created articles + social posts.
 
-    ``social_posts_per_week`` controls how often we publish to each chosen
-    platform. ``None`` keeps the legacy behaviour (one social per article)
-    so older callers don't break. ``0`` disables social posts entirely.
+    The dashboard caches completed analysis runs locally
+    (``user_settings.saved_analyses_by_tenant``) so history survives even when
+    the agent backend rotates rows. When the user clicks "Skapa content-plan"
+    on such a saved run, the ``analysis_run_id`` will not exist in the
+    backend's ``analysis_runs`` table. To handle that, the caller may pass
+    ``analysis_payload`` / ``analysis_domain`` / ``analysis_brand_name``
+    inline; we use them directly and skip the DB lookup.
     """
     if not tenant_id or tenant_id == "default":
         raise ValueError("tenant_id is required and must not be 'default'")
@@ -376,28 +382,39 @@ async def create_plan_from_analysis(
 
     sb = get_supabase()
 
-    # 1. Load analysis run. We use limit(1) instead of .single() so a missing
-    # row produces our friendly RuntimeError rather than the raw PostgREST
-    # "Cannot coerce the result to a single JSON object" error bubbling up to
-    # the agent_runs row.
-    try:
-        run_q = (
-            sb.table("analysis_runs")
-            .select("id,payload,domain,brand_name,tenant_id")
-            .eq("id", analysis_run_id)
-            .eq("tenant_id", tenant_id)
-            .limit(1)
-            .execute()
-        )
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not load analysis_run {analysis_run_id} for tenant {tenant_id}: {e}"
-        ) from e
-    rows = run_q.data or []
-    if not rows:
-        raise RuntimeError(f"analysis_run {analysis_run_id} not found for tenant {tenant_id}")
-    run = rows[0]
-    payload = run.get("payload") or {}
+    # 1. Resolve analysis run. Prefer an inline payload from the caller (set
+    # when the dashboard is operating on a locally-cached run). Otherwise
+    # look it up in the backend's analysis_runs table. We use limit(1)
+    # instead of .single() so a missing row produces our friendly
+    # RuntimeError rather than the raw PostgREST PGRST116 error bubbling up.
+    if analysis_payload is not None:
+        run = {
+            "domain": analysis_domain or "",
+            "brand_name": analysis_brand_name or "",
+        }
+        payload = analysis_payload or {}
+    else:
+        try:
+            run_q = (
+                sb.table("analysis_runs")
+                .select("id,payload,domain,brand_name,tenant_id")
+                .eq("id", analysis_run_id)
+                .eq("tenant_id", tenant_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not load analysis_run {analysis_run_id} for tenant {tenant_id}: {e}"
+            ) from e
+        rows = run_q.data or []
+        if not rows:
+            raise RuntimeError(
+                f"analysis_run {analysis_run_id} not found for tenant {tenant_id}. "
+                "Re-run the analysis or include the payload inline."
+            )
+        run = rows[0]
+        payload = run.get("payload") or {}
 
     # 2. Brand context
     brand_ctx = _load_tenant_brand_context(tenant_id)
