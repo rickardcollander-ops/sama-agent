@@ -28,6 +28,13 @@ during a migration window), set ``ALLOW_ANONYMOUS_TENANT_FALLBACK=1``. The
 older ``REQUIRE_TENANT_HEADERS`` flag is still honoured but is now
 redundant — protection is on by default.
 
+Read-side concession: anonymous GET/HEAD on protected prefixes returns
+200 ``{}`` instead of 401, so dashboard polling during pre-auth render
+doesn't fill the browser console with red. No data leaks — the empty
+payload is fixed in middleware and never reaches a route. Writes
+(POST/PUT/PATCH/DELETE) still return 401. Set
+``STRICT_PROTECTED_GET_AUTH=1`` to restore strict 401 on reads too.
+
 ``request.state`` is populated with:
 - ``request.state.tenant_id``   — best-effort tenant identifier (site_id when
   available, otherwise account_id, otherwise ``"default"``). Existing routes
@@ -267,10 +274,26 @@ class TenantMiddleware(BaseHTTPMiddleware):
         # Enforcement: protected routes must carry a tenant context. Without
         # this, anonymous callers fall through to ``DEFAULT_TENANT_ID`` and
         # see the legacy Successifier partition.
+        #
+        # Read-side concession for the dashboard: unauthenticated GET/HEAD on
+        # protected prefixes returns 200 ``{}`` instead of 401. The dashboard
+        # polls these endpoints during page load before its auth context is
+        # fully wired, and the resulting 401 spam fills the browser console.
+        # No data leaks because we never reach the route — the empty payload
+        # is fixed in middleware. Writes (POST/PUT/PATCH/DELETE) still 401.
+        # Set ``STRICT_PROTECTED_GET_AUTH=1`` to restore strict 401 on reads.
         if is_protected and not account_id and not allow_anon_fallback:
+            method = request.method.upper()
+            strict_get = _truthy(os.getenv("STRICT_PROTECTED_GET_AUTH"))
+            if method in ("GET", "HEAD") and not strict_get:
+                logger.info(
+                    "tenant_unauth_get_empty path=%s method=%s",
+                    path, method,
+                )
+                return JSONResponse(status_code=200, content={})
             logger.warning(
-                "tenant_required path=%s authenticated=%s",
-                path, authenticated,
+                "tenant_required path=%s method=%s authenticated=%s",
+                path, method, authenticated,
             )
             return JSONResponse(
                 status_code=401,
