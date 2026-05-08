@@ -486,16 +486,19 @@ async def create_plan_from_analysis(
     domain = run.get("domain") or brand_ctx.get("domain") or ""
     brand_name = run.get("brand_name") or brand_ctx.get("brand_name") or tenant_id
 
-    # 3. Voice (per-tenant; scrape if missing)
-    voice = await _ensure_voice(tenant_id, domain, brand_name)
+    # 3. Voice for title generation only. We deliberately use the default
+    # voice (no DB lookup, no scraping) so plan creation stays fast and
+    # cheap. The fully-tone-matched draft happens later, in
+    # _materialise_idea, when the user approves an individual idea.
+    voice = BrandVoice.for_tenant("default")
 
     # 4. Extract + bucket topics
     topics = _extract_topics_from_run(payload)
     if not topics:
         return {
             "plan_id": analysis_run_id,
-            "articles_created": 0,
-            "social_posts_created": 0,
+            "ideas_created": 0,
+            "social_ideas_created": 0,
             "scheduled_through": None,
             "warning": "analysis_run had no actionable topics",
         }
@@ -531,7 +534,9 @@ async def create_plan_from_analysis(
     bucket_counts = {b: len(bucketed[b]) for b in bucketed}
     schedule = _schedule_dates(articles_per_week, bucket_counts)
 
-    # 5. Generate concrete titles in one batched call
+    # 5. Generate concrete titles in one batched Claude call. This is the
+    # only LLM round-trip during plan creation -- the actual article body
+    # is produced later, on user approval, by _materialise_idea.
     flat: List[Tuple[str, Dict[str, Any]]] = []
     for b in ("30", "60", "90"):
         for t in bucketed[b]:
@@ -551,14 +556,14 @@ async def create_plan_from_analysis(
                 "rationale": "",
             })
 
-    # 6. For each (bucket, topic, idea, schedule_date): draft article + create rows
-    articles_created = 0
-    social_created = 0
+    # 6. For each (bucket, topic, idea, schedule_date): write a plan-item
+    # row with status='idea'. No content_pieces row is created -- that
+    # happens later in _materialise_idea. This keeps plan creation fast
+    # (one Claude call total) and avoids burning tokens on ideas the user
+    # might never approve.
+    ideas_created = 0
+    social_ideas_created = 0
     last_date: Optional[datetime] = None
-
-    # Articles built so far, in publish order. Social posts later pick a
-    # parent from this list so each post stays anchored to a real article
-    # instead of inventing one of its own.
     article_records: List[Dict[str, Any]] = []
 
     schedule_cursor: Dict[str, int] = {"30": 0, "60": 0, "90": 0}
@@ -575,156 +580,91 @@ async def create_plan_from_analysis(
 
         rationale = idea.get("rationale") or ""
         target_keyword = idea.get("target_keyword") or topic["query"]
-        title = idea.get("title") or f"Article on {topic['query']}"
-        pillar = idea.get("pillar") or ""
+        title = (idea.get("title") or f"Article on {topic['query']}")[:300]
+        pillar = (idea.get("pillar") or "")[:100]
+        angle = idea.get("angle") or ""
 
-        # 6a. Draft the article
-        try:
-            article = await _draft_article(
-                voice=voice,
-                brand_name=brand_name,
-                title=title,
-                angle=idea.get("angle", ""),
-                target_keyword=target_keyword,
-            )
-        except Exception as e:
-            logger.warning(f"Draft failed for {title!r}: {e}")
-            continue
-
-        # 6b. Insert content_pieces row
-        piece_data = {
-            "tenant_id": tenant_id,
-            "title": (article.get("title") or title)[:300],
-            "content": article.get("content") or "",
-            "content_type": "blog",
-            "meta_title": (article.get("meta_title") or title)[:200],
-            "meta_description": (article.get("meta_description") or "")[:500],
-            "target_keyword": target_keyword[:200],
-            "word_count": int(article.get("word_count") or 0)
-                or len((article.get("content") or "").split()),
-            "status": "draft",
-            "created_by": "sama_content",
-            "source_analysis_run_id": analysis_run_id,
-            "source_gap_id": topic["gap_type"],
-            "source_gap_title": rationale[:500] if rationale else None,
-            "created_at": now_iso,
-        }
-        piece_row = _safe_insert(sb, "content_pieces", piece_data)
-        piece_id = piece_row.get("id") if piece_row else None
-        if not piece_id:
-            continue
-
-        # 6c. Insert content_plan_items row for the article
         plan_data = {
             "tenant_id": tenant_id,
-            "title": piece_data["title"][:300],
-            "topic": rationale[:1000] or None,
+            "title": title,
+            "topic": (rationale or angle)[:1000] or None,
             "content_type": "blog_article",
             "target_keyword": target_keyword[:200],
-            "pillar": pillar[:100] or None,
+            "pillar": pillar or None,
             "reason": rationale[:500] or None,
             "priority": priority,
-            "status": "draft",
+            "status": "idea",
             "source": "analysis_gap",
             "source_run_id": analysis_run_id,
-            "content_piece_id": piece_id,
+            "content_piece_id": None,
             "scheduled_for": article_date.isoformat(),
             "auto_publish_on_schedule": False,
             "metadata": {
                 "bucket_days": bucket,
                 "gap_type": topic["gap_type"],
                 "competitors": topic.get("competitors", []),
+                "angle": angle,
             },
             "created_at": now_iso,
         }
         plan_row = _safe_insert(sb, "content_plan_items", plan_data)
         article_plan_id = plan_row.get("id") if plan_row else None
+        if not article_plan_id:
+            continue
 
-        articles_created += 1
+        ideas_created += 1
         if article_date > (last_date or article_date):
             last_date = article_date
         elif last_date is None:
             last_date = article_date
 
         article_records.append({
-            "piece_id": piece_id,
             "plan_id": article_plan_id,
-            "title": piece_data["title"],
-            "content": article.get("content") or "",
+            "title": title,
             "target_keyword": target_keyword,
             "scheduled_for": article_date,
             "priority": priority,
         })
 
-    # 7. Generate social posts for each platform on its own cadence,
-    # decoupled from the article cadence. Each post is anchored to the
-    # nearest article (by publish date) so the link/parent is stable.
+    # 7. Social plan items, one per (platform × social_date). Each one
+    # links to the nearest article idea via parent_plan_item_id so when
+    # the article is approved, _materialise_idea can cascade-draft the
+    # social children with the right parent context.
     if article_records and platforms and social_per_week > 0:
         social_dates = _social_schedule_dates(social_per_week)
         for platform in platforms:
             for slot_idx, social_date in enumerate(social_dates):
                 parent = _nearest_article(article_records, social_date) \
                     or article_records[slot_idx % len(article_records)]
-                try:
-                    social_piece = await generate_for_article(
-                        tenant_id=tenant_id,
-                        voice=voice,
-                        brand_name=brand_name,
-                        article_title=parent["title"],
-                        article_summary=parent["content"][:1500],
-                        platform=platform,
-                        link_placeholder="{{ARTICLE_URL}}",
-                    )
-                except Exception as e:
-                    logger.warning(f"social generation failed ({platform}): {e}")
-                    continue
-
-                social_piece_data = {
-                    "tenant_id": tenant_id,
-                    "title": f"{platform.title()} post: {parent['title']}"[:300],
-                    "content": social_piece["content"],
-                    "content_type": f"social_{platform}",
-                    "target_keyword": parent["target_keyword"][:200],
-                    "word_count": len(social_piece["content"].split()),
-                    "status": "draft",
-                    "created_by": "sama_social",
-                    "parent_content_id": parent["piece_id"],
-                    "source_analysis_run_id": analysis_run_id,
-                    "created_at": now_iso,
-                }
-                social_row = _safe_insert(sb, "content_pieces", social_piece_data)
-                social_piece_id = social_row.get("id") if social_row else None
-                if not social_piece_id:
-                    continue
 
                 social_plan_data = {
                     "tenant_id": tenant_id,
-                    "title": social_piece_data["title"][:300],
+                    "title": f"{platform.title()} post: {parent['title']}"[:300],
+                    "topic": f"Social post linking to article: {parent['title']}"[:1000],
                     "content_type": f"social_{platform}",
                     "target_keyword": parent["target_keyword"][:200],
                     "priority": parent["priority"],
-                    "status": "draft",
+                    "status": "idea",
                     "source": "analysis_gap",
                     "source_run_id": analysis_run_id,
-                    "content_piece_id": social_piece_id,
+                    "content_piece_id": None,
                     "parent_plan_item_id": parent["plan_id"],
                     "scheduled_for": social_date.isoformat(),
                     "auto_publish_on_schedule": False,
                     "metadata": {
                         "platform": platform,
-                        "parent_content_id": parent["piece_id"],
+                        "parent_article_title": parent["title"],
                     },
                     "created_at": now_iso,
                 }
                 if _safe_insert(sb, "content_plan_items", social_plan_data) is not None:
-                    social_created += 1
+                    social_ideas_created += 1
                     if social_date > (last_date or social_date):
                         last_date = social_date
 
     return {
         "plan_id": analysis_run_id,
-        "articles_created": articles_created,
-        "social_posts_created": social_created,
+        "ideas_created": ideas_created,
+        "social_ideas_created": social_ideas_created,
         "scheduled_through": last_date.isoformat() if last_date else None,
-        "voice_source_urls": [],  # opaque to UI; voice details available via tenant_brand_voices
     }

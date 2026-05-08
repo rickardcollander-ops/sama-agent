@@ -620,8 +620,79 @@ Return ONLY a JSON array (no markdown, no code fences) of {count} objects:
 
 # ── Materialiser (shared between /plan/:id/draft and calendar/scheduler) ─────
 
+async def _materialise_social_child(
+    sb,
+    tenant_id: str,
+    child: Dict[str, Any],
+    parent_piece: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Draft a social plan_item that is linked (parent_plan_item_id) to a
+    just-drafted article. Reuses ``generate_for_article`` so the post stays
+    on-brand and references the article via {{ARTICLE_URL}}.
+
+    Returns the social piece row on success, ``None`` on failure (logged).
+    The caller is responsible for catching exceptions; we keep this
+    function free of try/except so cascade failures are visible.
+    """
+    from agents.brand_voice import BrandVoice
+    from agents.social_for_article import generate_for_article
+
+    child_id = child["id"]
+    ctype = child.get("content_type") or ""
+    if not ctype.startswith("social_"):
+        logger.warning(
+            f"_materialise_social_child: child {child_id} is not social ({ctype}); skipping"
+        )
+        return None
+    platform = ctype.split("_", 1)[1] if "_" in ctype else ctype
+
+    sb.table("content_plan_items").update({"status": "drafting"}).eq("id", child_id).execute()
+
+    voice = BrandVoice.for_tenant("default")
+    brand_name = parent_piece.get("title") and tenant_id or tenant_id
+    social = await generate_for_article(
+        tenant_id=tenant_id,
+        voice=voice,
+        brand_name=brand_name,
+        article_title=parent_piece.get("title") or "",
+        article_summary=(parent_piece.get("content") or "")[:1500],
+        platform=platform,
+        link_placeholder="{{ARTICLE_URL}}",
+    )
+
+    body = social.get("content") or ""
+    social_piece_data = {
+        "tenant_id": tenant_id,
+        "title": (child.get("title") or f"{platform.title()} post")[:300],
+        "content": body,
+        "content_type": ctype,
+        "target_keyword": (child.get("target_keyword") or "")[:200],
+        "word_count": len(body.split()),
+        "status": "draft",
+        "created_by": "sama_social",
+        "parent_content_id": parent_piece.get("id"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    piece_result = sb.table("content_pieces").insert(social_piece_data).execute()
+    piece = (piece_result.data or [{}])[0]
+    piece_id = piece.get("id")
+
+    sb.table("content_plan_items").update({
+        "status": "draft",
+        "content_piece_id": piece_id,
+    }).eq("id", child_id).execute()
+
+    return piece
+
+
 async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a content_piece from a plan idea via Claude. Returns piece info."""
+    """Build a content_piece from a plan idea via Claude. Returns piece info.
+
+    When the item is an article (no parent_plan_item_id), also cascade-drafts
+    every social child whose ``parent_plan_item_id`` points at this item and
+    that is still in ``status='idea'``. This keeps the user's mental model
+    simple: approving an article approves its social satellites in one go.
+    """
     item_id = item["id"]
     sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item_id).execute()
 
@@ -688,10 +759,51 @@ Return ONLY a JSON object (no markdown fences):
         "content_piece_id": piece_id,
     }).eq("id", item_id).execute()
 
+    # Cascade: when this item is an article (not itself a social child),
+    # draft any social plan_items that point at it and are still ideas. We
+    # log and continue on per-child failures so a flaky platform prompt
+    # doesn't sink the article approval.
+    cascaded: List[str] = []
+    is_social = ctype.startswith("social_")
+    if not is_social:
+        try:
+            children_res = (
+                sb.table("content_plan_items")
+                .select("*")
+                .eq("tenant_id", tenant_id)
+                .eq("parent_plan_item_id", item_id)
+                .eq("status", "idea")
+                .execute()
+            )
+            children = children_res.data or []
+        except Exception as e:
+            logger.warning(f"cascade lookup failed for parent={item_id}: {e}")
+            children = []
+        for child in children:
+            try:
+                child_piece = await _materialise_social_child(
+                    sb, tenant_id, child, parent_piece=piece,
+                )
+                if child_piece and child_piece.get("id"):
+                    cascaded.append(child_piece["id"])
+            except Exception as e:
+                logger.warning(
+                    f"cascade social draft for child={child.get('id')} "
+                    f"parent={item_id} failed: {e}"
+                )
+                # Roll the child back to idea so the user can retry.
+                try:
+                    sb.table("content_plan_items").update(
+                        {"status": "idea"}
+                    ).eq("id", child["id"]).execute()
+                except Exception:
+                    pass
+
     return {
         "plan_item_id": item_id,
         "content_piece_id": piece_id,
         "piece": piece,
+        "cascaded_social_piece_ids": cascaded,
     }
 
 
@@ -771,8 +883,13 @@ async def get_piece_lineage(piece_id: str, request: Request):
 # ── Scheduler hook: process due scheduled items ──────────────────────────────
 
 async def process_due_scheduled_items() -> Dict[str, int]:
-    """Find plan items whose scheduled_for has passed; draft (and optionally
-    publish) them. Called from shared.scheduler hourly.
+    """Auto-publish previously-approved drafts whose scheduled_for has passed.
+
+    Note: ideas (``status='idea'``) are intentionally **not** drafted here.
+    Drafting only happens when the user explicitly approves an idea via
+    POST /plan/{id}/draft. The scheduler's job is the publish step for
+    items that are already drafted and opted-in via
+    ``auto_publish_on_schedule=True``.
     """
     sb = get_supabase()
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -783,7 +900,8 @@ async def process_due_scheduled_items() -> Dict[str, int]:
             sb.table("content_plan_items")
             .select("*")
             .lte("scheduled_for", now_iso)
-            .in_("status", ["idea"])
+            .eq("status", "draft")
+            .eq("auto_publish_on_schedule", True)
             .limit(50)
             .execute()
         )
@@ -794,40 +912,41 @@ async def process_due_scheduled_items() -> Dict[str, int]:
 
     for item in due:
         tenant_id = item.get("tenant_id") or "default"
+        piece_id = item.get("content_piece_id")
+        if not piece_id:
+            # No drafted piece to publish; skip silently.
+            continue
+
         try:
-            mat = await _materialise_idea(sb, tenant_id, item)
-            stats["drafted"] += 1
-
-            if not item.get("auto_publish_on_schedule"):
+            piece_q = (
+                sb.table("content_pieces")
+                .select("*")
+                .eq("id", piece_id)
+                .limit(1)
+                .execute()
+            )
+            piece_rows = piece_q.data or []
+            if not piece_rows:
                 continue
+            piece = piece_rows[0]
 
-            piece_id = mat.get("content_piece_id")
-            if not piece_id:
-                continue
-
-            # Publish via the canonical content_validation flow.
-            try:
-                from api.routes.content_validation import _publish_via_github
-                gh = await _publish_via_github(mat["piece"])
-                if gh.get("success"):
-                    sb.table("content_pieces").update({
-                        "status": "published",
-                        "published_at": now_iso,
-                        "external_url": gh.get("url"),
-                        "target_url": gh.get("url"),
-                    }).eq("id", piece_id).execute()
-                    sb.table("content_plan_items").update({"status": "published"}).eq(
-                        "id", item["id"]
-                    ).execute()
-                    stats["published"] += 1
-            except Exception as e:
-                logger.warning(f"scheduled publish for piece {piece_id} failed: {e}")
+            from api.routes.content_validation import _publish_via_github
+            gh = await _publish_via_github(piece)
+            if gh.get("success"):
+                sb.table("content_pieces").update({
+                    "status": "published",
+                    "published_at": now_iso,
+                    "external_url": gh.get("url"),
+                    "target_url": gh.get("url"),
+                }).eq("id", piece_id).execute()
+                sb.table("content_plan_items").update({"status": "published"}).eq(
+                    "id", item["id"]
+                ).execute()
+                stats["published"] += 1
         except Exception as e:
-            logger.warning(f"scheduled draft for item {item.get('id')} failed: {e}")
+            logger.warning(
+                f"scheduled publish for piece {piece_id} (plan_item {item.get('id')}) failed: {e}"
+            )
             stats["failed"] += 1
-            try:
-                sb.table("content_plan_items").update({"status": "idea"}).eq("id", item["id"]).execute()
-            except Exception:
-                pass
 
     return stats
