@@ -39,6 +39,9 @@ class CreateFromAnalysisPayload(BaseModel):
     analysis_run_id: str
     articles_per_week: int = Field(default=2, ge=1, le=5)
     social_platforms: List[str] = Field(default_factory=list)
+    # 0 = no social posts. Defaults to articles_per_week server-side when
+    # the dashboard omits the field (older clients).
+    social_posts_per_week: Optional[int] = Field(default=None, ge=0, le=7)
 
 
 @router.post("/plan/create-from-analysis", status_code=status.HTTP_202_ACCEPTED)
@@ -59,6 +62,14 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
             f"plan_create_from_analysis: dropping unsupported platforms {invalid}"
         )
     platforms = [p for p in requested if p in SUPPORTED_PLATFORMS]
+
+    # Default social cadence to articles cadence so old clients keep the
+    # 1-social-per-article behaviour. 0 means the user explicitly opted out.
+    social_per_week = (
+        payload.articles_per_week
+        if payload.social_posts_per_week is None
+        else payload.social_posts_per_week
+    )
 
     sb = get_supabase()
     run_id: Optional[str] = None
@@ -83,6 +94,7 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
                 analysis_run_id=payload.analysis_run_id,
                 articles_per_week=payload.articles_per_week,
                 social_platforms=platforms,
+                social_posts_per_week=social_per_week,
             )
             logger.info(
                 f"plan_create_from_analysis done for tenant={tenant_id}: {result}"
@@ -119,15 +131,18 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
 
     asyncio.create_task(_run())
 
+    total_articles = payload.articles_per_week * 13
+    total_socials = social_per_week * 13 * len(platforms)
     return {
         "accepted": True,
         "run_id": run_id,
         "analysis_run_id": payload.analysis_run_id,
         "articles_per_week": payload.articles_per_week,
+        "social_posts_per_week": social_per_week,
         "social_platforms": platforms,
         "message": (
-            f"Skapar plan: cirka {payload.articles_per_week * 13} artiklar "
-            f"+ {payload.articles_per_week * 13 * len(platforms)} sociala inlägg "
+            f"Skapar plan: cirka {total_articles} artiklar "
+            f"+ {total_socials} sociala inlägg "
             "genereras i bakgrunden. Kalendern uppdateras när de är klara."
         ),
     }
