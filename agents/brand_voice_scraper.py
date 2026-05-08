@@ -85,8 +85,36 @@ def _normalize_domain(domain: str) -> str:
 
 
 async def _fetch(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    """Fetch ``url`` after validating it does not point at a private/loopback
+    address (SSRF guard). Returns ``None`` on any error."""
+    from shared.safe_http import UnsafeURLError, assert_safe_url
+
     try:
-        resp = await client.get(url, follow_redirects=True, timeout=15)
+        assert_safe_url(url)
+    except UnsafeURLError as e:
+        logger.warning("brand_voice_scraper: refused unsafe url %s (%s)", url, e)
+        return None
+
+    try:
+        resp = await client.get(url, follow_redirects=False, timeout=15)
+        # Manually follow up to 5 redirects so each hop is re-validated.
+        hops = 0
+        while resp.status_code in (301, 302, 303, 307, 308) and hops < 5:
+            loc = resp.headers.get("Location")
+            if not loc:
+                break
+            next_url = httpx.URL(url).join(loc).human_repr()
+            try:
+                assert_safe_url(next_url)
+            except UnsafeURLError as e:
+                logger.warning(
+                    "brand_voice_scraper: refused unsafe redirect %s (%s)",
+                    next_url, e,
+                )
+                return None
+            resp = await client.get(next_url, follow_redirects=False, timeout=15)
+            url = next_url
+            hops += 1
         if resp.status_code != 200:
             return None
         return resp.text

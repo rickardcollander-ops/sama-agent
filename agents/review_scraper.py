@@ -26,8 +26,41 @@ class ReviewScraper:
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             },
-            follow_redirects=True
+            # SSRF guard: every URL is validated below; redirects are followed
+            # manually so each hop gets the same allowlist check.
+            follow_redirects=False,
         )
+        # Wrap ``http_client.get`` with the safe-URL guard. Done at __init__ so
+        # every scrape method below picks up the protection without per-call
+        # changes.
+        from shared.safe_http import UnsafeURLError, assert_safe_url
+        _orig_get = self.http_client.get
+
+        async def _safe_get(url: str, *args, **kwargs):
+            try:
+                assert_safe_url(url)
+            except UnsafeURLError as e:
+                logger.warning("review_scraper: refused unsafe url %s (%s)", url, e)
+                raise
+            kwargs.setdefault("follow_redirects", False)
+            resp = await _orig_get(url, *args, **kwargs)
+            hops = 0
+            while resp.status_code in (301, 302, 303, 307, 308) and hops < 5:
+                loc = resp.headers.get("Location")
+                if not loc:
+                    break
+                next_url = httpx.URL(url).join(loc).human_repr()
+                try:
+                    assert_safe_url(next_url)
+                except UnsafeURLError as e:
+                    logger.warning("review_scraper: refused unsafe redirect %s (%s)", next_url, e)
+                    raise
+                resp = await _orig_get(next_url, *args, **kwargs)
+                url = next_url
+                hops += 1
+            return resp
+
+        self.http_client.get = _safe_get  # type: ignore[method-assign]
         self.sb = None
 
     def _get_sb(self):
