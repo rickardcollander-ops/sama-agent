@@ -109,13 +109,19 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
             logger.info(
                 f"plan_create_from_analysis done for tenant={tenant_id}: {result}"
             )
-            articles = int(result.get("articles_created") or 0)
-            socials = int(result.get("social_posts_created") or 0)
+            ideas = int(result.get("ideas_created") or 0)
+            social_ideas = int(result.get("social_ideas_created") or 0)
             warning = result.get("warning")
             if warning:
-                summary = f"Plan klar: {articles} artiklar, {socials} sociala inlägg ({warning})"
+                summary = (
+                    f"Idélista klar: {ideas} artikel-idéer + {social_ideas} sociala "
+                    f"idéer ({warning}). Granska under Innehåll → Idéer."
+                )
             else:
-                summary = f"Plan klar: {articles} artiklar, {socials} sociala inlägg"
+                summary = (
+                    f"Idélista klar: {ideas} artikel-idéer + {social_ideas} sociala "
+                    f"idéer. Granska och godkänn under Innehåll → Idéer."
+                )
         except Exception as e:
             logger.exception(
                 f"plan_create_from_analysis failed for tenant={tenant_id}: {e}"
@@ -151,8 +157,8 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
         "social_posts_per_week": social_per_week,
         "social_platforms": platforms,
         "message": (
-            f"Skapar plan: cirka {total_articles} artiklar "
-            f"+ {total_socials} sociala inlägg "
-            "genereras i bakgrunden. Kalendern uppdateras när de är klara."
+            f"Skapar idélista: cirka {total_articles} artikel-idéer "
+            f"+ {total_socials} sociala idéer läggs i kalendern. "
+            "Granska och godkänn dem under Innehåll → Idéer."
         ),
     }
