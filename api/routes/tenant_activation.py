@@ -420,6 +420,70 @@ async def get_agent_run(run_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /agent-runs/{run_id}/stream — Server-Sent Events ─────────────────────
+
+@router.get("/agent-runs/{run_id}/stream")
+async def stream_agent_run(run_id: str, request: Request):
+    """Stream status updates for an agent run as Server-Sent Events.
+
+    Replaces 3-second client polling. Emits one ``data: <json>\\n\\n`` line per
+    detected status change; closes the connection when the run leaves the
+    ``running`` state. The polling cadence is set by ``AGENT_RUN_POLL_MS``
+    (default 1000) — short enough for snappy UI updates, infrequent enough
+    that a stuck connection only does a few queries before the watchdog reaps.
+    """
+    import asyncio
+    import json
+    import os
+
+    from starlette.responses import StreamingResponse
+
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    sb = get_supabase()
+    poll_ms = int(os.getenv("AGENT_RUN_POLL_MS", "1000"))
+    max_seconds = int(os.getenv("AGENT_RUN_STREAM_MAX_S", str(15 * 60)))
+
+    async def event_stream():
+        last_serialised: str | None = None
+        elapsed = 0.0
+        while elapsed < max_seconds:
+            if await request.is_disconnected():
+                return
+            try:
+                result = await asyncio.to_thread(
+                    lambda: sb.table("agent_runs")
+                    .select("id, agent_name, status, started_at, completed_at, summary, error")
+                    .eq("id", run_id)
+                    .eq("tenant_id", tenant_id)
+                    .limit(1)
+                    .execute()
+                )
+                rows = result.data or []
+                if not rows:
+                    yield f"event: error\ndata: {json.dumps({'detail': 'Run not found'})}\n\n"
+                    return
+                row = rows[0]
+                payload = json.dumps(row, default=str)
+                if payload != last_serialised:
+                    yield f"data: {payload}\n\n"
+                    last_serialised = payload
+                if row.get("status") and row["status"] != "running":
+                    return
+            except Exception as e:
+                logger.warning("stream_agent_run error: %s", e)
+                yield f"event: error\ndata: {json.dumps({'detail': str(e)})}\n\n"
+                return
+            await asyncio.sleep(poll_ms / 1000)
+            elapsed += poll_ms / 1000
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
+
 # ── Watchdog: mark stale "running" rows as failed ────────────────────────────
 
 async def reap_stale_runs() -> int:
