@@ -42,21 +42,45 @@ MODEL = getattr(settings, "CLAUDE_MODEL", "claude-sonnet-4-6")
 
 
 async def _ensure_voice(tenant_id: str, domain: str, brand_name: str) -> TenantBrandVoice:
-    """Load BrandVoice.for_tenant; if missing, trigger scrape and try again."""
+    """Load BrandVoice.for_tenant; if missing, trigger scrape and try again.
+
+    Falls back to the default voice when the tenant_brand_voices table is
+    unavailable (e.g. migration 039 not yet applied) or when scraping fails
+    for any reason. The plan should still produce articles in that case --
+    the user gets reasonable copy instead of a 500.
+    """
     try:
         return BrandVoice.for_tenant(tenant_id)
     except BrandVoiceNotFoundError:
-        if not domain:
-            raise RuntimeError(
-                f"No brand voice for tenant {tenant_id} and no domain configured to scrape."
-            )
-        logger.info(f"content_plan_creator: scraping voice for tenant={tenant_id}")
+        pass
+
+    if not domain:
+        logger.warning(
+            "content_plan_creator: no voice row for tenant=%s and no domain to scrape; "
+            "using default voice",
+            tenant_id,
+        )
+        return BrandVoice.for_tenant("default")
+
+    logger.info(f"content_plan_creator: scraping voice for tenant={tenant_id}")
+    try:
         await brand_voice_scraper.scrape_and_extract(
             tenant_id=tenant_id,
             domain=domain,
             brand_name=brand_name,
         )
+    except Exception as e:
+        logger.warning(
+            "content_plan_creator: brand voice scrape/persist failed for tenant=%s "
+            "(%s); falling back to default voice",
+            tenant_id, e,
+        )
+        return BrandVoice.for_tenant("default")
+
+    try:
         return BrandVoice.for_tenant(tenant_id)
+    except BrandVoiceNotFoundError:
+        return BrandVoice.for_tenant("default")
 
 
 def _load_tenant_brand_context(tenant_id: str) -> Dict[str, Any]:
