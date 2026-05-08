@@ -33,6 +33,7 @@ from api.routes import (
     content_ai_edit as content_ai_edit_routes,
     content_analysis_cache as content_analysis_cache_routes,
     weekly_email as weekly_email_routes,
+    account as account_routes,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -301,6 +302,7 @@ app.include_router(
     prefix="/api/email",
     tags=["email"],
 )
+app.include_router(account_routes.router, prefix="/api/account", tags=["account"])
 
 
 @app.get("/")
