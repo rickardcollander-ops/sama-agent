@@ -1025,14 +1025,14 @@ High Issues:
 
 List exactly 5 actionable recommendations, one per line, starting with a number. Be specific to successifier.com."""
 
-        def _call():
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
+        from shared.llm import call_claude
 
-        response = await asyncio.to_thread(_call)
+        response = await call_claude(
+            client=self.client,
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+        )
         recommendations = response.content[0].text.strip().split("\n")
         return [r.strip() for r in recommendations if r.strip()]
     

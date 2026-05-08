@@ -94,14 +94,14 @@ Subtopics to cover:
 Make it comprehensive, actionable, and SEO-optimized."""
         
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=8000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                )
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=8000,
+            )
             
             import json
             result = json.loads(response.content[0].text)
@@ -184,14 +184,14 @@ Format as JSON:
         user_prompt = f"Generate FAQ page about: {topic}"
         
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                )
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=4000,
+            )
 
             import json
             result = json.loads(response.content[0].text)
@@ -270,14 +270,14 @@ Competitor URLs: {', '.join(competitor_urls)}
 Analyze what competitors are doing and suggest how to create better content."""
         
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=3000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                )
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=3000,
+            )
             
             import json
             result = json.loads(response.content[0].text)
@@ -381,14 +381,14 @@ Results: {', '.join(f'{k}: {v}' for k, v in results.items())}
 Make it compelling and data-driven."""
         
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                )
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=4000,
+            )
 
             import json
             result = json.loads(response.content[0].text)
@@ -465,14 +465,14 @@ Format as JSON with updated content."""
 Make it current, relevant, and improved while maintaining the original intent."""
         
         try:
-            def _call():
-                return self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                )
-            response = await asyncio.to_thread(_call)
+            from shared.llm import call_claude
+            response = await call_claude(
+                client=self.client,
+                model=self.model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=4000,
+            )
 
             import json
             refreshed = json.loads(response.content[0].text)
