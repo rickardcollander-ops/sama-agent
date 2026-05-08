@@ -48,6 +48,10 @@ class PlanItemCreate(BaseModel):
     priority: str = "medium"
     status: str = "idea"
     source: str = "manual"
+    # Optional link to an existing content_pieces row. When set, the calendar
+    # treats this plan item as the schedule for that piece, so users can
+    # promote a draft from /c/content onto the calendar without duplicating.
+    content_piece_id: Optional[str] = None
     scheduled_for: Optional[datetime] = None
     auto_publish_on_schedule: bool = False
 
