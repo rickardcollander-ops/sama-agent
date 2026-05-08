@@ -353,6 +353,7 @@ async def create_plan_from_analysis(
     analysis_run_id: str,
     articles_per_week: int,
     social_platforms: List[str],
+    social_posts_per_week: Optional[int] = None,
     analysis_payload: Optional[Dict[str, Any]] = None,
     analysis_domain: Optional[str] = None,
     analysis_brand_name: Optional[str] = None,
