@@ -67,6 +67,14 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
         )
     platforms = [p for p in requested if p in SUPPORTED_PLATFORMS]
 
+    # Default social cadence to articles cadence so old clients keep the
+    # 1-social-per-article behaviour. 0 means the user explicitly opted out.
+    social_per_week = (
+        payload.articles_per_week
+        if payload.social_posts_per_week is None
+        else payload.social_posts_per_week
+    )
+
     sb = get_supabase()
     run_id: Optional[str] = None
     try:
@@ -129,15 +137,18 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
 
     asyncio.create_task(_run())
 
+    total_articles = payload.articles_per_week * 13
+    total_socials = social_per_week * 13 * len(platforms)
     return {
         "accepted": True,
         "run_id": run_id,
         "analysis_run_id": payload.analysis_run_id,
         "articles_per_week": payload.articles_per_week,
+        "social_posts_per_week": social_per_week,
         "social_platforms": platforms,
         "message": (
-            f"Skapar plan: cirka {payload.articles_per_week * 13} artiklar "
-            f"+ {payload.articles_per_week * 13 * len(platforms)} sociala inlägg "
+            f"Skapar plan: cirka {total_articles} artiklar "
+            f"+ {total_socials} sociala inlägg "
             "genereras i bakgrunden. Kalendern uppdateras när de är klara."
         ),
     }
