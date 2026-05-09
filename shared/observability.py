@@ -70,14 +70,24 @@ def _scrub(event: dict[str, Any]) -> dict[str, Any]:
     return event
 
 
+_SENTRY_DSN_RE = re.compile(r"^[A-Za-z0-9._\-]+@[A-Za-z0-9.\-]+/\d+$")
+
+
 def init_sentry() -> None:
     dsn = os.getenv("SENTRY_DSN", "").strip()
     if not dsn:
         logger.info("Sentry not configured (SENTRY_DSN unset); observability skipped")
         return
     if not dsn.lower().startswith(("http://", "https://")):
-        logger.warning("Sentry DSN missing http(s) scheme; observability skipped")
-        return
+        # Common config slip: DSN copied without the scheme. If it still looks
+        # like a valid Sentry DSN body (``<key>@<host>/<project_id>``), recover
+        # by prepending https:// instead of skipping observability entirely.
+        if _SENTRY_DSN_RE.match(dsn):
+            logger.info("Sentry DSN missing scheme; assuming https://")
+            dsn = f"https://{dsn}"
+        else:
+            logger.info("Sentry DSN malformed; observability skipped")
+            return
     try:
         import sentry_sdk
         from sentry_sdk.integrations.asyncio import AsyncioIntegration

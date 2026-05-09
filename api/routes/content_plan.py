@@ -37,6 +37,30 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+# Tracks whether the optional ``external_url`` column on ``content_pieces``
+# (added by migration 024_tenant_usage_and_plans.sql) exists in the connected
+# database. We probe lazily on the first failure with code 42703 and fall back
+# to a slimmer SELECT so the calendar endpoint stops spamming the error log
+# for every dashboard poll.
+_EXTERNAL_URL_PRESENT: Optional[bool] = None
+
+_FULL_PIECE_COLUMNS = (
+    "id,title,content_type,status,published_at,target_url,external_url,created_at"
+)
+_LEGACY_PIECE_COLUMNS = (
+    "id,title,content_type,status,published_at,target_url,created_at"
+)
+
+
+def _is_missing_column_error(err: Exception) -> bool:
+    """True when Supabase tells us a SELECT references a non-existent column."""
+    code = getattr(err, "code", None)
+    if code == "42703":
+        return True
+    msg = str(err)
+    return "42703" in msg or ("does not exist" in msg and "column" in msg)
+
+
 # ── Models ───────────────────────────────────────────────────────────────────
 
 class PlanItemCreate(BaseModel):
@@ -255,10 +279,11 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
     the window AND content_pieces that were created/published inside the
     window (so finished work shows up too).
     """
+    global _EXTERNAL_URL_PRESENT
     tenant_id = getattr(request.state, "tenant_id", "default")
-    try:
-        sb = get_supabase()
+    sb = get_supabase()
 
+    try:
         scheduled = (
             sb.table("content_plan_items")
             .select("*")
@@ -267,22 +292,59 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
             .lte("scheduled_for", end)
             .execute()
         )
-        pieces_published = (
+    except Exception as e:
+        logger.error(f"list_plan_for_calendar scheduled error: {e}")
+        return {"scheduled": [], "published_pieces": [], "error": str(e)}
+
+    columns = (
+        _LEGACY_PIECE_COLUMNS
+        if _EXTERNAL_URL_PRESENT is False
+        else _FULL_PIECE_COLUMNS
+    )
+
+    def _query(cols: str):
+        return (
             sb.table("content_pieces")
-            .select("id,title,content_type,status,published_at,target_url,external_url,created_at")
+            .select(cols)
             .eq("tenant_id", tenant_id)
             .eq("status", "published")
             .gte("published_at", start)
             .lte("published_at", end)
             .execute()
         )
-        return {
-            "scheduled": [_row(x) for x in (scheduled.data or [])],
-            "published_pieces": pieces_published.data or [],
-        }
+
+    try:
+        pieces_published = _query(columns)
+        if _EXTERNAL_URL_PRESENT is None:
+            _EXTERNAL_URL_PRESENT = True
     except Exception as e:
-        logger.error(f"list_plan_for_calendar error: {e}")
-        return {"scheduled": [], "published_pieces": [], "error": str(e)}
+        if _EXTERNAL_URL_PRESENT is not False and _is_missing_column_error(e):
+            _EXTERNAL_URL_PRESENT = False
+            logger.warning(
+                "content_pieces.external_url missing — falling back to legacy "
+                "SELECT. Apply migration 024_tenant_usage_and_plans.sql to enable."
+            )
+            try:
+                pieces_published = _query(_LEGACY_PIECE_COLUMNS)
+            except Exception as e2:
+                logger.error(f"list_plan_for_calendar pieces error (legacy): {e2}")
+                return {
+                    "scheduled": [_row(x) for x in (scheduled.data or [])],
+                    "published_pieces": [],
+                    "error": str(e2),
+                }
+        else:
+            logger.error(f"list_plan_for_calendar pieces error: {e}")
+            return {
+                "scheduled": [_row(x) for x in (scheduled.data or [])],
+                "published_pieces": [],
+                "error": str(e),
+            }
+
+    return {
+        "scheduled": [_row(x) for x in (scheduled.data or [])],
+        "published_pieces": pieces_published.data or [],
+    }
 
 
 # ── Create one ───────────────────────────────────────────────────────────────
