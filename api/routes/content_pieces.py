@@ -168,12 +168,37 @@ async def update_content_piece(piece_id: str, payload: ContentPieceUpdate):
 
 # ── Delete ───────────────────────────────────────────────────────────────────
 
-@router.delete("/pieces/{piece_id}")
-async def delete_content_piece(piece_id: str):
-    """Archive/delete a content piece."""
+@router.delete("/pieces/archived")
+async def delete_archived_content_pieces(request: Request):
+    """Permanently delete every archived content piece for the current tenant.
+
+    Backs the dashboard's "Töm arkiv" button. Declared before the
+    parameterised ``/pieces/{piece_id}`` route so FastAPI matches the
+    literal ``archived`` segment first.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        sb.table("content_pieces").delete().eq("id", piece_id).execute()
+        result = (
+            sb.table("content_pieces")
+            .delete()
+            .eq("tenant_id", tenant_id)
+            .eq("status", "archived")
+            .execute()
+        )
+        return {"success": True, "deleted": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"delete_archived_content_pieces error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@router.delete("/pieces/{piece_id}")
+async def delete_content_piece(piece_id: str, request: Request):
+    """Permanently delete a single content piece (tenant-scoped)."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+        sb.table("content_pieces").delete().eq("id", piece_id).eq("tenant_id", tenant_id).execute()
         return {"success": True}
     except Exception as e:
         logger.error(f"delete_content_piece error: {e}")

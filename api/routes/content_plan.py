@@ -288,6 +288,7 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
             sb.table("content_plan_items")
             .select("*")
             .eq("tenant_id", tenant_id)
+            .neq("status", "archived")
             .gte("scheduled_for", start)
             .lte("scheduled_for", end)
             .execute()
@@ -499,6 +500,31 @@ async def update_plan_item(item_id: str, payload: PlanItemUpdate, request: Reque
 
 
 # ── Delete ───────────────────────────────────────────────────────────────────
+
+@router.delete("/plan/archived")
+async def delete_archived_plan_items(request: Request):
+    """Permanently delete every archived plan item for the current tenant.
+
+    Backs the dashboard's "Töm arkiv" button. Archived rows are otherwise
+    invisible in the UI but linger in the table and re-appeared on the
+    calendar before the status filter was added — a hard delete is the
+    only way for a user to truly clear them.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("content_plan_items")
+            .delete()
+            .eq("tenant_id", tenant_id)
+            .eq("status", "archived")
+            .execute()
+        )
+        return {"success": True, "deleted": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"delete_archived_plan_items error: {e}")
+        return {"success": False, "error": str(e)}
+
 
 @router.delete("/plan/{item_id}")
 async def delete_plan_item(item_id: str, request: Request):
