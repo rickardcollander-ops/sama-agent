@@ -21,6 +21,7 @@ hourly: when ``scheduled_for <= now()``, the idea is drafted, and if
 the flag is set the resulting article is also published.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -778,7 +779,8 @@ Return ONLY a JSON object (no markdown fences):
   "word_count": <number>
 }}
 """
-    message = client.messages.create(
+    message = await asyncio.to_thread(
+        client.messages.create,
         model=settings.CLAUDE_MODEL,
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
@@ -836,25 +838,31 @@ Return ONLY a JSON object (no markdown fences):
         except Exception as e:
             logger.warning(f"cascade lookup failed for parent={item_id}: {e}")
             children = []
-        for child in children:
-            try:
-                child_piece = await _materialise_social_child(
-                    sb, tenant_id, child, parent_piece=piece,
-                )
-                if child_piece and child_piece.get("id"):
+        # Fan out social children in parallel — each platform is an
+        # independent LLM call, so awaiting them sequentially needlessly
+        # multiplied latency by the number of children.
+        if children:
+            results = await asyncio.gather(
+                *(
+                    _materialise_social_child(sb, tenant_id, child, parent_piece=piece)
+                    for child in children
+                ),
+                return_exceptions=True,
+            )
+            for child, child_piece in zip(children, results):
+                if isinstance(child_piece, Exception):
+                    logger.warning(
+                        f"cascade social draft for child={child.get('id')} "
+                        f"parent={item_id} failed: {child_piece}"
+                    )
+                    try:
+                        sb.table("content_plan_items").update(
+                            {"status": "idea"}
+                        ).eq("id", child["id"]).execute()
+                    except Exception:
+                        pass
+                elif child_piece and child_piece.get("id"):
                     cascaded.append(child_piece["id"])
-            except Exception as e:
-                logger.warning(
-                    f"cascade social draft for child={child.get('id')} "
-                    f"parent={item_id} failed: {e}"
-                )
-                # Roll the child back to idea so the user can retry.
-                try:
-                    sb.table("content_plan_items").update(
-                        {"status": "idea"}
-                    ).eq("id", child["id"]).execute()
-                except Exception:
-                    pass
 
     return {
         "plan_item_id": item_id,
