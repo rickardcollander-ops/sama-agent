@@ -85,6 +85,21 @@ async def run_site_audit(payload: RunPayload, request: Request):
 # per second. Throttling keeps DB load sane while still feeling live.
 _PROGRESS_WRITE_INTERVAL_S = 1.5
 
+# Tracks whether the optional progress columns (pages_total / pages_done from
+# migration 036_site_audit_progress.sql) exist in the connected database.
+# We probe lazily on the first failure with code 42703 and then fall back to
+# a slimmer SELECT so we don't spam the error log for every dashboard poll.
+_PROGRESS_COLUMNS_PRESENT: Optional[bool] = None
+
+
+def _is_missing_column_error(err: Exception) -> bool:
+    """True when Supabase tells us a SELECT references a non-existent column."""
+    code = getattr(err, "code", None)
+    if code == "42703":
+        return True
+    msg = str(err)
+    return "42703" in msg or "does not exist" in msg and "column" in msg
+
 
 async def _execute_audit(
     run_id: str,
@@ -111,6 +126,9 @@ async def _execute_audit(
             return
         last_write["t"] = now
         last_write["total"] = total
+        global _PROGRESS_COLUMNS_PRESENT
+        if _PROGRESS_COLUMNS_PRESENT is False:
+            return
         try:
             await asyncio.to_thread(
                 lambda: sb.table("site_audits").update({
@@ -118,8 +136,16 @@ async def _execute_audit(
                     "pages_done": done,
                 }).eq("id", run_id).execute()
             )
-        except Exception:
-            logger.debug(f"progress write failed for {run_id}", exc_info=True)
+            _PROGRESS_COLUMNS_PRESENT = True
+        except Exception as e:
+            if _is_missing_column_error(e):
+                _PROGRESS_COLUMNS_PRESENT = False
+                logger.warning(
+                    "site_audits.pages_total/pages_done missing — apply "
+                    "migration 036_site_audit_progress.sql to enable progress UI"
+                )
+            else:
+                logger.debug(f"progress write failed for {run_id}", exc_info=True)
 
     try:
         result = await agent.audit_domain(
@@ -149,22 +175,57 @@ async def _execute_audit(
 
 # ── GET /runs ────────────────────────────────────────────────────────────────
 
+_FULL_RUN_COLUMNS = (
+    "id,domain,pages_analyzed,pages_total,pages_done,"
+    "overall_score,status,started_at,completed_at,error"
+)
+_LEGACY_RUN_COLUMNS = (
+    "id,domain,pages_analyzed,overall_score,status,"
+    "started_at,completed_at,error"
+)
+
+
 @router.get("/runs")
 async def list_runs(request: Request, limit: int = 20):
     """Recent audits for this tenant (history view)."""
+    global _PROGRESS_COLUMNS_PRESENT
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
-    try:
-        result = (
+
+    columns = (
+        _LEGACY_RUN_COLUMNS
+        if _PROGRESS_COLUMNS_PRESENT is False
+        else _FULL_RUN_COLUMNS
+    )
+
+    def _query(cols: str):
+        return (
             sb.table("site_audits")
-            .select("id,domain,pages_analyzed,pages_total,pages_done,overall_score,status,started_at,completed_at,error")
+            .select(cols)
             .eq("tenant_id", tenant_id)
             .order("started_at", desc=True)
             .limit(min(limit, 100))
             .execute()
         )
+
+    try:
+        result = _query(columns)
+        if _PROGRESS_COLUMNS_PRESENT is None:
+            _PROGRESS_COLUMNS_PRESENT = True
         return {"runs": result.data or []}
     except Exception as e:
+        if _PROGRESS_COLUMNS_PRESENT is not False and _is_missing_column_error(e):
+            _PROGRESS_COLUMNS_PRESENT = False
+            logger.warning(
+                "site_audits progress columns missing — falling back to "
+                "legacy SELECT. Apply migration 036_site_audit_progress.sql."
+            )
+            try:
+                result = _query(_LEGACY_RUN_COLUMNS)
+                return {"runs": result.data or []}
+            except Exception as e2:
+                logger.error(f"list site_audits failed (legacy): {e2}")
+                return {"runs": []}
         logger.error(f"list site_audits failed: {e}")
         return {"runs": []}
 

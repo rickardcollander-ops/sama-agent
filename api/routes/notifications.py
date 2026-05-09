@@ -18,17 +18,25 @@ async def list_notifications(limit: int = 20, unread_only: bool = True):
     if unread_only:
         notifications = await notification_service.get_unread(limit=limit)
     else:
-        try:
-            from shared.database import get_supabase
-            sb = get_supabase()
-            result = sb.table("notifications") \
-                .select("*") \
-                .order("created_at", desc=True) \
-                .limit(limit) \
-                .execute()
-            notifications = result.data or []
-        except Exception:
+        # Reuse the service's missing-table cache so we don't keep hammering
+        # Supabase with 404s when migration 012 hasn't been applied.
+        if getattr(notification_service, "_table_missing", False):
             notifications = []
+        else:
+            try:
+                from shared.database import get_supabase
+                from shared.notifications import _is_missing_table_error
+                sb = get_supabase()
+                result = sb.table("notifications") \
+                    .select("*") \
+                    .order("created_at", desc=True) \
+                    .limit(limit) \
+                    .execute()
+                notifications = result.data or []
+            except Exception as e:
+                if _is_missing_table_error(e):
+                    notification_service._mark_missing()
+                notifications = []
 
     return {"notifications": notifications, "total": len(notifications)}
 

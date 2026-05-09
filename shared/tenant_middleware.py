@@ -47,6 +47,7 @@ payload is fixed in middleware and never reaches a route. Writes
 
 import logging
 import os
+import time
 from typing import Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -56,6 +57,23 @@ from starlette.responses import JSONResponse, Response
 logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT_ID = "default"
+
+# Per-tenant cooldown for the noisy "legacy_header_rejected" warning. Without
+# this every dashboard poll (multiple per second, dozens of endpoints) emits
+# its own WARNING — the production log becomes unreadable. We still want to
+# surface the deprecation, so we log once per tenant and then again every
+# _LEGACY_REJECT_LOG_INTERVAL_S seconds.
+_LEGACY_REJECT_LOG_INTERVAL_S = 300.0
+_legacy_reject_last_log: dict[str, float] = {}
+
+
+def _should_log_legacy_reject(tenant: str) -> bool:
+    now = time.monotonic()
+    last = _legacy_reject_last_log.get(tenant, 0.0)
+    if now - last < _LEGACY_REJECT_LOG_INTERVAL_S:
+        return False
+    _legacy_reject_last_log[tenant] = now
+    return True
 
 # Paths that should bypass tenant resolution entirely (health checks, OAuth
 # callbacks, webhooks signed by external providers).
@@ -258,11 +276,12 @@ class TenantMiddleware(BaseHTTPMiddleware):
             # honour it for tenants on the explicit allowlist during the
             # deprecation window.
             if legacy_tid and legacy_tid not in _legacy_allowlist():
-                logger.warning(
-                    "legacy_header_rejected tenant=%s path=%s "
-                    "(add to LEGACY_TENANT_HEADERS_ALLOW or migrate to JWT)",
-                    legacy_tid, path,
-                )
+                if _should_log_legacy_reject(legacy_tid):
+                    logger.warning(
+                        "legacy_header_rejected tenant=%s path=%s "
+                        "(add to LEGACY_TENANT_HEADERS_ALLOW or migrate to JWT)",
+                        legacy_tid, path,
+                    )
                 legacy_tid = None
             elif legacy_tid:
                 logger.info("legacy_header_used tenant=%s path=%s", legacy_tid, path)
