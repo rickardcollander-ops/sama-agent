@@ -29,6 +29,88 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _normalize_query(q: Any) -> str:
+    return (q or "").strip().lower() if isinstance(q, str) else ""
+
+
+def _filter_run_payload_to_saved(
+    payload: Dict[str, Any], saved_queries: List[str]
+) -> Dict[str, Any]:
+    """Restrict a stored AnalysisRun payload to currently-saved AI Assistant queries.
+
+    Older runs may carry query_results for prompts the user has since removed
+    from AI Assistant (or that were measured before the saved-only invariant
+    was enforced). Surfacing those would contradict the "only what you put in
+    AI Assistant gets measured" guarantee, so we drop them at read time and
+    rebuild the overview aggregates on the filtered subset to keep the
+    headline numbers consistent with the table.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    results = payload.get("query_results")
+    if not isinstance(results, list):
+        return payload
+
+    saved_norm = {_normalize_query(q) for q in saved_queries if _normalize_query(q)}
+    filtered = [
+        q for q in results
+        if isinstance(q, dict) and _normalize_query(q.get("query")) in saved_norm
+    ]
+
+    if len(filtered) == len(results):
+        return payload
+
+    out = dict(payload)
+    out["query_results"] = filtered
+    out["overview"] = _rebuild_overview(filtered)
+    return out
+
+
+def _rebuild_overview(query_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Mirror agents.analysis.AnalysisAgent._build_overview for filtered subsets."""
+    total_queries = len(query_results)
+    platform_count = max(
+        (len(q.get("ai_results") or []) for q in query_results), default=0
+    )
+    total_slots = total_queries * platform_count
+
+    total_mentions = sum(
+        sum(1 for r in (q.get("ai_results") or []) if r.get("mentioned"))
+        for q in query_results
+    )
+    seo_top10 = sum(
+        1 for q in query_results
+        if q.get("seo_rank") and q["seo_rank"] <= 10
+    )
+    present = sum(
+        1 for q in query_results
+        if (q.get("seo_rank") and q["seo_rank"] <= 10)
+        or any(r.get("mentioned") for r in (q.get("ai_results") or []))
+    )
+
+    opportunities = [
+        {
+            "query": q.get("query", ""),
+            "reason": (
+                "You rank on Google but AIs don't mention you — citation gap"
+                if q.get("gap") == "seo_winner_geo_loser"
+                else "AIs mention you but Google doesn't rank you — backlink/pillar gap"
+            ),
+        }
+        for q in query_results
+        if q.get("gap") in ("seo_winner_geo_loser", "geo_winner_seo_loser")
+    ][:3]
+
+    return {
+        "overall_mention_rate": (total_mentions / total_slots) if total_slots else 0,
+        "seo_top10_coverage": (seo_top10 / total_queries) if total_queries else 0,
+        "queries_with_presence": present,
+        "total_queries": total_queries,
+        "top_opportunities": opportunities,
+    }
+
+
 class GenerateQueriesPayload(BaseModel):
     count: int = 10
     # When ``mode="suggest"`` the endpoint returns LLM-generated suggestions in
@@ -231,7 +313,13 @@ async def list_runs(request: Request, limit: int = 20):
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
-    """One run with its full payload — used for polling and replay."""
+    """One run with its full payload — used for polling and replay.
+
+    Historical runs are clamped to the tenant's currently-saved
+    ``geo_queries`` before being returned: prompts that have since been
+    removed from AI Assistant should not reappear on Insights, and the
+    aggregate overview is recomputed so totals match the visible rows.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
@@ -253,7 +341,17 @@ async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
             payload = row["payload"]
             payload["id"] = row["id"]
             payload["status"] = row["status"]
-            return payload
+            try:
+                config = await get_tenant_config(tenant_id)
+                saved = list(getattr(config, "geo_queries", []) or [])
+            except Exception:
+                logger.warning(
+                    "could not load tenant config when filtering run %s; returning raw payload",
+                    run_id,
+                    exc_info=True,
+                )
+                saved = []
+            return _filter_run_payload_to_saved(payload, saved)
         return row
     except HTTPException:
         raise
