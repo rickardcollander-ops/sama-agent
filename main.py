@@ -30,6 +30,7 @@ from api.routes import (
     integrations_gsc as integrations_gsc_routes,
     content_plan as content_plan_routes,
     content_plan_create as content_plan_create_routes,
+    content_plan_refine as content_plan_refine_routes,
     content_ai_edit as content_ai_edit_routes,
     content_analysis_cache as content_analysis_cache_routes,
     weekly_email as weekly_email_routes,
@@ -260,6 +261,7 @@ app.include_router(content_validation.router, prefix="/api/content", tags=["cont
 app.include_router(content_generate.router, prefix="/api/content", tags=["content-generate"])
 app.include_router(content_plan_routes.router, prefix="/api/content", tags=["content-plan"])
 app.include_router(content_plan_create_routes.router, prefix="/api/content", tags=["content-plan-create"])
+app.include_router(content_plan_refine_routes.router, prefix="/api/content", tags=["content-plan-refine"])
 app.include_router(content_ai_edit_routes.router, prefix="/api/content", tags=["content-ai-edit"])
 app.include_router(content_analysis_cache_routes.router, prefix="/api/content", tags=["content-analysis-cache"])
 app.include_router(social_posts.router, prefix="/api/social", tags=["social-posts"])
