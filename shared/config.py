@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
 
+    # Voyage AI (embeddings — used by internal-linking semantic similarity).
+    # Optional: when unset, internal linking falls back to keyword matching only.
+    VOYAGE_API_KEY: str = ""
+
     # Vector Store
     PINECONE_API_KEY: str = ""
     PINECONE_ENVIRONMENT: str = ""

@@ -555,24 +555,31 @@ Requirements:
         if not analysis.get("in_first_paragraph"):
             issues.append("The target keyword does not appear in the first paragraph. Add it early.")
 
-        # Fetch existing content titles for internal-link suggestions
+        # Build internal-link suggestions from BOTH SAMA-authored content
+        # and sitemap-discovered pages, ranked by lexical + semantic relevance
+        # to the article being optimized.
         internal_pages: List[str] = []
         try:
-            sb = self._get_sb()
-            pages_result = sb.table(CONTENT_PIECES_TABLE).select("title,target_url").limit(50).execute()
-            for page in (pages_result.data or []):
-                title = page.get("title", "")
-                url = page.get("target_url", "")
+            from .seo_internal_linking import internal_linking_optimizer
+            tenant_id = getattr(self.tenant_config, "tenant_id", None) if self.tenant_config else None
+            link_result = await internal_linking_optimizer.analyze_content_for_links(
+                content=content,
+                current_url="",
+                tenant_id=tenant_id,
+            )
+            for s in (link_result.get("suggestions") or [])[:15]:
+                title = s.get("target_title") or s.get("anchor_text") or ""
+                url = s.get("target_url") or ""
                 if title and url:
                     internal_pages.append(f"- \"{title}\" ({url})")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("internal-link suggestion fetch failed: %s", e)
 
         internal_links_section = ""
         if internal_pages:
             internal_links_section = (
                 "\n\nINTERNAL PAGES AVAILABLE FOR LINKING:\n"
-                + "\n".join(internal_pages[:20])
+                + "\n".join(internal_pages)
                 + "\n\nWhere relevant, add markdown links to these internal pages using "
                 "natural anchor text. Do not force links where they don't fit."
             )
