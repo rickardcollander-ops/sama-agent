@@ -964,7 +964,15 @@ Return ONLY a JSON object (no markdown fences):
 
 @router.post("/plan/{item_id}/draft")
 async def draft_plan_item(item_id: str, request: Request):
-    """Turn a plan item into a full article and link them."""
+    """Kick off drafting in the background; return immediately.
+
+    Article generation is a 30-90s LLM call (long-form blog + social
+    cascade), which routinely exceeds Vercel's proxy timeout and leaves
+    the dashboard's "Skriver utkast…" spinner stuck. We mark the item
+    ``drafting`` synchronously so concurrent clicks no-op, hand the work
+    off to a background task, and let the dashboard poll plan/pieces
+    until the new draft surfaces.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
@@ -980,19 +988,48 @@ async def draft_plan_item(item_id: str, request: Request):
         if not rows:
             raise HTTPException(status_code=404, detail="Plan item not found")
         item = rows[0]
+        if item.get("status") == "drafting":
+            # Idempotent: a duplicate click while the first run is still
+            # in flight should not spawn a second cascade.
+            return {
+                "success": True,
+                "status": "drafting",
+                "plan_item_id": item_id,
+                "already_running": True,
+            }
 
-        result_data = await _materialise_idea(sb, tenant_id, item)
-        return {"success": True, **result_data}
+        sb.table("content_plan_items").update({"status": "drafting"}).eq(
+            "id", item_id
+        ).execute()
+
+        async def _run() -> None:
+            try:
+                await _materialise_idea(sb, tenant_id, item)
+            except Exception as e:
+                logger.error(
+                    f"draft_plan_item background error for {item_id}: {e}"
+                )
+                try:
+                    sb.table("content_plan_items").update(
+                        {"status": "idea"}
+                    ).eq("id", item_id).execute()
+                except Exception:
+                    pass
+
+        asyncio.create_task(_run())
+        return {
+            "success": True,
+            "status": "drafting",
+            "plan_item_id": item_id,
+        }
     except HTTPException:
-        try:
-            sb.table("content_plan_items").update({"status": "idea"}).eq("id", item_id).execute()
-        except Exception:
-            pass
         raise
     except Exception as e:
         logger.error(f"draft_plan_item error: {e}")
         try:
-            sb.table("content_plan_items").update({"status": "idea"}).eq("id", item_id).execute()
+            sb.table("content_plan_items").update({"status": "idea"}).eq(
+                "id", item_id
+            ).execute()
         except Exception:
             pass
         return {"success": False, "error": str(e)}
