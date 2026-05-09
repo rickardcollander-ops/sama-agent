@@ -91,6 +91,12 @@ _PROGRESS_WRITE_INTERVAL_S = 1.5
 # a slimmer SELECT so we don't spam the error log for every dashboard poll.
 _PROGRESS_COLUMNS_PRESENT: Optional[bool] = None
 
+# Same probe-and-cache trick for the AI-readability columns added in
+# migration 042_ai_readability.sql. If the migration hasn't been applied
+# yet, we silently drop those keys from the update and the audit still
+# completes successfully.
+_AI_READABILITY_COLUMNS_PRESENT: Optional[bool] = None
+
 
 def _is_missing_column_error(err: Exception) -> bool:
     """True when Supabase tells us a SELECT references a non-existent column."""
@@ -152,6 +158,28 @@ async def _execute_audit(
             domain=domain, max_pages=max_pages, progress_cb=progress_cb,
         )
         result["id"] = run_id
+
+        # AI-readability post-step. Runs against the audit result, refetches
+        # the homepage + 2 most-linked pages, and writes the report into
+        # ``payload.ai_readability``. Best-effort: failures are logged but
+        # never fail the audit.
+        try:
+            from agents.ai_readability import score_audit
+            from shared.config import settings as _settings
+            anth_key = (
+                getattr(config, "anthropic_api_key", None)
+                or _settings.ANTHROPIC_API_KEY
+            )
+            ai_readability = await score_audit(
+                result,
+                anthropic_key=anth_key,
+                tenant_id=tenant_id,
+            )
+            result["ai_readability"] = ai_readability
+        except Exception as e:
+            logger.info(f"ai_readability scoring skipped for {run_id}: {e}")
+            result["ai_readability"] = {"error": str(e)[:240]}
+
         update = {
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -159,6 +187,12 @@ async def _execute_audit(
             "overall_score": result.get("scores", {}).get("overall"),
             "payload": result,
         }
+        # Top up the AI-readability score columns when migration 042 has run.
+        ai_block = result.get("ai_readability") or {}
+        ai_score = ai_block.get("overall_score")
+        if isinstance(ai_score, (int, float)):
+            update["ai_readability_score"] = int(ai_score)
+            update["ai_readability_run_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         logger.exception(f"Site audit {run_id} failed for tenant {tenant_id}")
         update = {
@@ -167,10 +201,34 @@ async def _execute_audit(
             "error": str(e)[:500],
         }
 
+    global _AI_READABILITY_COLUMNS_PRESENT
     try:
         sb.table("site_audits").update(update).eq("id", run_id).execute()
-    except Exception:
-        logger.warning(f"Could not persist site_audit {run_id} update", exc_info=True)
+        if "ai_readability_score" in update:
+            _AI_READABILITY_COLUMNS_PRESENT = True
+    except Exception as e:
+        if (
+            "ai_readability_score" in update
+            and _is_missing_column_error(e)
+        ):
+            _AI_READABILITY_COLUMNS_PRESENT = False
+            logger.warning(
+                "site_audits.ai_readability_* missing — apply migration "
+                "042_ai_readability.sql to enable AI-readability scorecard"
+            )
+            update.pop("ai_readability_score", None)
+            update.pop("ai_readability_run_at", None)
+            try:
+                sb.table("site_audits").update(update).eq("id", run_id).execute()
+            except Exception:
+                logger.warning(
+                    f"Could not persist site_audit {run_id} update (fallback)",
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                f"Could not persist site_audit {run_id} update", exc_info=True
+            )
 
 
 # ── GET /runs ────────────────────────────────────────────────────────────────
