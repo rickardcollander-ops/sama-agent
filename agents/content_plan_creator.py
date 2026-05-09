@@ -31,6 +31,7 @@ from anthropic import Anthropic
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.tenant import get_tenant_config
 from .brand_voice import BrandVoice, BrandVoiceNotFoundError, TenantBrandVoice
 from . import brand_voice_scraper
 from .social_for_article import generate_for_article
@@ -40,6 +41,34 @@ logger = logging.getLogger(__name__)
 SUPPORTED_PLATFORMS = {"linkedin", "x", "instagram", "facebook"}
 DEFAULT_WEEKDAY = 1  # Tuesday (Mon=0)
 MODEL = getattr(settings, "CLAUDE_MODEL", "claude-sonnet-4-6")
+
+# Maps the ISO-639-1 codes TenantConfig.language returns to a human-readable
+# name we can use in the LLM prompt. Anything not listed falls back to the
+# code itself so the model still knows which language to target.
+_LANGUAGE_NAMES: Dict[str, str] = {
+    "sv": "Swedish",
+    "nb": "Norwegian (Bokmål)",
+    "no": "Norwegian",
+    "da": "Danish",
+    "fi": "Finnish",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "nl": "Dutch",
+    "pt": "Portuguese",
+    "pl": "Polish",
+    "cs": "Czech",
+    "ru": "Russian",
+    "ja": "Japanese",
+    "zh": "Chinese",
+    "en": "English",
+}
+
+
+def _language_name(code: str) -> str:
+    code = (code or "en").lower()
+    return _LANGUAGE_NAMES.get(code, code)
 
 
 async def _ensure_voice(tenant_id: str, domain: str, brand_name: str) -> TenantBrandVoice:
@@ -177,8 +206,22 @@ async def _generate_titles_for_topics(
     voice: TenantBrandVoice,
     brand_name: str,
     topics: List[Dict[str, Any]],
+    *,
+    language: str = "en",
+    brand_description: str = "",
+    target_audience: str = "",
+    unique_selling_points: str = "",
+    business_type: str = "",
+    tone_of_voice: str = "",
+    competitors: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Ask Claude to turn each topic into a concrete article title + angle."""
+    """Ask Claude to turn each topic into a concrete article title + angle.
+
+    The tenant's language and brand context (description, target audience,
+    USP, competitors) are baked into the prompt so the titles are written in
+    the right language and stay on-brand instead of falling back to generic
+    English business-software framing.
+    """
     if not topics or not settings.ANTHROPIC_API_KEY:
         return []
 
@@ -187,20 +230,53 @@ async def _generate_titles_for_topics(
         for i, t in enumerate(topics)
     )
 
+    language_name = _language_name(language)
+    competitors_block = ", ".join(competitors or []) or "(none on record)"
+    brand_context_lines = [
+        f"Brand: {brand_name}",
+    ]
+    if business_type:
+        brand_context_lines.append(f"Business type: {business_type}")
+    if brand_description:
+        brand_context_lines.append(f"What the brand does: {brand_description}")
+    if target_audience:
+        brand_context_lines.append(f"Target audience: {target_audience}")
+    if unique_selling_points:
+        brand_context_lines.append(f"Unique selling points / USP: {unique_selling_points}")
+    if tone_of_voice:
+        brand_context_lines.append(f"Tone of voice: {tone_of_voice}")
+    brand_context_lines.append(f"Known competitors: {competitors_block}")
+    brand_context_block = "\n".join(brand_context_lines)
+
     system_prompt = voice.get_system_prompt("blog", brand_name=brand_name)
-    user_prompt = f"""Below is a list of search queries where we have a gap in SEO and/or AI visibility. For each, propose ONE concrete article that addresses the query in our brand voice.
+    system_prompt += (
+        f"\n\nLANGUAGE REQUIREMENT (mandatory):\n"
+        f"- Write ALL output (titles, angles, rationale, pillar names, "
+        f"target keywords) in {language_name} ({language}). "
+        f"Never switch to English unless the brand explicitly uses English."
+    )
+
+    user_prompt = f"""Below is the brand context, followed by a list of search queries where we have a gap in SEO and/or AI visibility. For each query, propose ONE concrete article that addresses it from THIS brand's perspective and in THIS brand's voice.
+
+BRAND CONTEXT:
+{brand_context_block}
 
 Queries:
 {topic_lines}
 
-Return ONLY a JSON array of {len(topics)} objects, in the same order:
+Rules:
+- Stay strictly on-topic for the brand described above. If a query is generic (e.g. "best business software"), reframe it to {brand_name}'s actual industry, customer, and value proposition. Do not propose articles for unrelated industries.
+- Write everything in {language_name}. Titles, angles, rationale, pillar names and target keywords must all be in {language_name}.
+- Titles must read like a confident article a {brand_name} domain expert would write, not a generic SEO listicle.
+
+Return ONLY a JSON array of {len(topics)} objects, in the same order, with all string values in {language_name}:
 [
   {{
-    "title": "Concrete article headline that targets the query",
-    "angle": "One sentence describing the angle/POV",
-    "target_keyword": "the primary keyword to optimise for",
-    "pillar": "a one-word content pillar (churn|onboarding|automation|scaling|metrics|comparison|other)",
-    "rationale": "why this matters (e.g. 'competitor X dominates AI answers for this query')"
+    "title": "Concrete article headline that targets the query, in {language_name}",
+    "angle": "One sentence describing the angle/POV, in {language_name}",
+    "target_keyword": "the primary keyword to optimise for, in {language_name}",
+    "pillar": "a short content pillar label, in {language_name}",
+    "rationale": "why this matters for {brand_name} specifically, in {language_name}"
   }}
 ]
 """
@@ -481,16 +557,70 @@ async def create_plan_from_analysis(
         run = rows[0]
         payload = run.get("payload") or {}
 
-    # 2. Brand context
+    # 2. Brand context. We prefer the per-tenant settings (the brand the
+    # user actually configured in the dashboard) over whatever brand_name
+    # was attached to the analysis_run — analysis runs sometimes carry a
+    # different brand label and using it here produced ideas about the
+    # wrong company.
     brand_ctx = _load_tenant_brand_context(tenant_id)
-    domain = run.get("domain") or brand_ctx.get("domain") or ""
-    brand_name = run.get("brand_name") or brand_ctx.get("brand_name") or tenant_id
+    try:
+        tenant_config = await get_tenant_config(tenant_id)
+    except Exception as e:
+        logger.warning(
+            "content_plan_creator: get_tenant_config failed for tenant=%s "
+            "(%s); falling back to raw brand_ctx",
+            tenant_id, e,
+        )
+        tenant_config = None
 
-    # 3. Voice for title generation only. We deliberately use the default
-    # voice (no DB lookup, no scraping) so plan creation stays fast and
-    # cheap. The fully-tone-matched draft happens later, in
-    # _materialise_idea, when the user approves an individual idea.
-    voice = BrandVoice.for_tenant("default")
+    domain = (
+        (tenant_config.domain if tenant_config else "")
+        or run.get("domain")
+        or brand_ctx.get("domain")
+        or ""
+    )
+    brand_name = (
+        (tenant_config.brand_name if tenant_config else "")
+        or brand_ctx.get("brand_name")
+        or run.get("brand_name")
+        or tenant_id
+    )
+    language = tenant_config.language if tenant_config else "en"
+    brand_description = (
+        (brand_ctx.get("brand_description") if isinstance(brand_ctx, dict) else "")
+        or (tenant_config.get_raw("brand_description", "") if tenant_config else "")
+        or ""
+    )
+    target_audience = (
+        (brand_ctx.get("target_audience") if isinstance(brand_ctx, dict) else "")
+        or (tenant_config.get_raw("target_audience", "") if tenant_config else "")
+        or ""
+    )
+    unique_selling_points = (
+        (brand_ctx.get("unique_selling_points") if isinstance(brand_ctx, dict) else "")
+        or (tenant_config.get_raw("unique_selling_points", "") if tenant_config else "")
+        or ""
+    )
+    business_type = (
+        (brand_ctx.get("business_type") if isinstance(brand_ctx, dict) else "")
+        or (tenant_config.get_raw("business_type", "") if tenant_config else "")
+        or ""
+    )
+    tone_of_voice = (
+        (brand_ctx.get("tone_of_voice") if isinstance(brand_ctx, dict) else "")
+        or (tenant_config.brand_voice_tone if tenant_config else "")
+        or ""
+    )
+    competitors = list(tenant_config.competitors) if tenant_config else []
+
+    # 3. Voice for title generation. Use the tenant's own voice when one
+    # has been scraped/persisted; otherwise fall back to the default voice
+    # (no scrape during plan creation -- that would slow it down too much).
+    # The full tone-matched draft still happens later, in _materialise_idea.
+    try:
+        voice = BrandVoice.for_tenant(tenant_id)
+    except BrandVoiceNotFoundError:
+        voice = BrandVoice.for_tenant("default")
 
     # 4. Extract + bucket topics
     topics = _extract_topics_from_run(payload)
@@ -504,32 +634,43 @@ async def create_plan_from_analysis(
         }
 
     target_total = articles_per_week * 13  # ~13 weeks across 90 days
-    # Bucket assignment
+    # Bucket assignment by gap type
     bucketed: Dict[str, List[Dict[str, Any]]] = {"30": [], "60": [], "90": []}
     for t in topics:
         b = _bucket_for_gap(t["gap_type"], t["ai_mention"])
         bucketed[b].append(t)
 
-    # Trim to target_total proportionally so the user gets exactly the
-    # cadence they asked for.
-    target_split = {
-        "30": max(1, target_total // 3),
-        "60": max(1, target_total // 3),
-        "90": target_total - 2 * max(1, target_total // 3),
-    }
-    for b in ("30", "60", "90"):
-        if len(bucketed[b]) > target_split[b]:
-            bucketed[b] = bucketed[b][: target_split[b]]
-        # If we're short, top up from later buckets
-        while len(bucketed[b]) < target_split[b]:
-            stolen = None
-            for src in ("90", "60", "30"):
-                if src != b and bucketed[src]:
-                    stolen = bucketed[src].pop(0)
-                    break
-            if not stolen:
-                break
-            bucketed[b].append(stolen)
+    available_total = sum(len(v) for v in bucketed.values())
+
+    if available_total >= target_total:
+        # Plenty of topics — keep the gap-priority bucketing (high → 30d,
+        # medium → 60d, low → 90d) and trim each bucket to its share so we
+        # honour the user's cadence exactly. Over-bucket topics are kept in
+        # a spillover list so they can fill underfilled buckets instead of
+        # being discarded.
+        target_split = {
+            "30": max(1, target_total // 3),
+            "60": max(1, target_total // 3),
+            "90": target_total - 2 * max(1, target_total // 3),
+        }
+        spillover: List[Dict[str, Any]] = []
+        for b in ("30", "60", "90"):
+            if len(bucketed[b]) > target_split[b]:
+                spillover.extend(bucketed[b][target_split[b]:])
+                bucketed[b] = bucketed[b][: target_split[b]]
+        for b in ("30", "60", "90"):
+            while len(bucketed[b]) < target_split[b] and spillover:
+                bucketed[b].append(spillover.pop(0))
+    else:
+        # Sparse topics — the analysis only surfaced a handful of gaps, so
+        # the gap-priority bucketing collapses (the old logic dumped every
+        # topic into the 60-90d window). Spread what we have evenly across
+        # 30/60/90 instead so the user sees ideas in the next 30 days too,
+        # not just in months 2-3.
+        all_topics = bucketed["30"] + bucketed["60"] + bucketed["90"]
+        bucketed = {"30": [], "60": [], "90": []}
+        for idx, t in enumerate(all_topics):
+            bucketed[("30", "60", "90")[idx % 3]].append(t)
 
     bucket_counts = {b: len(bucketed[b]) for b in bucketed}
     schedule = _schedule_dates(articles_per_week, bucket_counts)
@@ -542,7 +683,16 @@ async def create_plan_from_analysis(
         for t in bucketed[b]:
             flat.append((b, t))
     titles = await _generate_titles_for_topics(
-        voice, brand_name, [t for _, t in flat]
+        voice,
+        brand_name,
+        [t for _, t in flat],
+        language=language,
+        brand_description=brand_description,
+        target_audience=target_audience,
+        unique_selling_points=unique_selling_points,
+        business_type=business_type,
+        tone_of_voice=tone_of_voice,
+        competitors=competitors,
     )
     if len(titles) != len(flat):
         # If batched call returned fewer than expected, pad with stub titles
@@ -630,8 +780,14 @@ async def create_plan_from_analysis(
     # links to the nearest article idea via parent_plan_item_id so when
     # the article is approved, _materialise_idea can cascade-draft the
     # social children with the right parent context.
+    logger.info(
+        "content_plan_creator: social loop pre-check tenant=%s "
+        "articles_created=%d platforms=%s social_per_week=%s",
+        tenant_id, len(article_records), platforms, social_per_week,
+    )
     if article_records and platforms and social_per_week > 0:
         social_dates = _social_schedule_dates(social_per_week)
+        attempted = 0
         for platform in platforms:
             for slot_idx, social_date in enumerate(social_dates):
                 parent = _nearest_article(article_records, social_date) \
@@ -642,7 +798,7 @@ async def create_plan_from_analysis(
                     "title": f"{platform.title()} post: {parent['title']}"[:300],
                     "topic": f"Social post linking to article: {parent['title']}"[:1000],
                     "content_type": f"social_{platform}",
-                    "target_keyword": parent["target_keyword"][:200],
+                    "target_keyword": (parent.get("target_keyword") or "")[:200],
                     "priority": parent["priority"],
                     "status": "idea",
                     "source": "analysis_gap",
@@ -657,10 +813,24 @@ async def create_plan_from_analysis(
                     },
                     "created_at": now_iso,
                 }
+                attempted += 1
                 if _safe_insert(sb, "content_plan_items", social_plan_data) is not None:
                     social_ideas_created += 1
                     if social_date > (last_date or social_date):
                         last_date = social_date
+        if attempted and social_ideas_created == 0:
+            logger.error(
+                "content_plan_creator: every social insert failed for "
+                "tenant=%s platforms=%s; check logs above for the underlying "
+                "PostgREST error",
+                tenant_id, platforms,
+            )
+    elif platforms and social_per_week > 0:
+        logger.warning(
+            "content_plan_creator: skipping social loop for tenant=%s — "
+            "no article_records were created (articles_created=%d)",
+            tenant_id, len(article_records),
+        )
 
     return {
         "plan_id": analysis_run_id,
