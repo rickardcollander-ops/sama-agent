@@ -6,7 +6,7 @@ Runs automated workflows on a schedule using APScheduler.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -52,6 +52,80 @@ _job_history: Dict[str, Dict[str, Any]] = {
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+# Map kind → scheduler job_id for the email jobs that the admin UI controls.
+# Values are (job_id, default_dow, default_hour, default_minute).
+_EMAIL_JOBS: Dict[str, Tuple[str, Optional[str], Optional[int], int]] = {
+    "weekly_status": ("weekly_status_email",       "mon", 9,    0),
+    "social_posts":  ("hourly_social_posts_email", None,  None, 15),
+}
+
+# Cache of the last-applied email_schedules row per kind. Used by
+# `_run_reload_email_schedules` to detect changes and reschedule the
+# corresponding job without restarting the process.
+_email_schedule_state: Dict[str, Dict[str, Any]] = {}
+
+
+def _read_email_schedule(kind: str) -> Optional[Dict[str, Any]]:
+    """Return the email_schedules row for `kind`, or None on lookup failure.
+
+    Failure is silent on purpose — if the migration hasn't been applied yet
+    the scheduler should still come up using the hard-coded defaults.
+    """
+    try:
+        from shared.database import get_supabase
+        sb = get_supabase()
+        result = (
+            sb.table("email_schedules")
+            .select("kind,enabled,cron_day_of_week,cron_hour,cron_minute,timezone,updated_at")
+            .eq("kind", kind)
+            .single()
+            .execute()
+        )
+        return result.data
+    except Exception as e:
+        logger.debug(f"[scheduler] email_schedules lookup failed for {kind}: {e}")
+        return None
+
+
+def _build_email_trigger(kind: str) -> CronTrigger:
+    """Build a CronTrigger for an email job from email_schedules + defaults.
+
+    Falls back to the per-kind defaults baked into _EMAIL_JOBS when the row
+    is missing or partial. Caches the row in `_email_schedule_state` so the
+    reload loop can diff against it.
+    """
+    _, default_dow, default_hour, default_minute = _EMAIL_JOBS[kind]
+    row = _read_email_schedule(kind) or {}
+    _email_schedule_state[kind] = row
+
+    dow = row.get("cron_day_of_week") if row else default_dow
+    hour = row.get("cron_hour") if row else default_hour
+    minute = row.get("cron_minute") if row else default_minute
+    if minute is None:
+        minute = default_minute
+    tz = row.get("timezone") or "UTC"
+
+    kwargs: Dict[str, Any] = {"minute": int(minute), "timezone": tz}
+    if hour is not None:
+        kwargs["hour"] = int(hour)
+    if dow:
+        kwargs["day_of_week"] = dow
+    return CronTrigger(**kwargs)
+
+
+def _email_schedule_enabled(kind: str) -> bool:
+    """Return whether the kind is currently enabled. Defaults to True if
+    the row is missing so a fresh install keeps sending."""
+    row = _email_schedule_state.get(kind)
+    if row is None:
+        row = _read_email_schedule(kind)
+        _email_schedule_state[kind] = row or {}
+    if not row:
+        return True
+    enabled = row.get("enabled")
+    return bool(enabled) if enabled is not None else True
 
 
 def get_job_history() -> Dict[str, Dict[str, Any]]:
@@ -413,7 +487,7 @@ async def _run_weekly_social_analysis():
         logger.info(f"[scheduler] Social OODA done -- {total} actions generated")
         _record("weekly_social_analysis", "success")
     except Exception as e:
-        logger.error(f"[scheduler] Social OODA failed: {e}")
+        logger.error(f"[scheduler] Weekly social OODA failed: {e}")
         _record("weekly_social_analysis", "error", str(e))
         await _notify_failure("weekly_social_analysis", str(e))
 
@@ -538,6 +612,11 @@ async def _run_daily_lead_scoring():
 
 
 async def _run_weekly_status_email():
+    """Send the weekly status email batch. Skips when admin disabled the kind."""
+    if not _email_schedule_enabled("weekly_status"):
+        logger.info("[scheduler] weekly_status_email disabled by admin; skipping run")
+        _record("weekly_status_email", "skipped", "disabled")
+        return
     logger.info("[scheduler] Running weekly status email batch...")
     try:
         from shared.weekly_email import send_weekly_status_for_all
@@ -670,6 +749,10 @@ async def _run_social_posts_email():
     been emailed yet. Fills in the article URL and ships one HTML email
     per article via Brevo.
     """
+    if not _email_schedule_enabled("social_posts"):
+        logger.info("[scheduler] hourly_social_posts_email disabled by admin; skipping run")
+        _record("hourly_social_posts_email", "skipped", "disabled")
+        return
     job_id = "hourly_social_posts_email"
     try:
         from shared.social_email_dispatcher import dispatch_due_social_emails
@@ -685,6 +768,35 @@ async def _run_social_posts_email():
         logger.error(f"[scheduler] {job_id} failed: {e}")
         _record(job_id, "error", str(e))
         await _notify_failure(job_id, str(e))
+
+
+async def _run_reload_email_schedules():
+    """Once a minute, check email_schedules for changes and reschedule jobs.
+
+    Compares the row's `updated_at` against the cached state. When an admin
+    edits the schedule via the dashboard, the new cron applies within ~60s
+    without restarting the worker.
+    """
+    for kind, (job_id, *_defaults) in _EMAIL_JOBS.items():
+        try:
+            row = _read_email_schedule(kind)
+            cached = _email_schedule_state.get(kind) or {}
+            if not row:
+                continue
+            if row.get("updated_at") == cached.get("updated_at"):
+                continue
+            new_trigger = _build_email_trigger(kind)
+            try:
+                scheduler.reschedule_job(job_id, trigger=new_trigger)
+                logger.info(
+                    f"[scheduler] reloaded email schedule for {kind}: "
+                    f"dow={row.get('cron_day_of_week')} hour={row.get('cron_hour')} "
+                    f"minute={row.get('cron_minute')} enabled={row.get('enabled')}"
+                )
+            except Exception as e:
+                logger.warning(f"[scheduler] reschedule_job({job_id}) failed: {e}")
+        except Exception as e:
+            logger.debug(f"[scheduler] reload check failed for {kind}: {e}")
 
 
 async def _run_watchdog() -> None:
@@ -707,9 +819,23 @@ def start():
     scheduler.add_job(_run_weekly_content_analysis, CronTrigger(day_of_week="wed", hour=5, minute=0), id="weekly_content_analysis", replace_existing=True)
     scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
     scheduler.add_job(_run_due_content_drafts, CronTrigger(minute=0), id="hourly_due_content_drafts", replace_existing=True)
-    # Social-posts email dispatcher: hourly at minute=15 so it doesn't
-    # collide with the due-content-drafts job at minute=0.
-    scheduler.add_job(_run_social_posts_email, CronTrigger(minute=15), id="hourly_social_posts_email", replace_existing=True)
+
+    # Email jobs — cron pulled from email_schedules so admin can edit it live.
+    weekly_status_job_id, *_ = _EMAIL_JOBS["weekly_status"]
+    social_posts_job_id, *_ = _EMAIL_JOBS["social_posts"]
+    scheduler.add_job(
+        _run_weekly_status_email,
+        _build_email_trigger("weekly_status"),
+        id=weekly_status_job_id,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_social_posts_email,
+        _build_email_trigger("social_posts"),
+        id=social_posts_job_id,
+        replace_existing=True,
+    )
+
     scheduler.add_job(_run_midday_review_check, CronTrigger(hour=14, minute=0), id="midday_review_check", replace_existing=True)
     scheduler.add_job(_run_daily_reflection, CronTrigger(hour=22, minute=0), id="daily_reflection", replace_existing=True)
     scheduler.add_job(_run_daily_digest, CronTrigger(hour=17, minute=0), id="daily_digest", replace_existing=True)
@@ -733,6 +859,7 @@ def start():
         scheduler.add_job(_run_for_all_tenants, trigger, args=[agent_name, schedule_kind], id=job_id, replace_existing=True)
 
     scheduler.add_job(_run_watchdog, CronTrigger(minute="*/5"), id="agent_runs_watchdog", replace_existing=True)
+    scheduler.add_job(_run_reload_email_schedules, IntervalTrigger(seconds=60), id="email_schedules_reload", replace_existing=True)
 
     scheduler.start()
     logger.info(
@@ -740,7 +867,8 @@ def start():
         "keywords 02:00, SEO Mon 03:00, metrics 04:00, "
         "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, "
         "social Tue 11:00, reviews 14:00, content Wed 05:00, autopilot Wed 06:00, "
-        "due-content-drafts hourly :00, social-emails hourly :15, "
+        "due-content-drafts hourly :00, social-emails admin-configurable, "
+        "weekly-status admin-configurable, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
     )
 
