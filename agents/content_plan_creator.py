@@ -274,24 +274,20 @@ Return ONLY a JSON array of {n} objects, in {language_name}:
             model=MODEL,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-            max_tokens=2048,
+            max_tokens=8192,
         )
     except Exception as e:
         logger.warning("_seed_topics_from_brand: Claude call failed: %s", e)
         return []
 
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.lstrip().lower().startswith("json"):
-            text = text.split("\n", 1)[1] if "\n" in text else text
-        text = text.rsplit("```", 1)[0]
-    try:
-        seeds = json.loads(text.strip())
-    except json.JSONDecodeError as e:
-        logger.warning("_seed_topics_from_brand: parse failed (%s); raw: %s", e, text[:300])
-        return []
-    if not isinstance(seeds, list):
+    text = response.content[0].text
+    seeds = _parse_json_array(text)
+    if not seeds:
+        logger.warning(
+            "_seed_topics_from_brand: empty/unparseable response; "
+            "raw head=%r tail=%r",
+            text[:300], text[-300:],
+        )
         return []
 
     out: List[Dict[str, Any]] = []
@@ -313,27 +309,63 @@ Return ONLY a JSON array of {n} objects, in {language_name}:
     return out
 
 
-async def _generate_titles_for_topics(
+def _parse_json_array(text: str) -> List[Any]:
+    """Best-effort JSON-array parse that tolerates truncated responses.
+
+    Claude occasionally returns a long array that gets cut off at
+    ``max_tokens``, leaving the JSON ending mid-object. ``json.loads`` then
+    fails for the whole payload and the caller treats every title as
+    missing. This helper strips the markdown fence, tries strict parse,
+    and on failure walks back to the last complete object so we keep the
+    titles that DID parse instead of throwing them all away.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.lstrip().lower().startswith("json"):
+            text = text.split("\n", 1)[1] if "\n" in text else text
+        text = text.rsplit("```", 1)[0]
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        pass
+
+    # Fall back to the last complete "}, " before truncation, then close
+    # the array. Cheap and good enough for the 5-15 element outputs we
+    # build with this helper.
+    start = text.find("[")
+    if start < 0:
+        return []
+    last_complete = text.rfind("},", start)
+    if last_complete < 0:
+        return []
+    candidate = text[start : last_complete + 1] + "]"
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+async def _generate_titles_chunk(
     voice: TenantBrandVoice,
     brand_name: str,
     topics: List[Dict[str, Any]],
     *,
-    language: str = "en",
-    brand_description: str = "",
-    target_audience: str = "",
-    unique_selling_points: str = "",
-    business_type: str = "",
-    tone_of_voice: str = "",
-    competitors: Optional[List[str]] = None,
+    language: str,
+    brand_description: str,
+    target_audience: str,
+    unique_selling_points: str,
+    business_type: str,
+    tone_of_voice: str,
+    competitors: Optional[List[str]],
 ) -> List[Dict[str, Any]]:
-    """Ask Claude to turn each topic into a concrete article title + angle.
-
-    The tenant's language and brand context (description, target audience,
-    USP, competitors) are baked into the prompt so the titles are written in
-    the right language and stay on-brand instead of falling back to generic
-    English business-software framing.
-    """
-    if not topics or not settings.ANTHROPIC_API_KEY:
+    """Single Claude round-trip for one chunk of topics."""
+    if not topics:
         return []
 
     topic_lines = "\n".join(
@@ -343,9 +375,7 @@ async def _generate_titles_for_topics(
 
     language_name = _language_name(language)
     competitors_block = ", ".join(competitors or []) or "(none on record)"
-    brand_context_lines = [
-        f"Brand: {brand_name}",
-    ]
+    brand_context_lines = [f"Brand: {brand_name}"]
     if business_type:
         brand_context_lines.append(f"Business type: {business_type}")
     if brand_description:
@@ -393,29 +423,80 @@ Return ONLY a JSON array of {len(topics)} objects, in the same order, with all s
 """
     from shared.llm import call_claude
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = await call_claude(
-        client=client,
-        model=MODEL,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-        max_tokens=2048,
-    )
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.lstrip().lower().startswith("json"):
-            text = text.split("\n", 1)[1] if "\n" in text else text
-        text = text.rsplit("```", 1)[0]
-
     try:
-        ideas = json.loads(text.strip())
-    except json.JSONDecodeError as e:
-        logger.error(f"_generate_titles_for_topics: parse failed: {e}; raw: {text[:500]}")
+        response = await call_claude(
+            client=client,
+            model=MODEL,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=8192,
+        )
+    except Exception as e:
+        logger.error("_generate_titles_chunk: Claude call failed: %s", e)
         return []
-    if not isinstance(ideas, list):
+    text = response.content[0].text
+    ideas = _parse_json_array(text)
+    if not ideas:
+        logger.error(
+            "_generate_titles_chunk: empty/unparseable response for %d topics; "
+            "raw head=%r tail=%r",
+            len(topics), text[:300], text[-300:],
+        )
+    return ideas[: len(topics)]
+
+
+async def _generate_titles_for_topics(
+    voice: TenantBrandVoice,
+    brand_name: str,
+    topics: List[Dict[str, Any]],
+    *,
+    language: str = "en",
+    brand_description: str = "",
+    target_audience: str = "",
+    unique_selling_points: str = "",
+    business_type: str = "",
+    tone_of_voice: str = "",
+    competitors: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Ask Claude to turn each topic into a concrete article title + angle.
+
+    The tenant's language and brand context (description, target audience,
+    USP, competitors) are baked into the prompt so the titles are written in
+    the right language and stay on-brand instead of falling back to generic
+    English business-software framing.
+
+    Topics are processed in chunks of ``CHUNK_SIZE`` so a single
+    truncation can't wipe out every title in the batch — the previous
+    one-call-for-all approach was leaving every idea with the
+    "Article on <query>" English stub when output went past max_tokens.
+    """
+    if not topics or not settings.ANTHROPIC_API_KEY:
         return []
 
-    return ideas[: len(topics)]
+    CHUNK_SIZE = 5
+    chunks = [topics[i : i + CHUNK_SIZE] for i in range(0, len(topics), CHUNK_SIZE)]
+    out: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        chunk_titles = await _generate_titles_chunk(
+            voice,
+            brand_name,
+            chunk,
+            language=language,
+            brand_description=brand_description,
+            target_audience=target_audience,
+            unique_selling_points=unique_selling_points,
+            business_type=business_type,
+            tone_of_voice=tone_of_voice,
+            competitors=competitors,
+        )
+        # Pad missing entries inside this chunk so positional order with the
+        # input topics is preserved across the concatenation. The outer
+        # caller still does a final pad-with-stubs sweep, but doing it
+        # per-chunk first keeps the next chunks aligned.
+        while len(chunk_titles) < len(chunk):
+            chunk_titles.append({})
+        out.extend(chunk_titles[: len(chunk)])
+    return out
 
 
 async def _draft_article(
@@ -835,17 +916,29 @@ async def create_plan_from_analysis(
         tone_of_voice=tone_of_voice,
         competitors=competitors,
     )
-    if len(titles) != len(flat):
-        # If batched call returned fewer than expected, pad with stub titles
-        while len(titles) < len(flat):
-            t = flat[len(titles)][1]
-            titles.append({
-                "title": f"Article on {t['query']}",
-                "angle": "",
-                "target_keyword": t["query"],
+    # Replace any missing/empty entries with a fallback that at least uses
+    # the seed's own language. The previous "Article on <query>" stub was
+    # always English and was being inserted whenever a chunk's response
+    # got truncated — that's how we ended up with a list of "Article on
+    # best tools for managing business operations" titles for a Swedish
+    # tenant. Now we fall back to the seed's angle_hint or the query
+    # itself (both already in the tenant's language for brand_seed
+    # topics).
+    while len(titles) < len(flat):
+        titles.append({})
+    for i, ((_, topic), idea) in enumerate(zip(flat, titles)):
+        if not isinstance(idea, dict) or not (idea.get("title") or "").strip():
+            fallback = (
+                (topic.get("angle_hint") or "").strip()
+                or topic["query"]
+            )
+            titles[i] = {
+                "title": fallback,
+                "angle": (topic.get("angle_hint") or "").strip(),
+                "target_keyword": topic["query"],
                 "pillar": "",
-                "rationale": "",
-            })
+                "rationale": (topic.get("rationale_hint") or "").strip(),
+            }
 
     # 6. For each (bucket, topic, idea, schedule_date): write a plan-item
     # row with status='idea'. No content_pieces row is created -- that
