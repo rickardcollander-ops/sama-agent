@@ -288,14 +288,71 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
 
 @router.post("/plan")
 async def create_plan_item(request: Request, payload: PlanItemCreate):
+    """Create or update a plan row.
+
+    The dashboard's "Schemalägg" flow posts here for an existing content
+    piece. Inserting unconditionally would trip
+    ``uniq_content_plan_keyword_per_tenant`` whenever a row already exists
+    for that keyword (which is the common case after an idea has been
+    drafted into a piece). So we upsert: if a row already exists for this
+    ``content_piece_id`` — or, failing that, this ``target_keyword`` — we
+    update it in place instead of inserting a duplicate.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
         data = {
             **payload.model_dump(exclude_none=True, mode="json"),
             "tenant_id": tenant_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        existing: Optional[Dict[str, Any]] = None
+        cpid = data.get("content_piece_id")
+        kw = (data.get("target_keyword") or "").strip()
+
+        if cpid:
+            res = (
+                sb.table("content_plan_items")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .eq("content_piece_id", cpid)
+                .limit(1)
+                .execute()
+            )
+            existing = (res.data or [None])[0]
+
+        if not existing and kw:
+            # Supabase-py doesn't expose lower(); fetch tenant rows and
+            # match in Python so the comparison stays case-insensitive.
+            res = (
+                sb.table("content_plan_items")
+                .select("id,target_keyword")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+            kw_lower = kw.lower()
+            for row in (res.data or []):
+                if (row.get("target_keyword") or "").strip().lower() == kw_lower:
+                    existing = row
+                    break
+
+        if existing:
+            update_data = {k: v for k, v in data.items() if k != "tenant_id"}
+            update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            result = (
+                sb.table("content_plan_items")
+                .update(update_data)
+                .eq("id", existing["id"])
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+            return {
+                "success": True,
+                "item": _row(result.data[0]) if result.data else update_data,
+                "updated": True,
+            }
+
+        data["created_at"] = datetime.now(timezone.utc).isoformat()
         result = sb.table("content_plan_items").insert(data).execute()
         return {"success": True, "item": _row(result.data[0]) if result.data else data}
     except Exception as e:
