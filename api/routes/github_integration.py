@@ -68,15 +68,19 @@ def _get_github_config(tenant_id: str) -> Optional[dict]:
     """Load github_integration from user_settings for a tenant."""
     try:
         sb = get_supabase()
+        # limit(1) + check data instead of .single() — .single() returns 406
+        # PGRST116 when no row exists, which is the common case for tenants
+        # who have never opened settings, and pollutes the error log.
         result = (
             sb.table("user_settings")
             .select("settings")
             .eq("user_id", tenant_id)
-            .single()
+            .limit(1)
             .execute()
         )
-        if result.data:
-            return result.data.get("settings", {}).get("github_integration")
+        rows = result.data or []
+        if rows:
+            return (rows[0].get("settings") or {}).get("github_integration")
     except Exception as e:
         logger.error(f"_get_github_config error: {e}")
     return None
@@ -86,15 +90,18 @@ def _save_github_config(tenant_id: str, config: Optional[dict]):
     """Save github_integration into user_settings JSON."""
     try:
         sb = get_supabase()
-        # Read current settings
+        # Read current settings (may be absent — first time the tenant
+        # configures anything). Avoid .single() so a missing row doesn't
+        # blow up the read with PGRST116.
         result = (
             sb.table("user_settings")
             .select("settings")
             .eq("user_id", tenant_id)
-            .single()
+            .limit(1)
             .execute()
         )
-        current = result.data.get("settings", {}) if result.data else {}
+        rows = result.data or []
+        current = (rows[0].get("settings") or {}) if rows else {}
         if config is None:
             current.pop("github_integration", None)
         else:
