@@ -1,5 +1,4 @@
-"""
-Social-posts email -- the day after an article publishes, mail the user
+"""Social-posts email -- the day after an article publishes, mail the user
 all the social-post copy (LinkedIn / X / Instagram / Facebook) that was
 generated alongside the article so they can publish manually on each
 platform. The article link is filled into every {{ARTICLE_URL}}
@@ -17,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from shared.brevo_client import send_transactional_email
 from shared.database import get_supabase
+from shared.email import send_log
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,9 @@ async def send_social_posts_email(
 ) -> Dict[str, Any]:
     """Render + send the social-posts email for one published article.
 
-    Returns {sent: bool, social_count: int, error?: str}.
+    Returns {sent: bool, social_count: int, error?: str}. Every send
+    attempt (including failures) is recorded in email_send_log so the
+    admin page can surface them.
     """
     sb = get_supabase()
 
@@ -131,12 +133,18 @@ async def send_social_posts_email(
         return {"sent": False, "error": "no recipient email configured", "social_count": len(social_pieces)}
 
     # 4. Render + send
+    article_title = article.get("title") or "your article"
     html_body = _render_html(
-        article_title=article.get("title") or "your article",
+        article_title=article_title,
         article_url=article_url,
         social_pieces=social_pieces,
     )
-    subject = f"Social posts ready: {article.get('title') or 'your article'}"
+    subject = f"Social posts ready: {article_title}"
+    stats = {
+        "social_count": len(social_pieces),
+        "article_id": article_content_id,
+        "article_url": article_url,
+    }
 
     try:
         ok = await send_transactional_email(
@@ -145,9 +153,27 @@ async def send_social_posts_email(
             html_body=html_body,
         )
     except Exception as e:
+        send_log.write(
+            kind="social_posts",
+            user_id=tenant_id,
+            recipient=recipient_email,
+            subject=subject,
+            status="error",
+            error=str(e),
+            stats=stats,
+        )
         return {"sent": False, "error": str(e), "social_count": len(social_pieces)}
 
     if not ok:
+        send_log.write(
+            kind="social_posts",
+            user_id=tenant_id,
+            recipient=recipient_email,
+            subject=subject,
+            status="error",
+            error="brevo send returned false",
+            stats=stats,
+        )
         return {"sent": False, "error": "brevo send returned false", "social_count": len(social_pieces)}
 
     # 5. Persist substituted copy back so the dashboard shows the real URL
@@ -168,4 +194,12 @@ async def send_social_posts_email(
     except Exception as e:
         logger.debug(f"could not mark plan_items emailed_at: {e}")
 
+    send_log.write(
+        kind="social_posts",
+        user_id=tenant_id,
+        recipient=recipient_email,
+        subject=subject,
+        status="sent",
+        stats=stats,
+    )
     return {"sent": True, "social_count": len(social_pieces)}

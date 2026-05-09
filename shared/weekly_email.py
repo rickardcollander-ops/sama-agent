@@ -1,9 +1,10 @@
 """
 Weekly status email — composer + sender.
 
-Run weekly (Monday 09:00 UTC) by the scheduler. Per opted-in user, aggregates
-the past 7 days of agent_reports and pending content_pieces across the user's
-sites, renders the email and sends via Resend.
+Run weekly (Monday 09:00 UTC by default; configurable via the
+email_schedules table) by the scheduler. Per opted-in user,
+aggregates the past 7 days of agent_reports and pending content_pieces
+across the user's sites, renders the email and sends via Resend.
 
 Dashboard exposes a "Send test email now" button that calls
 `send_weekly_status_for_user(..., test=True)` from an authenticated route.
@@ -11,12 +12,12 @@ Dashboard exposes a "Send test email now" button that calls
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Optional
 from urllib.parse import urlencode
 
 from shared.config import settings
 from shared.database import get_supabase
-from shared.email import resend_client
+from shared.email import resend_client, send_log
 from shared.email.template import (
     render_weekly_status_html,
     render_weekly_status_text,
@@ -25,7 +26,7 @@ from shared.email.template import (
 logger = logging.getLogger(__name__)
 
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────
 
 LOOKBACK_DAYS = 7
 PENDING_APPROVAL_LIMIT = 50
@@ -38,7 +39,7 @@ DEDUPE_WINDOW_DAYS = 6
 AGENT_ORDER = ("seo", "content", "ads", "social", "reviews", "analytics", "ai_visibility")
 
 
-# ── Data assembly ────────────────────────────────────────────────────────────
+# ── Data assembly ────────────────────────────────────────────────────
 
 
 def _week_label(now: datetime) -> str:
@@ -184,7 +185,7 @@ def _collect_problems(agent_sections: list[dict]) -> list[str]:
     return out
 
 
-# ── Email composition ────────────────────────────────────────────────────────
+# ── Email composition ─────────────────────────────────────────────────
 
 
 def _compose_email(
@@ -264,7 +265,7 @@ def _compose_email(
     }
 
 
-# ── Recipient resolution ─────────────────────────────────────────────────────
+# ── Recipient resolution ────────────────────────────────────────────────
 
 
 def _resolve_recipient_email(user_id: str, override: Optional[str]) -> Optional[str]:
@@ -329,7 +330,7 @@ def _recently_sent(user_id: str) -> Optional[str]:
         return None
 
 
-# ── Public API ───────────────────────────────────────────────────────────────
+# ── Public API ───────────────────────────────────────────────────────────
 
 
 def send_weekly_status_for_user(
@@ -397,7 +398,8 @@ def send_weekly_status_for_user(
             tags=[{"name": "kind", "value": "weekly_status"}],
         )
         message_id = response.get("id") if isinstance(response, dict) else None
-        _log_send(
+        send_log.write(
+            kind="weekly_status",
             user_id=user_id,
             recipient=recipient,
             subject=composed["subject"],
@@ -416,13 +418,14 @@ def send_weekly_status_for_user(
         }
     except Exception as e:
         logger.error(f"[weekly-email] send failed for {user_id}: {e}")
-        _log_send(
+        send_log.write(
+            kind="weekly_status",
             user_id=user_id,
             recipient=recipient,
             subject=composed["subject"],
             stats=composed["stats"],
             status="error",
-            error=str(e)[:500],
+            error=str(e),
             test=test,
         )
         return {"sent": False, "user_id": user_id, "error": str(e)}
@@ -473,37 +476,3 @@ def preview_weekly_status_for_user(user_id: str) -> dict:
         recipient_email=recipient,
         user_brand_name=str(user_settings.get("brand_name") or ""),
     )
-
-
-# ── Send log ─────────────────────────────────────────────────────────────────
-
-
-def _log_send(
-    *,
-    user_id: str,
-    recipient: str,
-    subject: str,
-    stats: dict[str, Any],
-    status: str,
-    message_id: Optional[str] = None,
-    error: Optional[str] = None,
-    test: bool = False,
-) -> None:
-    """Write to email_send_log. Best-effort — never raises."""
-    sb = get_supabase()
-    try:
-        sb.table("email_send_log").insert(
-            {
-                "user_id": user_id,
-                "recipient": recipient,
-                "kind": "weekly_status",
-                "subject": subject,
-                "status": status,
-                "message_id": message_id,
-                "error": error,
-                "stats": stats,
-                "test": test,
-            }
-        ).execute()
-    except Exception as e:
-        logger.warning(f"[weekly-email] could not write email_send_log: {e}")
