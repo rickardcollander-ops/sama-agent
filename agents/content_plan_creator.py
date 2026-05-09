@@ -202,6 +202,117 @@ def _extract_topics_from_run(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return topics
 
 
+async def _seed_topics_from_brand(
+    brand_name: str,
+    *,
+    language: str,
+    brand_description: str,
+    target_audience: str,
+    unique_selling_points: str,
+    business_type: str,
+    competitors: Optional[List[str]],
+    n: int,
+) -> List[Dict[str, Any]]:
+    """Ask Claude for ``n`` content topic seeds grounded purely in the
+    tenant's brand context.
+
+    Used when the analysis run surfaced no actionable gaps (clean audit,
+    very narrow site, or first-week onboarding) so we can still hand the
+    user a populated idea list. The output is shaped like the rest of the
+    pipeline expects: each seed has a ``query``-style topic, an
+    ``angle``-style hint, and a default ``gap_type`` so bucketing still
+    works downstream.
+    """
+    if n <= 0 or not settings.ANTHROPIC_API_KEY:
+        return []
+
+    language_name = _language_name(language)
+    competitors_block = ", ".join(competitors or []) or "(none on record)"
+    brand_lines = [f"Brand: {brand_name}"]
+    if business_type:
+        brand_lines.append(f"Business type: {business_type}")
+    if brand_description:
+        brand_lines.append(f"What the brand does: {brand_description}")
+    if target_audience:
+        brand_lines.append(f"Target audience: {target_audience}")
+    if unique_selling_points:
+        brand_lines.append(f"Unique selling points: {unique_selling_points}")
+    brand_lines.append(f"Known competitors: {competitors_block}")
+    brand_block = "\n".join(brand_lines)
+
+    system_prompt = (
+        f"You generate content-marketing topic ideas for a specific brand. "
+        f"Stay strictly inside the brand's actual industry and customer base — "
+        f"never propose generic SaaS or business-software topics unless that "
+        f"is exactly what the brand sells. Write everything in {language_name}."
+    )
+    user_prompt = f"""Propose {n} blog-article topic ideas for the brand below. The ideas must be relevant to this brand's industry, customer pain points, and unique angle — not generic business-software content.
+
+BRAND CONTEXT:
+{brand_block}
+
+Mix in:
+- buyer-intent topics the target audience would actually search for
+- thought-leadership angles tied to the unique selling points
+- comparison/decision-stage topics (where it fits the industry)
+
+Return ONLY a JSON array of {n} objects, in {language_name}:
+[
+  {{
+    "query": "search query / topic in {language_name}",
+    "angle": "one-sentence angle/POV in {language_name}",
+    "rationale": "why this matters for {brand_name} specifically, in {language_name}"
+  }}
+]
+"""
+
+    from shared.llm import call_claude
+    client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    try:
+        response = await call_claude(
+            client=client,
+            model=MODEL,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=2048,
+        )
+    except Exception as e:
+        logger.warning("_seed_topics_from_brand: Claude call failed: %s", e)
+        return []
+
+    text = response.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.lstrip().lower().startswith("json"):
+            text = text.split("\n", 1)[1] if "\n" in text else text
+        text = text.rsplit("```", 1)[0]
+    try:
+        seeds = json.loads(text.strip())
+    except json.JSONDecodeError as e:
+        logger.warning("_seed_topics_from_brand: parse failed (%s); raw: %s", e, text[:300])
+        return []
+    if not isinstance(seeds, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for s in seeds[:n]:
+        if not isinstance(s, dict):
+            continue
+        query = (s.get("query") or "").strip()
+        if not query:
+            continue
+        out.append({
+            "query": query,
+            "gap_type": "brand_seed",
+            "ai_mention": False,
+            "seo_rank": None,
+            "competitors": list(competitors or [])[:3],
+            "angle_hint": (s.get("angle") or "").strip(),
+            "rationale_hint": (s.get("rationale") or "").strip(),
+        })
+    return out
+
+
 async def _generate_titles_for_topics(
     voice: TenantBrandVoice,
     brand_name: str,
@@ -622,18 +733,48 @@ async def create_plan_from_analysis(
     except BrandVoiceNotFoundError:
         voice = BrandVoice.for_tenant("default")
 
-    # 4. Extract + bucket topics
+    # 4. Extract + bucket topics. If the analysis surfaced no gaps (clean
+    # audit, very narrow site, fresh onboarding), seed topics directly from
+    # the brand context so the user still gets a usable idea list. Sparse
+    # runs are also topped up the same way so the calendar isn't half-empty.
+    target_total = articles_per_week * 13  # ~13 weeks across 90 days
     topics = _extract_topics_from_run(payload)
+
+    if len(topics) < target_total:
+        seed_count = target_total - len(topics)
+        logger.info(
+            "content_plan_creator: analysis returned %d topics for tenant=%s; "
+            "seeding %d additional topics from brand context",
+            len(topics), tenant_id, seed_count,
+        )
+        seeds = await _seed_topics_from_brand(
+            brand_name,
+            language=language,
+            brand_description=brand_description,
+            target_audience=target_audience,
+            unique_selling_points=unique_selling_points,
+            business_type=business_type,
+            competitors=competitors,
+            n=seed_count,
+        )
+        seen_queries = {t["query"].lower() for t in topics}
+        for s in seeds:
+            if s["query"].lower() not in seen_queries:
+                topics.append(s)
+                seen_queries.add(s["query"].lower())
+
     if not topics:
         return {
             "plan_id": analysis_run_id,
             "ideas_created": 0,
             "social_ideas_created": 0,
             "scheduled_through": None,
-            "warning": "analysis_run had no actionable topics",
+            "warning": (
+                "analysis_run had no actionable topics and brand-context "
+                "seeding produced no fallback topics — check that the "
+                "tenant's brand_description/target_audience are populated"
+            ),
         }
-
-    target_total = articles_per_week * 13  # ~13 weeks across 90 days
     # Bucket assignment by gap type
     bucketed: Dict[str, List[Dict[str, Any]]] = {"30": [], "60": [], "90": []}
     for t in topics:
