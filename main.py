@@ -23,6 +23,7 @@ from api.routes import (
     github_integration, usage, social_schedule, analytics_attribution,
     content_validation, analysis as analysis_routes, approvals,
     site_audit as site_audit_routes,
+    ai_readability as ai_readability_routes,
     content_suggest, ads_suggest, social_suggest, tech_agent,
     strategy as strategy_routes, menu as menu_routes,
     content_performance as content_performance_routes,
@@ -246,6 +247,7 @@ app.include_router(automation.router, prefix="/api/automation", tags=["automatio
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 app.include_router(improvements.router, prefix="/api", tags=["improvements"])
 app.include_router(ai_visibility.router, prefix="/api/ai-visibility", tags=["ai-visibility"])
+app.include_router(ai_readability_routes.router, prefix="/api/ai-readability", tags=["ai-readability"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(gtm.router, prefix="/api/gtm", tags=["gtm"])
 app.include_router(goals.router, prefix="/api", tags=["goals"])
