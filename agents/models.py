@@ -21,6 +21,7 @@ AGENT_ACTIONS_TABLE = "agent_actions"
 GTM_ICP_TABLE = "gtm_icp_analyses"
 GTM_STRATEGIES_TABLE = "gtm_strategies"
 GTM_SIGNALS_TABLE = "gtm_signals"
+EXTERNAL_PAGES_TABLE = "external_pages"
 
 
 class Keyword(BaseModel):

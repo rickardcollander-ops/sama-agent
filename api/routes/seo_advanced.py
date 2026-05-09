@@ -11,6 +11,7 @@ import logging
 from agents.seo_schema import schema_generator
 from agents.seo_indexing import indexing_api
 from agents.seo_internal_linking import internal_linking_optimizer
+from agents.external_pages import refresh_external_pages
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -29,6 +30,13 @@ class IndexingRequest(BaseModel):
 class InternalLinkingRequest(BaseModel):
     content: str
     current_url: str
+    tenant_id: Optional[str] = None
+
+
+class SitemapRefreshRequest(BaseModel):
+    site_url: str
+    tenant_id: str = "default"
+    max_urls: int = 200
 
 
 @router.post("/schema/generate")
@@ -129,7 +137,8 @@ async def analyze_internal_linking(request: InternalLinkingRequest):
     try:
         result = await internal_linking_optimizer.analyze_content_for_links(
             request.content,
-            request.current_url
+            request.current_url,
+            tenant_id=request.tenant_id,
         )
         
         return {
@@ -183,6 +192,23 @@ async def get_pillar_link_suggestions(pillar: str):
         
     except Exception as e:
         logger.error(f"Failed to get pillar link suggestions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/internal-linking/sitemap-refresh")
+async def refresh_sitemap_pages(request: SitemapRefreshRequest):
+    """Discover URLs from the tenant's sitemap.xml, scrape lightweight
+    metadata, embed, and store in external_pages so the internal-linking
+    optimizer can suggest links into them. Safe to call repeatedly."""
+    try:
+        result = await refresh_external_pages(
+            request.site_url,
+            tenant_id=request.tenant_id,
+            max_urls=request.max_urls,
+        )
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Failed to refresh sitemap pages: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
