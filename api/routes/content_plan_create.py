@@ -158,7 +158,7 @@ async def plan_create_from_analysis(payload: CreateFromAnalysisPayload, request:
         "social_platforms": platforms,
         "message": (
             f"Skapar idélista: cirka {total_articles} artikel-idéer "
-            f"+ {total_socials} sociala idéer läggs i kalendern. "
+            f"+ {total_socials} sociala idéer läggs i planen. "
             "Granska och godkänn dem under Innehåll → Idéer."
         ),
     }
