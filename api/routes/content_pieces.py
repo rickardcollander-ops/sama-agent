@@ -5,7 +5,7 @@ CRUD for content pieces (blog articles, landing pages, etc.) scoped by tenant.
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -33,6 +33,12 @@ class ContentPieceCreate(BaseModel):
     source_gap_id: Optional[str] = None
     source_gap_title: Optional[str] = None
     source_strategy_topic: Optional[str] = None
+    # Premium article fields (set by article_writer; nullable for legacy).
+    slug: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    featured_image_alt: Optional[str] = None
+    article_score: Optional[int] = None
+    article_data: Optional[Dict[str, Any]] = None
 
 
 class ContentPieceUpdate(BaseModel):
@@ -47,6 +53,11 @@ class ContentPieceUpdate(BaseModel):
     source_gap_id: Optional[str] = None
     source_gap_title: Optional[str] = None
     source_strategy_topic: Optional[str] = None
+    slug: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    featured_image_alt: Optional[str] = None
+    article_score: Optional[int] = None
+    article_data: Optional[Dict[str, Any]] = None
 
 
 def _ensure_numeric(row: dict) -> dict:

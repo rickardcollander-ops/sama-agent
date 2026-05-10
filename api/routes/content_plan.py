@@ -842,15 +842,53 @@ async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[st
     item_id = item["id"]
     sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item_id).execute()
 
-    import anthropic
-    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     ctype = item.get("content_type") or "blog_article"
-    target_words = (
-        "1500-2200 words" if ctype == "blog_article" else
-        "120-180 words" if ctype == "linkedin_post" else
-        "300-500 words"
-    )
-    prompt = f"""You are an expert B2B SaaS marketer. Write a {ctype.replace('_', ' ')}.
+
+    # Long-form articles go through the structured "premium" writer (TOC,
+    # key takeaways, FAQ, hybrid imagery, internal/external link
+    # injection, scored). Other content types still use the lightweight
+    # JSON prompt below.
+    if ctype == "blog_article":
+        from agents.article_writer import generate_premium_article
+        try:
+            article = await generate_premium_article(
+                title=item.get("title") or "",
+                topic=item.get("topic") or "",
+                primary_keyword=item.get("target_keyword") or "",
+                pillar=item.get("pillar") or "",
+                tenant_id=tenant_id,
+            )
+        except Exception as exc:
+            logger.error(
+                f"premium article generation failed for plan_item={item_id}: {exc}"
+            )
+            raise
+
+        piece_data = {
+            "tenant_id": tenant_id,
+            "title": article["title"],
+            "slug": article.get("slug"),
+            "content": article["content"],
+            "content_type": ctype,
+            "meta_title": article.get("meta_title") or "",
+            "meta_description": article.get("meta_description") or "",
+            "target_keyword": item.get("target_keyword") or article["article_data"].get("primary_keyword", ""),
+            "word_count": article["word_count"],
+            "featured_image_url": article.get("featured_image_url"),
+            "featured_image_alt": article.get("featured_image_alt"),
+            "article_score": article.get("article_score"),
+            "article_data": article.get("article_data"),
+            "status": "draft",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        import anthropic
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        target_words = (
+            "120-180 words" if ctype == "linkedin_post" else
+            "300-500 words"
+        )
+        prompt = f"""You are an expert B2B SaaS marketer. Write a {ctype.replace('_', ' ')}.
 
 Title: {item.get('title') or ''}
 Topic: {item.get('topic') or ''}
@@ -867,36 +905,37 @@ Return ONLY a JSON object (no markdown fences):
   "word_count": <number>
 }}
 """
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model=settings.CLAUDE_MODEL,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = message.content[0].text.strip()
-    try:
-        article = json.loads(text)
-    except json.JSONDecodeError:
-        if "```" in text:
-            fenced = text.split("```")[1]
-            if fenced.startswith("json"):
-                fenced = fenced[4:]
-            article = json.loads(fenced.strip())
-        else:
-            article = {"title": item.get("title"), "content": text, "word_count": len(text.split())}
+        message = await asyncio.to_thread(
+            client.messages.create,
+            model=settings.CLAUDE_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+        try:
+            article = json.loads(text)
+        except json.JSONDecodeError:
+            if "```" in text:
+                fenced = text.split("```")[1]
+                if fenced.startswith("json"):
+                    fenced = fenced[4:]
+                article = json.loads(fenced.strip())
+            else:
+                article = {"title": item.get("title"), "content": text, "word_count": len(text.split())}
 
-    piece_data = {
-        "tenant_id": tenant_id,
-        "title": article.get("title") or item.get("title") or "Untitled",
-        "content": article.get("content") or "",
-        "content_type": ctype,
-        "meta_title": article.get("meta_title") or "",
-        "meta_description": article.get("meta_description") or "",
-        "target_keyword": item.get("target_keyword") or "",
-        "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
-        "status": "draft",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+        piece_data = {
+            "tenant_id": tenant_id,
+            "title": article.get("title") or item.get("title") or "Untitled",
+            "content": article.get("content") or "",
+            "content_type": ctype,
+            "meta_title": article.get("meta_title") or "",
+            "meta_description": article.get("meta_description") or "",
+            "target_keyword": item.get("target_keyword") or "",
+            "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+            "status": "draft",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     piece_result = sb.table("content_pieces").insert(piece_data).execute()
     piece = (piece_result.data or [{}])[0]
     piece_id = piece.get("id")
