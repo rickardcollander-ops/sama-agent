@@ -36,6 +36,7 @@ from api.routes import (
     content_analysis_cache as content_analysis_cache_routes,
     weekly_email as weekly_email_routes,
     account as account_routes,
+    pdf_render as pdf_render_routes,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -307,6 +308,7 @@ app.include_router(
     tags=["email"],
 )
 app.include_router(account_routes.router, prefix="/api/account", tags=["account"])
+app.include_router(pdf_render_routes.router, prefix="/api/pdf", tags=["pdf-render"])
 
 
 @app.get("/")

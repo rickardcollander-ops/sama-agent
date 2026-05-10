@@ -14,6 +14,11 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install headless Chromium for the PDF render service. `--with-deps` pulls
+# all the system .so libs Chromium needs at runtime (libnss, libatk, libcups
+# etc) — without it Playwright's launch() blows up at request time.
+RUN python -m playwright install --with-deps chromium
+
 # Copy application code
 COPY . .
 
