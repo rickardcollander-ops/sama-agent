@@ -33,6 +33,171 @@ def _normalize_query(q: Any) -> str:
     return (q or "").strip().lower() if isinstance(q, str) else ""
 
 
+# ai_visibility_checks records the engine under its display name; the
+# analysis_runs payload uses the short AIPlatform identifier the dashboard
+# matrix renders. Engines without a mapping are skipped when augmenting.
+_AI_VISIBILITY_ENGINE_TO_PLATFORM: Dict[str, str] = {
+    "ChatGPT (GPT-4o)": "chatgpt",
+    "Claude (Anthropic)": "claude",
+    "Gemini (Google)": "gemini",
+    "Perplexity AI": "perplexity",
+    "Microsoft Copilot": "copilot",
+}
+
+
+def _classify_gap_for_augment(
+    seo_rank: Optional[int], ai_results: List[Dict[str, Any]]
+) -> str:
+    """Mirror agents.analysis.AnalysisAgent._classify_gap so synthesised rows
+    pick up the same gap labels the matrix already understands. Duplicated
+    here to keep this read-time helper free of the agent-stack import (which
+    pulls in httpx/anthropic at module load time)."""
+    seo_strong = seo_rank is not None and seo_rank <= 10
+    mentioned_count = sum(1 for r in ai_results if r.get("mentioned"))
+    ai_strong = mentioned_count / max(len(ai_results), 1) >= 0.5
+    competitor_strong = any(r.get("competitors_mentioned") for r in ai_results)
+    if competitor_strong and not seo_strong and not ai_strong:
+        return "competitor_dominates"
+    if seo_strong and not ai_strong:
+        return "seo_winner_geo_loser"
+    if not seo_strong and ai_strong:
+        return "geo_winner_seo_loser"
+    if seo_strong and ai_strong:
+        return "both_winners"
+    return "both_losers"
+
+
+def _build_query_result_from_checks(
+    query: str,
+    platforms: List[str],
+    checks: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Synthesise a query_results entry from ai_visibility_checks rows.
+
+    Used when the run's stored payload doesn't yet have an entry for *query*
+    (typically because the user added the prompt to AI Assistant after the
+    last full analysis ran). Returns ``None`` when AI Assistant hasn't yet
+    produced any checks for the query — the caller drops the row in that
+    case so the matrix doesn't grow empty placeholder rows.
+
+    SEO fields are left null because ai_visibility_checks doesn't carry
+    Google rank data; the matrix renders "—" for those columns and the gap
+    classifier treats the SEO side as not-strong.
+    """
+    qnorm = _normalize_query(query)
+    if not qnorm:
+        return None
+
+    # Latest check per platform (engine display-name → AIPlatform mapping).
+    by_platform: Dict[str, Dict[str, Any]] = {}
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        if _normalize_query(c.get("prompt")) != qnorm:
+            continue
+        platform = _AI_VISIBILITY_ENGINE_TO_PLATFORM.get(c.get("ai_engine") or "")
+        if not platform:
+            continue
+        prev = by_platform.get(platform)
+        prev_ts = (prev or {}).get("checked_at") or ""
+        cur_ts = c.get("checked_at") or ""
+        if prev is None or cur_ts > prev_ts:
+            by_platform[platform] = c
+
+    if not by_platform:
+        return None
+
+    ai_results: List[Dict[str, Any]] = []
+    for p in platforms:
+        c = by_platform.get(p)
+        if c is not None:
+            ai_results.append({
+                "platform": p,
+                "mentioned": bool(c.get("mentioned")),
+                "rank": c.get("rank"),
+                "cited_as_source": False,
+                "sentiment": c.get("sentiment"),
+                "competitors_mentioned": list(c.get("competitors_mentioned") or []),
+            })
+        else:
+            # Platform was tracked by the original run but ai_visibility doesn't
+            # cover it (e.g. google_aio). Surface a placeholder so the column
+            # still renders side-by-side with the populated ones.
+            ai_results.append({
+                "platform": p,
+                "mentioned": False,
+                "rank": None,
+                "cited_as_source": False,
+                "sentiment": None,
+                "competitors_mentioned": [],
+            })
+
+    return {
+        "query": query,
+        "seo_rank": None,
+        "seo_competitors_in_top10": 0,
+        "ai_results": ai_results,
+        "gap": _classify_gap_for_augment(None, ai_results),
+    }
+
+
+def _augment_run_payload_with_checks(
+    payload: Any,
+    saved_queries: List[str],
+    checks: List[Dict[str, Any]],
+) -> Any:
+    """Add synthesised query_results entries for saved AI Assistant prompts
+    that aren't yet in the run's stored payload.
+
+    The Insights matrix used to go blank whenever the user changed their
+    AI Assistant queries between full analyses: the read-time filter dropped
+    the run's old prompts, but nothing populated the new ones until the next
+    on-demand /api/analysis/run finished. This helper plugs the gap by
+    reading the running totals out of ai_visibility_checks (which the AI
+    Assistant page already keeps fresh) and patching them onto the matrix.
+
+    Run after :func:`_filter_run_payload_to_saved`. The combination keeps
+    the "only what's saved is shown" invariant intact while making sure
+    every currently-saved query has a row as long as we have any check data
+    for it.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if not saved_queries or not checks:
+        return payload
+
+    existing_results = payload.get("query_results")
+    if not isinstance(existing_results, list):
+        return payload
+
+    have_norm = {
+        _normalize_query(q.get("query"))
+        for q in existing_results
+        if isinstance(q, dict)
+    }
+    platforms = payload.get("platforms")
+    if not isinstance(platforms, list):
+        platforms = []
+    platforms = [p for p in platforms if isinstance(p, str)]
+
+    additions: List[Dict[str, Any]] = []
+    for q in saved_queries:
+        norm = _normalize_query(q)
+        if not norm or norm in have_norm:
+            continue
+        synth = _build_query_result_from_checks(q, platforms, checks)
+        if synth is not None:
+            additions.append(synth)
+
+    if not additions:
+        return payload
+
+    out = dict(payload)
+    out["query_results"] = list(existing_results) + additions
+    out["overview"] = _rebuild_overview(out["query_results"])
+    return out
+
+
 def _filter_run_payload_to_saved(
     payload: Dict[str, Any], saved_queries: List[str]
 ) -> Dict[str, Any]:
@@ -351,7 +516,35 @@ async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
                     exc_info=True,
                 )
                 saved = []
-            return _filter_run_payload_to_saved(payload, saved)
+            filtered = _filter_run_payload_to_saved(payload, saved)
+
+            # Pull recent ai_visibility_checks so prompts the user added to
+            # AI Assistant after this run was persisted still appear in the
+            # matrix. Without this the Insights "Per query" view looks
+            # empty until a fresh /api/analysis/run completes.
+            checks: List[Dict[str, Any]] = []
+            if saved:
+                try:
+                    chk = (
+                        sb.table("ai_visibility_checks")
+                        .select(
+                            "prompt,ai_engine,mentioned,rank,sentiment,"
+                            "competitors_mentioned,checked_at"
+                        )
+                        .eq("tenant_id", tenant_id)
+                        .order("checked_at", desc=True)
+                        .limit(500)
+                        .execute()
+                    )
+                    checks = chk.data or []
+                except Exception:
+                    logger.warning(
+                        "could not load ai_visibility_checks for run %s; "
+                        "skipping augmentation",
+                        run_id,
+                        exc_info=True,
+                    )
+            return _augment_run_payload_with_checks(filtered, saved, checks)
         return row
     except HTTPException:
         raise
