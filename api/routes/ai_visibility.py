@@ -6,8 +6,8 @@ GEO (Generative Engine Optimization) monitoring endpoints
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -18,6 +18,98 @@ from shared.tenant import get_tenant_config
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+# Each tracked query fans out across 5 AI engines, so capping manual runs at
+# one per week keeps token spend tied to the weekly cron cycle. The dashboard
+# countdown reads `next_available_at` from /lock-status to render the timer.
+AI_VISIBILITY_LOCK_DAYS = 7
+
+
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        # Supabase returns "2026-05-10T08:23:00.123+00:00" or "...Z".
+        cleaned = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned)
+    except Exception:
+        return None
+
+
+def _latest_completed_run(tenant_id: str) -> Optional[Dict[str, Any]]:
+    """Return the most recent completed ai_visibility agent_runs row, or None."""
+    if not tenant_id or tenant_id == "default":
+        return None
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("agent_runs")
+            .select("id,status,completed_at")
+            .eq("tenant_id", tenant_id)
+            .eq("agent_name", "ai_visibility")
+            .eq("status", "completed")
+            .order("completed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logger.debug(f"_latest_completed_run lookup failed: {e}")
+        return None
+
+
+def _compute_lock(tenant_id: str) -> Dict[str, Any]:
+    """Compute lock status for the manual /check endpoint.
+
+    Returns a dict with `locked`, `last_completed_at`, `next_available_at`
+    (all ISO strings or None). A tenant with no completed runs yet is never
+    locked — the first run can always go through.
+    """
+    last = _latest_completed_run(tenant_id)
+    last_completed_at = (last or {}).get("completed_at")
+    last_dt = _parse_iso(last_completed_at)
+    if not last_dt:
+        return {
+            "locked": False,
+            "last_completed_at": None,
+            "next_available_at": None,
+        }
+    next_dt = last_dt + timedelta(days=AI_VISIBILITY_LOCK_DAYS)
+    return {
+        "locked": datetime.now(timezone.utc) < next_dt,
+        "last_completed_at": last_completed_at,
+        "next_available_at": next_dt.isoformat(),
+    }
+
+
+def _read_geo_queries_updated_at(tenant_id: str) -> Optional[str]:
+    """Return the timestamp the tenant last edited their saved queries.
+
+    The dashboard writes this into user_settings.settings whenever the user
+    adds or removes a query. Used by the dashboard to render a "review your
+    tracked queries" reminder once the saved set has gone untouched for too
+    long. None when missing or unparsable — the dashboard treats that as
+    "never edited" and shows the reminder.
+    """
+    if not tenant_id or tenant_id == "default":
+        return None
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("user_settings")
+            .select("settings")
+            .eq("user_id", tenant_id)
+            .single()
+            .execute()
+        )
+        settings = (result.data or {}).get("settings") or {}
+        ts = settings.get("geo_queries_updated_at")
+        return ts if isinstance(ts, str) else None
+    except Exception as e:
+        logger.debug(f"_read_geo_queries_updated_at failed: {e}")
+        return None
 
 
 class GapUpdateRequest(BaseModel):
@@ -86,6 +178,26 @@ async def get_gaps(request: Request):
     except Exception as e:
         logger.error(f"get_gaps error: {e}")
         return {"gaps": []}
+
+
+# ── Lock status ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/lock-status")
+async def get_lock_status(request: Request):
+    """Return the manual-check cooldown state for the dashboard countdown.
+
+    `locked`: whether a manual run would be refused right now.
+    `last_completed_at` / `next_available_at`: ISO timestamps for the timer.
+    `geo_queries_updated_at`: when the tenant last edited the saved set;
+    used to surface the "review your tracked queries" reminder banner.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    lock = _compute_lock(tenant_id)
+    return {
+        **lock,
+        "lock_days": AI_VISIBILITY_LOCK_DAYS,
+        "geo_queries_updated_at": _read_geo_queries_updated_at(tenant_id),
+    }
 
 
 # ── Run check ────────────────────────────────────────────────────────────────────────────────
@@ -178,6 +290,23 @@ async def run_check(request: Request):
                     "No queries configured. Add the prompts you want measured "
                     "under AI Assistant before running a check."
                 ),
+            }
+        # 7-day cooldown: refuse manual reruns within the weekly cycle so
+        # token spend stays bounded. The scheduled cron triggers in the same
+        # window, so users see a countdown instead of a re-run button.
+        lock = _compute_lock(tenant_id)
+        if lock["locked"]:
+            return {
+                "status": "locked",
+                "error": "cooldown_active",
+                "message": (
+                    "AI Assistant check ran less than "
+                    f"{AI_VISIBILITY_LOCK_DAYS} days ago. The next run is "
+                    "scheduled automatically — see the countdown on the AI "
+                    "Assistants page."
+                ),
+                "last_completed_at": lock["last_completed_at"],
+                "next_available_at": lock["next_available_at"],
             }
         agent = AIVisibilityAgent(tenant_config=config)
         label = f"tenant={tenant_id}"
