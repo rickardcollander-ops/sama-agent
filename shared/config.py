@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     # AI Model
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
+    # Premium article pipeline (optional — generators degrade gracefully when
+    # the keys are missing so existing tenants keep getting plain articles
+    # until they configure imagery).
+    OPENAI_API_KEY: str = ""                                # featured image gen
+    OPENAI_IMAGE_MODEL: str = "gpt-image-1"
+    OPENAI_IMAGE_QUALITY: str = "medium"                    # low | medium | high
+    OPENAI_IMAGE_SIZE: str = "1536x1024"                    # landscape, fits hero
+    UNSPLASH_ACCESS_KEY: str = ""                           # inline stock images
+    PREMIUM_ARTICLE_INLINE_IMAGES: int = 1                  # how many sections get an inline image (stock if Unsplash configured, otherwise generated via OpenAI)
+
     # SEO Config
     GSC_SITE_URL: str = "sc-domain:successifier.com"
     SEO_COMPETITORS: List[str] = ["gainsight.com", "totango.com", "churnzero.com", "custify.com", "vitally.io"]
