@@ -11,7 +11,11 @@ These tests cover the helpers in api/routes/analysis.py that strip
 mismatched query_results and rebuild the overview aggregates.
 """
 
-from api.routes.analysis import _filter_run_payload_to_saved
+from api.routes.analysis import (
+    _augment_run_payload_with_checks,
+    _build_query_result_from_checks,
+    _filter_run_payload_to_saved,
+)
 
 
 def _make_query(query, mentioned=False, seo_rank=None, gap="both_losers"):
@@ -110,3 +114,131 @@ def test_filter_tolerates_missing_query_results():
 def test_filter_tolerates_non_dict_payload():
     assert _filter_run_payload_to_saved(None, ["x"]) is None
     assert _filter_run_payload_to_saved("string", ["x"]) == "string"
+
+
+# ── Augmentation: pull saved-but-missing queries from ai_visibility_checks ──
+
+
+def _check(prompt, engine, mentioned, rank=None, checked_at="2026-05-09T00:00:00Z",
+           competitors=None, sentiment=None):
+    return {
+        "prompt": prompt,
+        "ai_engine": engine,
+        "mentioned": mentioned,
+        "rank": rank,
+        "competitors_mentioned": competitors or [],
+        "sentiment": sentiment,
+        "checked_at": checked_at,
+    }
+
+
+def test_augment_adds_missing_saved_query_from_checks():
+    payload = _payload()  # no query_results yet
+    payload["platforms"] = ["chatgpt", "claude", "google_aio"]
+    checks = [
+        _check("Bästa CRM för småföretag", "ChatGPT (GPT-4o)", True, rank=2),
+        _check("Bästa CRM för småföretag", "Claude (Anthropic)", False),
+    ]
+    out = _augment_run_payload_with_checks(payload, ["Bästa CRM för småföretag"], checks)
+    rows = out["query_results"]
+    assert [r["query"] for r in rows] == ["Bästa CRM för småföretag"]
+    by_platform = {r["platform"]: r for r in rows[0]["ai_results"]}
+    # platforms in run.platforms get a row each, with placeholders for engines
+    # ai_visibility doesn't track (google_aio).
+    assert by_platform["chatgpt"]["mentioned"] is True
+    assert by_platform["chatgpt"]["rank"] == 2
+    assert by_platform["claude"]["mentioned"] is False
+    assert by_platform["google_aio"]["mentioned"] is False
+    assert by_platform["google_aio"]["rank"] is None
+    # SEO data isn't carried by ai_visibility_checks.
+    assert rows[0]["seo_rank"] is None
+
+
+def test_augment_leaves_existing_query_alone():
+    payload = _payload(_make_query("Bästa CRM för småföretag", mentioned=True))
+    payload["platforms"] = ["chatgpt"]
+    checks = [_check("Bästa CRM för småföretag", "ChatGPT (GPT-4o)", False)]
+    out = _augment_run_payload_with_checks(payload, ["Bästa CRM för småföretag"], checks)
+    # existing row preserved verbatim — augmentation never overwrites the
+    # original full-analysis snapshot (which carries SEO data the checks
+    # table doesn't have).
+    assert out is payload
+
+
+def test_augment_skips_query_with_no_checks():
+    payload = _payload()
+    payload["platforms"] = ["chatgpt"]
+    out = _augment_run_payload_with_checks(payload, ["nothing-checked-yet"], [])
+    assert out is payload
+
+
+def test_augment_uses_latest_check_per_engine():
+    payload = _payload()
+    payload["platforms"] = ["chatgpt"]
+    checks = [
+        _check("q", "ChatGPT (GPT-4o)", True, rank=1, checked_at="2026-05-10T10:00:00Z"),
+        _check("q", "ChatGPT (GPT-4o)", False, checked_at="2026-05-09T10:00:00Z"),
+    ]
+    out = _augment_run_payload_with_checks(payload, ["q"], checks)
+    row = out["query_results"][0]["ai_results"][0]
+    # Newer check wins, even if it appears second in the input list.
+    assert row["mentioned"] is True
+    assert row["rank"] == 1
+
+
+def test_augment_recomputes_overview():
+    payload = _payload()
+    payload["platforms"] = ["chatgpt"]
+    payload["overview"] = {
+        "overall_mention_rate": 0.0,
+        "seo_top10_coverage": 0.0,
+        "queries_with_presence": 0,
+        "total_queries": 0,
+        "top_opportunities": [],
+    }
+    checks = [_check("q", "ChatGPT (GPT-4o)", True, rank=1)]
+    out = _augment_run_payload_with_checks(payload, ["q"], checks)
+    overview = out["overview"]
+    assert overview["total_queries"] == 1
+    assert overview["overall_mention_rate"] == 1.0
+    # seo_rank is null for synthesised rows so top10 coverage stays at 0.
+    assert overview["seo_top10_coverage"] == 0.0
+    assert overview["queries_with_presence"] == 1
+
+
+def test_augment_ignores_unmapped_engine_names():
+    """An engine we don't know how to map (e.g. a renamed model) is dropped
+    rather than producing a row with platform=None."""
+    payload = _payload()
+    payload["platforms"] = ["chatgpt"]
+    checks = [_check("q", "Some New Model", True)]
+    out = _augment_run_payload_with_checks(payload, ["q"], checks)
+    # No mapping → no synthesised row.
+    assert out is payload
+
+
+def test_augment_query_match_is_case_and_whitespace_insensitive():
+    payload = _payload()
+    payload["platforms"] = ["chatgpt"]
+    checks = [_check("  Bästa CRM För Småföretag ", "ChatGPT (GPT-4o)", True)]
+    out = _augment_run_payload_with_checks(payload, ["bästa crm för småföretag"], checks)
+    assert len(out["query_results"]) == 1
+
+
+def test_augment_noop_when_nothing_saved():
+    payload = _payload(_make_query("q"))
+    out = _augment_run_payload_with_checks(payload, [], [])
+    assert out is payload
+
+
+def test_augment_tolerates_non_dict_payload():
+    assert _augment_run_payload_with_checks(None, ["q"], []) is None
+    assert _augment_run_payload_with_checks("x", ["q"], []) == "x"
+
+
+def test_build_query_result_returns_none_without_data():
+    assert _build_query_result_from_checks("q", ["chatgpt"], []) is None
+    # Only unmapped engines → still None.
+    assert _build_query_result_from_checks(
+        "q", ["chatgpt"], [_check("q", "Unknown Model", True)]
+    ) is None
