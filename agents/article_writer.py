@@ -497,6 +497,7 @@ async def generate_premium_article(
     article_data = {
         "primary_keyword": outline.get("primary_keyword", ""),
         "secondary_keywords": outline.get("secondary_keywords", []),
+        "intro_md": outline.get("intro_md", ""),
         "table_of_contents": outline.get("table_of_contents", []),
         "key_takeaways": outline.get("key_takeaways", []),
         "sections": sections,
