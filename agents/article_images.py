@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -146,11 +148,96 @@ async def fetch_stock_image(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def fetch_inline_images(queries: List[str]) -> List[Optional[Dict[str, Any]]]:
-    """Resolve a list of section image queries in parallel."""
+async def _generate_inline_image_openai(
+    query: str,
+    *,
+    upload_path_prefix: str,
+) -> Optional[Dict[str, Any]]:
+    """Inline-image fallback when Unsplash isn't configured (or returns no
+    match). Uses ``gpt-image-1`` like the featured pipe but with a section
+    prompt and uploads to Supabase Storage so we don't bloat
+    ``article_data`` with multiple base64 PNGs.
+    """
+    api_key = (settings.OPENAI_API_KEY or "").strip()
+    if not api_key:
+        return None
+
+    prompt = (
+        f"Editorial illustration for a B2B SaaS blog section about \"{query}\". "
+        "Photo-realistic, modern business setting, soft natural lighting, "
+        "neutral muted palette, no on-image text or logos."
+    )
+    payload = {
+        "model": settings.OPENAI_IMAGE_MODEL,
+        "prompt": prompt,
+        "size": settings.OPENAI_IMAGE_SIZE,
+        "quality": settings.OPENAI_IMAGE_QUALITY,
+        "n": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            res = await client.post(
+                _OPENAI_IMAGE_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+        res.raise_for_status()
+        b64 = (res.json().get("data") or [{}])[0].get("b64_json")
+        if not b64:
+            return None
+    except httpx.HTTPStatusError as exc:
+        logger.warning("OpenAI inline image error %s: %s", exc.response.status_code, exc.response.text[:200])
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OpenAI inline image failed for %r: %s", query, exc)
+        return None
+
+    digest = hashlib.md5(query.encode("utf-8")).hexdigest()[:10]
+    ts = int(datetime.now(timezone.utc).timestamp())
+    path = f"{upload_path_prefix.rstrip('/')}/inline-{digest}-{ts}.png"
+    hosted = upload_featured_to_supabase(b64_png=b64, path=path)
+    return {
+        "url": hosted or f"data:image/png;base64,{b64}",
+        "alt": query[:120],
+        "source": "openai",
+    }
+
+
+async def _resolve_inline_image(
+    query: str,
+    *,
+    upload_path_prefix: str,
+) -> Optional[Dict[str, Any]]:
+    """Try Unsplash first (free, attribution required); fall back to
+    generating the image via OpenAI when Unsplash isn't configured or has
+    no match. Either path returns the same dict shape so the writer can
+    treat the result uniformly.
+    """
+    if (settings.UNSPLASH_ACCESS_KEY or "").strip():
+        stock = await fetch_stock_image(query)
+        if stock:
+            return stock
+    return await _generate_inline_image_openai(query, upload_path_prefix=upload_path_prefix)
+
+
+async def fetch_inline_images(
+    queries: List[str],
+    *,
+    upload_path_prefix: str = "inline",
+) -> List[Optional[Dict[str, Any]]]:
+    """Resolve a list of section image queries in parallel.
+
+    Each query is resolved via Unsplash (preferred, free) with an OpenAI
+    generation fallback so a missing Unsplash key still produces inline
+    imagery — at the cost of one ``gpt-image-1`` call per slot.
+    ``upload_path_prefix`` is used only by the OpenAI fallback to namespace
+    Supabase Storage uploads (e.g. ``"<tenant>/<slug>"``).
+    """
     if not queries:
         return []
-    return await asyncio.gather(*(fetch_stock_image(q) for q in queries))
+    return await asyncio.gather(*(
+        _resolve_inline_image(q, upload_path_prefix=upload_path_prefix) for q in queries
+    ))
 
 
 # ──────────────────────────────────────────────────────────────────────────

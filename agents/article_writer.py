@@ -425,12 +425,16 @@ async def generate_premium_article(
         if q and len(inline_queries) < inline_slots:
             inline_queries.append((idx, q))
 
+    upload_prefix = f"{tenant_id}/{outline.get('slug') or _slugify(outline['title'])}"
     featured_task = generate_featured_image(
         title=outline["title"],
         summary=outline.get("meta_description") or topic or outline["title"],
         primary_keyword=outline.get("primary_keyword", ""),
     )
-    inline_task = fetch_inline_images([q for _, q in inline_queries])
+    inline_task = fetch_inline_images(
+        [q for _, q in inline_queries],
+        upload_path_prefix=upload_prefix,
+    )
     featured, inline_images = await asyncio.gather(featured_task, inline_task)
 
     # Featured image: try to upload to Supabase Storage; fall back to

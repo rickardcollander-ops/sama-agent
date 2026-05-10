@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     OPENAI_IMAGE_QUALITY: str = "medium"                    # low | medium | high
     OPENAI_IMAGE_SIZE: str = "1536x1024"                    # landscape, fits hero
     UNSPLASH_ACCESS_KEY: str = ""                           # inline stock images
-    PREMIUM_ARTICLE_INLINE_IMAGES: int = 3                  # how many sections get a stock image
+    PREMIUM_ARTICLE_INLINE_IMAGES: int = 1                  # how many sections get an inline image (stock if Unsplash configured, otherwise generated via OpenAI)
 
     # SEO Config
     GSC_SITE_URL: str = "sc-domain:successifier.com"
