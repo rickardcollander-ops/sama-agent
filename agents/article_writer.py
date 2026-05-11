@@ -17,7 +17,7 @@ Pipeline:
     6. Return everything packed for storage in ``content_pieces``
        (top-level columns + ``article_data`` JSONB blob).
 
-The function never raises on imagery / linking failures — those degrade
+The function never raises on imagery / linking failures. Those degrade
 quietly so a missing API key or rate-limit doesn't break drafting.
 """
 
@@ -39,6 +39,7 @@ from .article_images import (
     upload_featured_to_supabase,
 )
 from .article_score import compute_article_score
+from .brand_voice import BrandVoice, BrandVoiceNotFoundError, TenantBrandVoice
 
 
 logger = logging.getLogger(__name__)
@@ -49,15 +50,48 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────
 
 
-_OUTLINE_SYSTEM = """You are a senior B2B SaaS content strategist and SEO writer.
+_OUTLINE_SYSTEM_BASE = """You are a senior B2B SaaS content strategist and SEO writer.
 You produce in-depth, expert articles that read like the best long-form
-posts from Ahrefs, Backlinko, and First Round Review — concrete, useful,
+posts from Ahrefs, Backlinko, and First Round Review: concrete, useful,
 and visibly structured (TOC, key takeaways, H2/H3 sections, comparison
 tables where helpful, FAQ).
 
-You ALWAYS respond with a single valid JSON object — no prose, no
+You ALWAYS respond with a single valid JSON object. No prose, no
 markdown fences. Every section body is itself markdown. Use proper
-sentence punctuation. Avoid filler and avoid the word "delve"."""
+sentence punctuation.
+
+HARD STYLE RULES (these apply to every string you output, including
+intro_md, section body_md, takeaways, FAQ answers, meta_description):
+- NEVER use em-dashes (the "—" character). If you need a pause, use a
+  comma, a period, parentheses, or a colon. Never use " - " as a stand-in
+  either; rewrite the sentence.
+- Write like an experienced operator, not like ChatGPT. Vary sentence
+  length. Mix short punchy sentences (5-10 words) with longer ones.
+  Active voice.
+- No throat-clearing openers ("In today's world", "In conclusion",
+  "It's important to note", "The good news is that").
+- No hype words: delve, tapestry, leverage, harness, robust, seamless,
+  unleash, unlock, elevate, navigate, game-changer, revolutionary,
+  disruptive, ever-evolving.
+- Concrete examples and numbers over abstract claims. Name real
+  workflows, tools, and metrics where you can.
+- Read each sentence aloud in your head before writing it. If it sounds
+  like an AI wrote it, rewrite it."""
+
+
+def _build_outline_system(voice: Optional[TenantBrandVoice]) -> str:
+    """Compose the outline system prompt with the tenant's brand voice
+    prepended so the article inherits the company's tone instead of a
+    generic SEO-writer voice. Falls back to the base prompt only when
+    no voice is available.
+    """
+    if voice is None:
+        return _OUTLINE_SYSTEM_BASE
+    try:
+        voice_prompt = voice.get_system_prompt(content_type="blog")
+    except Exception:
+        return _OUTLINE_SYSTEM_BASE
+    return f"{voice_prompt}\n\n---\n\n{_OUTLINE_SYSTEM_BASE}"
 
 
 def _outline_prompt(
@@ -98,7 +132,7 @@ Return ONLY a JSON object with this exact shape:
       "id": "kebab-section-id (matches TOC)",
       "heading": "H2 heading",
       "image_query": "concrete photo search query (e.g. 'team analyzing dashboards in modern office'); MAX {inline_image_slots} sections may include this; others omit it",
-      "body_md": "Full section body in markdown. Use H3 (###) sub-headings, bullet lists, blockquotes, and at least one comparison or summary table somewhere in the article. Reference internal_link_anchors and external_link_anchors naturally as plain phrases — DO NOT insert links yourself.",
+      "body_md": "Full section body in markdown. Use H3 (###) sub-headings, bullet lists, blockquotes, and at least one comparison or summary table somewhere in the article. Reference internal_link_anchors and external_link_anchors naturally as plain phrases. DO NOT insert links yourself. DO NOT use em-dashes anywhere in this body.",
       "internal_link_anchors": ["2-4 short phrases that should later become links to related published articles"],
       "external_link_anchors": [
         {{"phrase": "exact phrase to wrap as a link", "url": "https://reputable-source.example.com/path", "reason": "why this source supports the claim"}}
@@ -145,6 +179,30 @@ def _strip_json_fence(text: str) -> str:
 def _parse_outline(raw: str) -> Dict[str, Any]:
     text = _strip_json_fence(raw)
     return json.loads(text)
+
+
+_SCRUB_FIELDS = {
+    "title", "slug", "meta_title", "meta_description", "intro_md",
+    "primary_keyword", "label", "point", "details", "heading", "body_md",
+    "image_query", "phrase", "reason", "q", "a", "alt", "credit",
+}
+
+
+def _scrub_outline(node: Any) -> Any:
+    """Walk the outline and run BrandVoice.cleanup_ai_tells on every
+    string value so any em-dashes the model slips in get rewritten to
+    commas / hyphens before assembly.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str) and key in _SCRUB_FIELDS:
+                node[key] = BrandVoice.cleanup_ai_tells(value)
+            else:
+                _scrub_outline(value)
+    elif isinstance(node, list):
+        for item in node:
+            _scrub_outline(item)
+    return node
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -388,6 +446,18 @@ async def generate_premium_article(
     """
     inline_slots = settings.PREMIUM_ARTICLE_INLINE_IMAGES if inline_image_slots is None else inline_image_slots
 
+    # Load tenant brand voice so the article inherits the company tone
+    # instead of a generic SEO-writer voice. Fall back to Successifier
+    # defaults if the tenant has no voice row yet.
+    voice: Optional[TenantBrandVoice]
+    try:
+        voice = BrandVoice.for_tenant(tenant_id)
+    except BrandVoiceNotFoundError:
+        voice = BrandVoice.for_tenant("default")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Brand voice load failed (%s); using base prompt", exc)
+        voice = None
+
     # 1. Outline + bodies from Claude ────────────────────────────────────
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     user_prompt = _outline_prompt(
@@ -402,7 +472,7 @@ async def generate_premium_article(
         client.messages.create,
         model=settings.CLAUDE_MODEL,
         max_tokens=8000,
-        system=_OUTLINE_SYSTEM,
+        system=_build_outline_system(voice),
         messages=[{"role": "user", "content": user_prompt}],
     )
     raw = message.content[0].text
@@ -411,6 +481,8 @@ async def generate_premium_article(
     except json.JSONDecodeError as exc:
         logger.error("Outline JSON parse failed: %s -- raw=%s", exc, raw[:400])
         raise
+
+    _scrub_outline(outline)
 
     # Normalise required fields with safe defaults.
     outline.setdefault("title", title)
@@ -479,7 +551,7 @@ async def generate_premium_article(
         external_inserted += n_ext
 
     # 4. Final markdown ──────────────────────────────────────────────────
-    markdown = _render_markdown(outline)
+    markdown = BrandVoice.cleanup_ai_tells(_render_markdown(outline))
     word_count = len(re.findall(r"\b\w+\b", markdown))
 
     # 5. Score ───────────────────────────────────────────────────────────
