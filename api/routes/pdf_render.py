@@ -52,11 +52,11 @@ def _allowed_hosts() -> set[str]:
     raw = os.getenv("PDF_RENDER_ALLOWED_HOSTS", "").strip()
     if raw:
         return {h.strip().lower() for h in raw.split(",") if h.strip()}
-    # Sensible default: anything ending in successifier.com + Vercel previews.
+    # Sensible default: anything under successifier.com + Vercel previews.
+    # The wildcard match in _host_is_allowed handles subdomains like
+    # sama.successifier.com — this set is just the exact hosts.
     return {
-        "app.successifier.com",
         "successifier.com",
-        "www.successifier.com",
         "localhost",
         "127.0.0.1",
     }
@@ -66,6 +66,11 @@ def _host_is_allowed(host: str) -> bool:
     host = host.lower()
     allowed = _allowed_hosts()
     if host in allowed:
+        return True
+    # Allow any successifier.com subdomain (app, sama, www, future ones).
+    # Only when the default allowlist is in use — once an operator sets
+    # PDF_RENDER_ALLOWED_HOSTS explicitly we honour their list literally.
+    if not os.getenv("PDF_RENDER_ALLOWED_HOSTS", "").strip() and host.endswith(".successifier.com"):
         return True
     # Allow *.vercel.app preview deployments by default — they're the
     # canonical staging environment for this dashboard.
