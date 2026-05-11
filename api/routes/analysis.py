@@ -141,6 +141,95 @@ def _build_query_result_from_checks(
     }
 
 
+def _build_run_payload_from_checks_only(
+    tenant_id: str,
+    saved_queries: List[str],
+    checks: List[Dict[str, Any]],
+    brand_name: Optional[str],
+    domain: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Synthesise a complete AnalysisRun payload from ai_visibility_checks.
+
+    Used when the tenant has run AI Assistant checks (via /c/geo) but never
+    triggered a full /api/analysis/run, so no analysis_runs row exists. The
+    Insights matrix would otherwise show its empty state even though the
+    monitoring data is sitting in ai_visibility_checks.
+
+    Returns ``None`` when there's nothing meaningful to display — either no
+    saved queries, no checks, or no engine in the checks maps to a known
+    AIPlatform. Callers fall back to the empty state in that case.
+    """
+    if not saved_queries or not checks:
+        return None
+
+    # Derive platforms from the checks data so the matrix columns line up
+    # with what we actually have. Preserve a stable order so the matrix
+    # doesn't shuffle columns between renders.
+    platform_order = ["chatgpt", "claude", "gemini", "perplexity", "copilot"]
+    seen_platforms: set[str] = set()
+    latest_checked_at = ""
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        platform = _AI_VISIBILITY_ENGINE_TO_PLATFORM.get(c.get("ai_engine") or "")
+        if platform:
+            seen_platforms.add(platform)
+        ts = c.get("checked_at") or ""
+        if ts > latest_checked_at:
+            latest_checked_at = ts
+    if not seen_platforms:
+        return None
+    platforms = [p for p in platform_order if p in seen_platforms]
+
+    query_results: List[Dict[str, Any]] = []
+    for q in saved_queries:
+        synth = _build_query_result_from_checks(q, platforms, checks)
+        if synth is not None:
+            query_results.append(synth)
+
+    if not query_results:
+        return None
+
+    return {
+        "id": f"synth-{tenant_id}",
+        "status": "completed",
+        "synthetic": True,
+        "source": "ai_visibility_checks",
+        "tenant_id": tenant_id,
+        "brand_name": brand_name,
+        "domain": domain,
+        "query_count": len(query_results),
+        "platform_count": len(platforms),
+        "platforms": platforms,
+        "query_results": query_results,
+        "overview": _rebuild_overview(query_results),
+        "completed_at": latest_checked_at or None,
+    }
+
+
+def _load_recent_checks(tenant_id: str) -> List[Dict[str, Any]]:
+    """Pull the recent ai_visibility_checks rows used by augmentation/synthesis."""
+    try:
+        sb = get_supabase()
+        chk = (
+            sb.table("ai_visibility_checks")
+            .select(
+                "prompt,ai_engine,mentioned,rank,sentiment,"
+                "competitors_mentioned,checked_at"
+            )
+            .eq("tenant_id", tenant_id)
+            .order("checked_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        return chk.data or []
+    except Exception:
+        logger.warning(
+            "could not load ai_visibility_checks for tenant %s", tenant_id, exc_info=True
+        )
+        return []
+
+
 def _augment_run_payload_with_checks(
     payload: Any,
     saved_queries: List[str],
@@ -474,6 +563,73 @@ async def list_runs(request: Request, limit: int = 20):
         return {"runs": []}
 
 
+# ── GET /latest ──────────────────────────────────────────────────────────────
+
+@router.get("/latest")
+async def get_latest(request: Request) -> Dict[str, Any]:
+    """Return the data the Insights matrix should render right now.
+
+    Resolution order:
+      1. The most recent completed ``analysis_runs`` row, filtered to the
+         tenant's currently-saved ``geo_queries`` and augmented with
+         ``ai_visibility_checks`` so freshly-added prompts still appear.
+      2. A synthetic payload built purely from ``ai_visibility_checks`` —
+         used when the tenant has run AI Assistant checks via /c/geo but
+         never triggered /api/analysis/run. Without this fallback the
+         matrix went blank for visibility-only tenants even though their
+         monitoring data was already in the database.
+      3. ``{"status": "empty"}`` when neither source has anything to render.
+    """
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    sb = get_supabase()
+
+    try:
+        config = await get_tenant_config(tenant_id)
+        saved = list(getattr(config, "geo_queries", []) or [])
+        brand_name = getattr(config, "brand_name", None)
+        domain = getattr(config, "domain", None)
+    except Exception:
+        logger.warning(
+            "tenant config lookup failed in /api/analysis/latest", exc_info=True
+        )
+        saved, brand_name, domain = [], None, None
+
+    try:
+        result = (
+            sb.table("analysis_runs")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("status", "completed")
+            .order("completed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.error(f"latest analysis_runs lookup failed: {e}")
+        rows = []
+
+    if rows:
+        row = rows[0]
+        payload = row.get("payload")
+        if isinstance(payload, dict):
+            payload["id"] = row["id"]
+            payload["status"] = row["status"]
+            filtered = _filter_run_payload_to_saved(payload, saved)
+            checks = _load_recent_checks(tenant_id) if saved else []
+            return _augment_run_payload_with_checks(filtered, saved, checks)
+
+    if saved:
+        checks = _load_recent_checks(tenant_id)
+        synth = _build_run_payload_from_checks_only(
+            tenant_id, saved, checks, brand_name, domain
+        )
+        if synth is not None:
+            return synth
+
+    return {"status": "empty", "synthetic": True, "source": "none"}
+
+
 # ── GET /runs/{id} ───────────────────────────────────────────────────────────
 
 @router.get("/runs/{run_id}")
@@ -517,33 +673,7 @@ async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
                 )
                 saved = []
             filtered = _filter_run_payload_to_saved(payload, saved)
-
-            # Pull recent ai_visibility_checks so prompts the user added to
-            # AI Assistant after this run was persisted still appear in the
-            # matrix. Without this the Insights "Per query" view looks
-            # empty until a fresh /api/analysis/run completes.
-            checks: List[Dict[str, Any]] = []
-            if saved:
-                try:
-                    chk = (
-                        sb.table("ai_visibility_checks")
-                        .select(
-                            "prompt,ai_engine,mentioned,rank,sentiment,"
-                            "competitors_mentioned,checked_at"
-                        )
-                        .eq("tenant_id", tenant_id)
-                        .order("checked_at", desc=True)
-                        .limit(500)
-                        .execute()
-                    )
-                    checks = chk.data or []
-                except Exception:
-                    logger.warning(
-                        "could not load ai_visibility_checks for run %s; "
-                        "skipping augmentation",
-                        run_id,
-                        exc_info=True,
-                    )
+            checks = _load_recent_checks(tenant_id) if saved else []
             return _augment_run_payload_with_checks(filtered, saved, checks)
         return row
     except HTTPException:
