@@ -22,10 +22,21 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from shared.database import get_supabase
+from shared.domain import normalize_host, same_domain
 from shared.tenant import get_tenant_config
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _expected_domain(config) -> str:
+    """Return the bare host the tenant is allowed to audit, or ``""``.
+
+    When empty, the guard is intentionally skipped — older tenants who haven't
+    populated ``user_sites.settings.domain`` would otherwise see nothing at
+    all, which is worse than the leak we're plugging.
+    """
+    return normalize_host(getattr(config, "domain", "") or "")
 
 
 class RunPayload(BaseModel):
@@ -48,6 +59,24 @@ async def run_site_audit(payload: RunPayload, request: Request):
     domain = (payload.domain or config.domain or "").strip()
     if not domain:
         raise HTTPException(status_code=400, detail="domain required")
+
+    # Domain guard: the workspace may only audit its own configured domain.
+    # Without this, a caller (or a stale dashboard) can poison the cache by
+    # kicking off an audit for an unrelated domain under this tenant_id and
+    # then receiving it back from /runs.
+    expected = _expected_domain(config)
+    if expected and not same_domain(domain, expected):
+        logger.warning(
+            "site_audit_domain_mismatch tenant=%s requested=%s configured=%s",
+            tenant_id, domain, expected,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Domain '{domain}' does not match this workspace "
+                f"(configured: '{expected}')."
+            ),
+        )
 
     max_pages = max(1, min(payload.max_pages or 200, 500))
     sb = get_supabase()
@@ -245,9 +274,18 @@ _LEGACY_RUN_COLUMNS = (
 
 @router.get("/runs")
 async def list_runs(request: Request, limit: int = 20):
-    """Recent audits for this tenant (history view)."""
+    """Recent audits for this tenant (history view).
+
+    Rows whose ``domain`` doesn't match the workspace's configured domain are
+    dropped before returning. This is a belt-and-braces filter — the writer
+    already refuses mismatched audits — but it also hides historical rows
+    that pre-date the guard, which is why the dashboard had to layer the
+    same check on top.
+    """
     global _PROGRESS_COLUMNS_PRESENT
     tenant_id = getattr(request.state, "tenant_id", "default")
+    config = await get_tenant_config(tenant_id)
+    expected = _expected_domain(config)
     sb = get_supabase()
 
     columns = (
@@ -266,11 +304,23 @@ async def list_runs(request: Request, limit: int = 20):
             .execute()
         )
 
+    def _filter(rows):
+        if not expected:
+            return rows
+        kept = [r for r in rows if same_domain(r.get("domain"), expected)]
+        dropped = len(rows) - len(kept)
+        if dropped:
+            logger.info(
+                "site_audit_runs_filtered tenant=%s expected=%s dropped=%d",
+                tenant_id, expected, dropped,
+            )
+        return kept
+
     try:
         result = _query(columns)
         if _PROGRESS_COLUMNS_PRESENT is None:
             _PROGRESS_COLUMNS_PRESENT = True
-        return {"runs": result.data or []}
+        return {"runs": _filter(result.data or [])}
     except Exception as e:
         if _PROGRESS_COLUMNS_PRESENT is not False and _is_missing_column_error(e):
             _PROGRESS_COLUMNS_PRESENT = False
@@ -280,7 +330,7 @@ async def list_runs(request: Request, limit: int = 20):
             )
             try:
                 result = _query(_LEGACY_RUN_COLUMNS)
-                return {"runs": result.data or []}
+                return {"runs": _filter(result.data or [])}
             except Exception as e2:
                 logger.error(f"list site_audits failed (legacy): {e2}")
                 return {"runs": []}
@@ -292,8 +342,15 @@ async def list_runs(request: Request, limit: int = 20):
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
-    """One audit with its full payload — used for polling and replay."""
+    """One audit with its full payload — used for polling and replay.
+
+    404s when the row's ``domain`` doesn't match the workspace's configured
+    domain so a stale link to another tenant's audit can't surface its
+    payload even if both share a tenant_id partition.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
+    config = await get_tenant_config(tenant_id)
+    expected = _expected_domain(config)
     sb = get_supabase()
     try:
         result = (
@@ -308,6 +365,13 @@ async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
         if not rows:
             raise HTTPException(status_code=404, detail="Site audit not found")
         row = rows[0]
+        if expected and not same_domain(row.get("domain"), expected):
+            logger.warning(
+                "site_audit_domain_mismatch_on_read tenant=%s id=%s "
+                "row_domain=%s expected=%s",
+                tenant_id, run_id, row.get("domain"), expected,
+            )
+            raise HTTPException(status_code=404, detail="Site audit not found")
         if row.get("status") == "completed" and row.get("payload"):
             payload = row["payload"]
             payload["id"] = row["id"]

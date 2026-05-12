@@ -23,10 +23,20 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from shared.database import get_supabase
+from shared.domain import normalize_host, same_domain
 from shared.tenant import get_tenant_config
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _expected_domain(config) -> str:
+    """Bare host the tenant is allowed to read/write, or ``""`` when unset.
+
+    Empty disables the guard — older tenants who haven't populated
+    ``user_sites.settings.domain`` would otherwise see nothing.
+    """
+    return normalize_host(getattr(config, "domain", "") or "")
 
 
 def _normalize_query(q: Any) -> str:
@@ -465,6 +475,23 @@ async def run_analysis(payload: RunPayload, request: Request):
         list(getattr(config, "competitors", []) or [])
     )
 
+    # Domain guard: refuse to persist a run whose domain doesn't match the
+    # workspace. Without this, a caller can poison /runs (and /latest) by
+    # submitting an analysis for an unrelated domain under this tenant_id.
+    expected = _expected_domain(config)
+    if expected and domain and not same_domain(domain, expected):
+        logger.warning(
+            "analysis_domain_mismatch tenant=%s requested=%s configured=%s",
+            tenant_id, domain, expected,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Domain '{domain}' does not match this workspace "
+                f"(configured: '{expected}')."
+            ),
+        )
+
     # Persist the row before kicking off the background task — if the insert
     # fails (RLS, missing table, bad credentials) the dashboard has no id to
     # poll, so surface the real reason instead of returning {"id": null}.
@@ -545,8 +572,15 @@ async def _execute_analysis(
 
 @router.get("/runs")
 async def list_runs(request: Request, limit: int = 20):
-    """Recent analysis runs for this tenant (for the history view)."""
+    """Recent analysis runs for this tenant (for the history view).
+
+    Rows whose ``domain`` doesn't match the workspace's configured domain are
+    dropped before returning — mirrors the dashboard filter and hides
+    pre-guard rows that drifted across tenants.
+    """
     tenant_id = getattr(request.state, "tenant_id", "default")
+    config = await get_tenant_config(tenant_id)
+    expected = _expected_domain(config)
     sb = get_supabase()
     try:
         result = (
@@ -557,7 +591,17 @@ async def list_runs(request: Request, limit: int = 20):
             .limit(min(limit, 100))
             .execute()
         )
-        return {"runs": result.data or []}
+        rows = result.data or []
+        if expected:
+            kept = [r for r in rows if same_domain(r.get("domain"), expected)]
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info(
+                    "analysis_runs_filtered tenant=%s expected=%s dropped=%d",
+                    tenant_id, expected, dropped,
+                )
+            rows = kept
+        return {"runs": rows}
     except Exception as e:
         logger.error(f"list analysis_runs failed: {e}")
         return {"runs": []}
@@ -594,6 +638,7 @@ async def get_latest(request: Request) -> Dict[str, Any]:
         )
         saved, brand_name, domain = [], None, None
 
+    expected_host = normalize_host(domain or "")
     try:
         result = (
             sb.table("analysis_runs")
@@ -611,13 +656,22 @@ async def get_latest(request: Request) -> Dict[str, Any]:
 
     if rows:
         row = rows[0]
-        payload = row.get("payload")
-        if isinstance(payload, dict):
-            payload["id"] = row["id"]
-            payload["status"] = row["status"]
-            filtered = _filter_run_payload_to_saved(payload, saved)
-            checks = _load_recent_checks(tenant_id) if saved else []
-            return _augment_run_payload_with_checks(filtered, saved, checks)
+        # Drop the stored row when its domain doesn't match — falls through
+        # to the synthetic builder so the matrix renders fresh
+        # ai_visibility_checks data instead of a stranger's payload.
+        if expected_host and not same_domain(row.get("domain"), expected_host):
+            logger.warning(
+                "analysis_latest_domain_mismatch tenant=%s row_domain=%s expected=%s",
+                tenant_id, row.get("domain"), expected_host,
+            )
+        else:
+            payload = row.get("payload")
+            if isinstance(payload, dict):
+                payload["id"] = row["id"]
+                payload["status"] = row["status"]
+                filtered = _filter_run_payload_to_saved(payload, saved)
+                checks = _load_recent_checks(tenant_id) if saved else []
+                return _augment_run_payload_with_checks(filtered, saved, checks)
 
     if saved:
         checks = _load_recent_checks(tenant_id)
@@ -640,8 +694,13 @@ async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
     ``geo_queries`` before being returned: prompts that have since been
     removed from AI Assistant should not reappear on Insights, and the
     aggregate overview is recomputed so totals match the visible rows.
+
+    404s when the row's ``domain`` doesn't match the workspace's configured
+    domain — same cross-tenant guard as ``/runs`` and ``/latest``.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
+    config = await get_tenant_config(tenant_id)
+    expected = _expected_domain(config)
     sb = get_supabase()
     try:
         result = (
@@ -656,22 +715,20 @@ async def get_run(run_id: str, request: Request) -> Dict[str, Any]:
         if not rows:
             raise HTTPException(status_code=404, detail="Analysis run not found")
         row = rows[0]
+        if expected and not same_domain(row.get("domain"), expected):
+            logger.warning(
+                "analysis_run_domain_mismatch_on_read tenant=%s id=%s "
+                "row_domain=%s expected=%s",
+                tenant_id, run_id, row.get("domain"), expected,
+            )
+            raise HTTPException(status_code=404, detail="Analysis run not found")
         # If the run is complete, surface the AnalysisRun payload directly so
         # the frontend can render it without reshaping.
         if row.get("status") == "completed" and row.get("payload"):
             payload = row["payload"]
             payload["id"] = row["id"]
             payload["status"] = row["status"]
-            try:
-                config = await get_tenant_config(tenant_id)
-                saved = list(getattr(config, "geo_queries", []) or [])
-            except Exception:
-                logger.warning(
-                    "could not load tenant config when filtering run %s; returning raw payload",
-                    run_id,
-                    exc_info=True,
-                )
-                saved = []
+            saved = list(getattr(config, "geo_queries", []) or [])
             filtered = _filter_run_payload_to_saved(payload, saved)
             checks = _load_recent_checks(tenant_id) if saved else []
             return _augment_run_payload_with_checks(filtered, saved, checks)
