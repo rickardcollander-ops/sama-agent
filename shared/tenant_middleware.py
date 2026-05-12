@@ -81,6 +81,8 @@ _BYPASS_PREFIXES = (
     "/health",
     "/api/auth/",
     "/api/webhooks/",
+    # Stripe posts the webhook directly to the backend — no JWT, signature-verified.
+    "/api/subscriptions/webhook",
     "/docs",
     "/redoc",
     "/openapi.json",

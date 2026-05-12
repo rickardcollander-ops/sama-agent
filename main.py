@@ -37,6 +37,7 @@ from api.routes import (
     weekly_email as weekly_email_routes,
     account as account_routes,
     pdf_render as pdf_render_routes,
+    subscriptions as subscriptions_routes,
 )
 from shared.config import settings
 from shared.database import init_db, get_supabase
@@ -231,6 +232,23 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"detail": exc.detail},
     )
 
+
+# Map trial/subscription gating to 402 Payment Required so the dashboard
+# can recognise the response and route users to the pricing page.
+from shared.usage import SubscriptionRequired  # noqa: E402
+
+
+@app.exception_handler(SubscriptionRequired)
+async def subscription_required_handler(request: Request, exc: SubscriptionRequired):
+    return JSONResponse(
+        status_code=402,
+        content={
+            "detail": "Subscription required",
+            "reason": exc.reason,
+            "code": "subscription_required",
+        },
+    )
+
 # Include routers
 app.include_router(orchestrator.router, prefix="/api/orchestrator", tags=["orchestrator"])
 app.include_router(seo.router, prefix="/api/seo", tags=["seo"])
@@ -309,6 +327,7 @@ app.include_router(
 )
 app.include_router(account_routes.router, prefix="/api/account", tags=["account"])
 app.include_router(pdf_render_routes.router, prefix="/api/pdf", tags=["pdf-render"])
+app.include_router(subscriptions_routes.router, prefix="/api/subscriptions", tags=["subscriptions"])
 
 
 @app.get("/")
