@@ -640,6 +640,22 @@ _PGRST_MISSING_COL_RE = re.compile(
     r"Could not find the ['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]? column",
 )
 
+# Postgres SQLSTATE 23505 = unique_violation. Migration 038 adds
+# uniq_content_plan_keyword_per_tenant on (tenant_id, lower(target_keyword)),
+# so prior strategy / keyword-research / GEO-query runs that wrote a row for
+# the same keyword make a fresh insert collide. We treat that as a benign
+# skip (the keyword is already in the plan) instead of an error.
+_DUP_KEY_MARKERS = (
+    "23505",
+    "duplicate key",
+    "uniq_content_plan_keyword_per_tenant",
+)
+
+
+def _is_dup_keyword_error(msg: str) -> bool:
+    lowered = msg.lower()
+    return any(marker in lowered for marker in _DUP_KEY_MARKERS)
+
 
 def _safe_insert(
     sb: Any, table: str, data: Dict[str, Any], max_retries: int = 8,
@@ -647,6 +663,10 @@ def _safe_insert(
     """Insert ``data`` into ``table``; on "unknown column" errors, drop the
     offending column and retry. Returns the first inserted row, or ``None``
     if the insert keeps failing for unrelated reasons.
+
+    Duplicate-key errors on the per-tenant keyword constraint are treated
+    as a soft skip: a row for this keyword already exists for the tenant,
+    so the caller should just move on rather than treating it as a failure.
     """
     payload = dict(data)
     for _ in range(max_retries):
@@ -655,6 +675,14 @@ def _safe_insert(
             return (row.data or [{}])[0] or None
         except Exception as e:
             msg = str(e)
+            if _is_dup_keyword_error(msg):
+                logger.info(
+                    "%s insert skipped: keyword %r already in plan for tenant %r",
+                    table,
+                    payload.get("target_keyword"),
+                    payload.get("tenant_id"),
+                )
+                return None
             match = _PGRST_MISSING_COL_RE.search(msg)
             if not match:
                 logger.error(f"{table} insert failed: {e}")
@@ -953,6 +981,25 @@ async def create_plan_from_analysis(
     schedule_cursor: Dict[str, int] = {"30": 0, "60": 0, "90": 0}
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # Pre-seed the in-batch dedupe set with target_keywords already on the
+    # tenant's plan. The unique index is on lower(target_keyword), so any
+    # row written by a previous strategy / keyword-research / GEO-query run
+    # would otherwise come back as a duplicate-key error during insert.
+    seen_keywords_lower: set[str] = set()
+    try:
+        existing_kw_res = (
+            sb.table("content_plan_items")
+            .select("target_keyword")
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
+        for row in (existing_kw_res.data or []):
+            kw = (row.get("target_keyword") or "").strip().lower()
+            if kw:
+                seen_keywords_lower.add(kw)
+    except Exception as e:
+        logger.debug(f"content_plan_creator: existing-keyword preload skipped: {e}")
+
     for (bucket, topic), idea in zip(flat, titles):
         sched_list = schedule.get(bucket, [])
         idx = schedule_cursor[bucket]
@@ -967,6 +1014,19 @@ async def create_plan_from_analysis(
         title = (idea.get("title") or f"Article on {topic['query']}")[:300]
         pillar = (idea.get("pillar") or "")[:100]
         angle = idea.get("angle") or ""
+
+        # Case-insensitive in-batch + cross-run dedupe so we don't fire the
+        # uniq_content_plan_keyword_per_tenant constraint and end up with
+        # half the article ideas missing from the plan.
+        kw_lower = (target_keyword or "").strip().lower()
+        if kw_lower and kw_lower in seen_keywords_lower:
+            logger.info(
+                "content_plan_creator: skipping duplicate keyword %r for tenant %s",
+                target_keyword, tenant_id,
+            )
+            continue
+        if kw_lower:
+            seen_keywords_lower.add(kw_lower)
 
         plan_data = {
             "tenant_id": tenant_id,
@@ -1032,7 +1092,12 @@ async def create_plan_from_analysis(
                     "title": f"{platform.title()} post: {parent['title']}"[:300],
                     "topic": f"Social post linking to article: {parent['title']}"[:1000],
                     "content_type": f"social_{platform}",
-                    "target_keyword": (parent.get("target_keyword") or "")[:200],
+                    # Inheriting parent's target_keyword would always trip
+                    # uniq_content_plan_keyword_per_tenant since the parent
+                    # article row just claimed it. The partial unique index
+                    # excludes NULL/empty, so leave it blank on socials and
+                    # keep the parent linkage via parent_plan_item_id below.
+                    "target_keyword": None,
                     "priority": parent["priority"],
                     "status": "idea",
                     "source": "analysis_gap",
