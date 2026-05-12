@@ -93,14 +93,19 @@ class PageReport:
     # Security headers captured from the HTTP response — used for the
     # technical-SEO score and to surface concrete fix instructions.
     security_headers: Dict[str, bool] = field(default_factory=dict)
+    # Extra raw signals retained so the tech agent can quote the customer's
+    # actual current code in its suggestions, instead of guessing from brand
+    # metadata. Each is bounded server-side to keep the JSONB row reasonable.
+    og_tags: Dict[str, str] = field(default_factory=dict)
+    jsonld_blocks: List[str] = field(default_factory=list)
+    head_html_excerpt: Optional[str] = None
+    viewport_content: Optional[str] = None
+    html_lang: Optional[str] = None
+    hreflang_alternates: List[Dict[str, str]] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        # body_text_sample is captured for keyword extraction but is too
-        # noisy to ship over the wire; strip it from the page payload.
-        d = self.__dict__.copy()
-        d.pop("body_text_sample", None)
-        return d
+        return self.__dict__.copy()
 
 
 @dataclass
@@ -369,6 +374,10 @@ class SiteAuditAgent:
                 "recommendations": recommendations,
                 "recommendation_groups": recommendation_groups,
                 "keyword_opportunities": keyword_opportunities,
+                # Raw site-level signals retained for the tech agent. Both
+                # capped so the JSONB row stays under control.
+                "robots_txt_content": robots[:4096] if robots else None,
+                "sitemap_sample": (sitemap_urls or [])[:50],
             }
 
     # ── Recommendation grouping + keyword opportunities ─────────────────────
@@ -628,6 +637,12 @@ class SiteAuditAgent:
         report = PageReport(url=url, status_code=status, response_ms=ms,
                             security_headers=sec_headers)
 
+        # Snapshot the raw <head> HTML before we mutate the soup below
+        # (script/style stripping). The tech agent uses this excerpt as the
+        # "before" snippet when proposing meta-tag/OG/JSON-LD edits.
+        if soup.head is not None:
+            report.head_html_excerpt = str(soup.head)[:1500]
+
         # Title
         if soup.title and soup.title.string:
             report.title = soup.title.string.strip()
@@ -654,24 +669,30 @@ class SiteAuditAgent:
         ]
 
         # Schema.org JSON-LD — extract BEFORE stripping <script> tags below.
+        # Keep the raw block (capped) alongside the @type list so the tech
+        # agent can quote it back when proposing schema fixes.
         for s in soup.find_all("script", type=lambda v: v and "ld+json" in v.lower()):
+            raw = (s.string or "").strip()
             try:
-                data = json.loads(s.string or "{}")
+                data = json.loads(raw or "{}")
             except Exception:
                 continue
             report.has_schema = True
             for t in self._extract_schema_types(data):
                 if t and t not in report.schema_types:
                     report.schema_types.append(t)
+            if raw and len(report.jsonld_blocks) < 3:
+                report.jsonld_blocks.append(raw[:2000])
 
         # Word count + body sample (rough — strip script/style first).
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         body_text = soup.get_text(" ", strip=True)
         report.word_count = _word_count(body_text)
-        # Keep first ~6k chars for keyword extraction; full body text would
-        # blow up the JSON payload but a sample captures the page's topic.
-        report.body_text_sample = body_text[:6000] if body_text else None
+        # Keep first ~1.5k chars for keyword extraction + the tech agent's
+        # "what does this page actually say?" context. Was 6k; trimmed once
+        # we started shipping it over the wire so the JSONB row stays sane.
+        report.body_text_sample = body_text[:1500] if body_text else None
 
         # Images — alt, dimensions (CLS), and lazy-loading.
         imgs = soup.find_all("img")
@@ -696,22 +717,49 @@ class SiteAuditAgent:
         if canon and canon.get("href"):
             report.canonical = canon["href"].strip()
 
-        # Open Graph
-        report.has_open_graph = bool(soup.find("meta", attrs={"property": re.compile(r"^og:", re.I)}))
+        # Open Graph + Twitter Card — capture the actual values, not just
+        # presence, so suggestions can quote the customer's current og:title
+        # back at them and propose a concrete replacement.
+        for m in soup.find_all("meta", attrs={"property": re.compile(r"^(og|twitter):", re.I)}):
+            prop = (m.get("property") or "").strip().lower()
+            content = (m.get("content") or "").strip()
+            if prop and content and prop not in report.og_tags:
+                report.og_tags[prop] = content[:300]
+        # Twitter Card sometimes ships as <meta name="twitter:..."> instead
+        # of property="twitter:..." — pick those up too.
+        for m in soup.find_all("meta", attrs={"name": re.compile(r"^twitter:", re.I)}):
+            prop = (m.get("name") or "").strip().lower()
+            content = (m.get("content") or "").strip()
+            if prop and content and prop not in report.og_tags:
+                report.og_tags[prop] = content[:300]
+        report.has_open_graph = any(k.startswith("og:") for k in report.og_tags)
 
         # Viewport
         vp = soup.find("meta", attrs={"name": re.compile(r"^viewport$", re.I)})
         report.has_viewport = bool(vp and vp.get("content"))
+        if vp and vp.get("content"):
+            report.viewport_content = vp["content"].strip()[:200]
 
         # <html lang>
         html_tag = soup.find("html")
         report.has_lang = bool(html_tag and html_tag.get("lang"))
+        if html_tag and html_tag.get("lang"):
+            report.html_lang = html_tag["lang"].strip()[:20]
 
         # Hreflang — important for international SEO. We only require it on
         # sites that actually have multilingual variants, but we still record
         # presence so the site-level finding can decide whether to flag it.
-        report.has_hreflang = bool(soup.find("link", rel=lambda v: v and "alternate" in (v if isinstance(v, list) else [v]),
-                                              hreflang=True))
+        hreflang_links = soup.find_all(
+            "link",
+            rel=lambda v: v and "alternate" in (v if isinstance(v, list) else [v]),
+            hreflang=True,
+        )
+        report.has_hreflang = bool(hreflang_links)
+        for link in hreflang_links[:20]:
+            lang = (link.get("hreflang") or "").strip()
+            href = (link.get("href") or "").strip()
+            if lang and href:
+                report.hreflang_alternates.append({"lang": lang[:20], "href": href[:300]})
 
         # Links
         all_links = soup.find_all("a", href=True)
