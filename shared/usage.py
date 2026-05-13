@@ -34,6 +34,16 @@ class PlanLimits:
 
 
 PLANS: Dict[str, PlanLimits] = {
+    "free": PlanLimits(
+        name="Free",
+        # Comp accounts (beta users, internal demos, friends-and-family). We
+        # still record usage for visibility but never block. Set when admin
+        # toggles the plan on /c/admin so the tenant doesn't hit a paywall.
+        content_pieces=10**9,
+        ad_creatives=10**9,
+        agent_runs=10**9,
+        review_responses=10**9,
+    ),
     "starter": PlanLimits(
         name="Starter",
         content_pieces=20,
