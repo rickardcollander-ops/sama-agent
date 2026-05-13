@@ -152,6 +152,12 @@ class Settings(BaseSettings):
     # "billing not configured" rather than crashing.
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # Per-site pricing. One Stripe price ($169/mo recurring) charged with
+    # quantity == number of sites the customer has connected.
+    STRIPE_PRICE_SITE: str = ""
+    SITE_PRICE_USD: int = 169                 # used for display copy in the dashboard
+    # Legacy tier prices — no longer used in checkout, kept so existing env
+    # files don't fail validation. Remove once the rollout is complete.
     STRIPE_PRICE_STARTER: str = ""
     STRIPE_PRICE_GROWTH: str = ""
     STRIPE_PRICE_ENTERPRISE: str = ""

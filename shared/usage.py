@@ -34,23 +34,24 @@ class PlanLimits:
 
 
 PLANS: Dict[str, PlanLimits] = {
-    "starter": PlanLimits(
-        name="Starter",
-        content_pieces=20,
-        ad_creatives=10,
-        agent_runs=200,
-        review_responses=50,
-    ),
-    "growth": PlanLimits(
-        name="Growth",
+    # Per-site billing: every subscriber gets the same flat caps. Limits
+    # are intentionally generous since they're charged $169/mo per site,
+    # not per usage. Usage is still recorded so we can spot anomalies and
+    # add billing later if needed.
+    "site": PlanLimits(
+        name="Site",
         content_pieces=100,
         ad_creatives=50,
         agent_runs=1000,
         review_responses=300,
     ),
+    # Legacy tier names kept as aliases so old user_settings.plan values
+    # ("starter" / "growth" / "enterprise") still resolve to limits while
+    # the rollout settles.
+    "starter": PlanLimits(name="Site", content_pieces=100, ad_creatives=50, agent_runs=1000, review_responses=300),
+    "growth": PlanLimits(name="Site", content_pieces=100, ad_creatives=50, agent_runs=1000, review_responses=300),
     "enterprise": PlanLimits(
-        name="Enterprise",
-        # Effectively unlimited; we still record usage for billing visibility.
+        name="Site",
         content_pieces=10**9,
         ad_creatives=10**9,
         agent_runs=10**9,
@@ -58,7 +59,7 @@ PLANS: Dict[str, PlanLimits] = {
     ),
 }
 
-DEFAULT_PLAN = "starter"
+DEFAULT_PLAN = "site"
 
 # Known metrics — keep in sync with PlanLimits attributes.
 METRICS = ("content_pieces", "ad_creatives", "agent_runs", "review_responses")
