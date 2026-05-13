@@ -33,7 +33,7 @@ PAYMENT_GRACE_STATUSES = {"past_due"}  # still has access but UI nags
 class AccessStatus:
     """What the rest of the app needs to know to gate billable actions."""
 
-    plan: str                       # starter | growth | enterprise
+    plan: str                       # always "site" with per-site pricing
     status: str                     # see ACTIVE_STATUSES above + canceled/expired
     has_access: bool                # False -> block billable actions
     trial_ends_at: Optional[str]    # ISO timestamp or None
@@ -43,6 +43,11 @@ class AccessStatus:
     stripe_subscription_id: Optional[str]
     blocked_reason: Optional[str]   # filled when has_access is False
     current_period_end: Optional[str] = None
+    # Per-site pricing: how many sites this user has + Stripe quantity.
+    site_count: int = 0
+    quantity: int = 0               # mirror of Stripe sub quantity
+    unit_price_usd: int = 0         # display copy
+    monthly_total_usd: int = 0      # quantity * unit_price_usd
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -56,6 +61,10 @@ class AccessStatus:
             "stripe_subscription_id": self.stripe_subscription_id,
             "blocked_reason": self.blocked_reason,
             "current_period_end": self.current_period_end,
+            "site_count": self.site_count,
+            "quantity": self.quantity,
+            "unit_price_usd": self.unit_price_usd,
+            "monthly_total_usd": self.monthly_total_usd,
         }
 
 
@@ -73,13 +82,16 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _resolve(settings: Dict[str, Any]) -> AccessStatus:
+def _resolve(settings: Dict[str, Any], site_count: int = 0) -> AccessStatus:
     """Decide access purely from a settings dict — no DB calls.
 
     Kept separate from ``get_access_status`` so the Stripe webhook can reuse
-    the same precedence rules when projecting the new state.
+    the same precedence rules when projecting the new state. ``site_count``
+    is supplied separately because computing it requires a DB call.
     """
-    plan = (settings.get("plan") or "growth").lower()
+    from shared.config import settings as cfg
+
+    plan = (settings.get("plan") or "site").lower()
     raw_status = (settings.get("plan_status") or "trial").lower()
     trial_ends_at = settings.get("trial_ends_at")
     trial_dt = _parse_iso(trial_ends_at)
@@ -88,91 +100,89 @@ def _resolve(settings: Dict[str, Any]) -> AccessStatus:
     admin_until = settings.get("admin_granted_until")
     admin_until_dt = _parse_iso(admin_until)
     current_period_end = settings.get("subscription_current_period_end")
+    quantity = int(settings.get("subscription_quantity") or max(site_count, 1))
+    unit_price = int(cfg.SITE_PRICE_USD or 0)
+    monthly_total = quantity * unit_price
     now = _now()
+
+    def _base(**overrides: Any) -> AccessStatus:
+        defaults: Dict[str, Any] = dict(
+            plan=plan,
+            status=raw_status,
+            has_access=False,
+            trial_ends_at=trial_ends_at,
+            trial_days_remaining=0,
+            admin_granted_until=admin_until,
+            stripe_customer_id=stripe_customer_id,
+            stripe_subscription_id=stripe_subscription_id,
+            blocked_reason=None,
+            current_period_end=current_period_end,
+            site_count=site_count,
+            quantity=quantity,
+            unit_price_usd=unit_price,
+            monthly_total_usd=monthly_total,
+        )
+        defaults.update(overrides)
+        return AccessStatus(**defaults)
 
     # 1) Admin grant overrides everything else. A null admin_granted_until
     # means unlimited; otherwise it expires.
     if raw_status == "admin_granted":
         if admin_until is None or (admin_until_dt and admin_until_dt > now):
-            return AccessStatus(
-                plan=plan,
-                status="admin_granted",
-                has_access=True,
-                trial_ends_at=trial_ends_at,
-                trial_days_remaining=0,
-                admin_granted_until=admin_until,
-                stripe_customer_id=stripe_customer_id,
-                stripe_subscription_id=stripe_subscription_id,
-                blocked_reason=None,
-                current_period_end=current_period_end,
-            )
+            return _base(status="admin_granted", has_access=True)
         # grant expired — fall through to subscription/trial checks below
 
     # 2) Active Stripe subscription wins next.
     if raw_status in ("active", "trialing"):
-        return AccessStatus(
-            plan=plan,
-            status=raw_status,
-            has_access=True,
-            trial_ends_at=trial_ends_at,
-            trial_days_remaining=0,
-            admin_granted_until=admin_until,
-            stripe_customer_id=stripe_customer_id,
-            stripe_subscription_id=stripe_subscription_id,
-            blocked_reason=None,
-            current_period_end=current_period_end,
-        )
+        return _base(status=raw_status, has_access=True)
 
     # 3) past_due — Stripe is retrying the card. Keep access for the
     # current period so an autopay hiccup doesn't lock the user out, but
     # surface the state to the UI.
     if raw_status == "past_due":
-        return AccessStatus(
-            plan=plan,
-            status="past_due",
-            has_access=True,
-            trial_ends_at=trial_ends_at,
-            trial_days_remaining=0,
-            admin_granted_until=admin_until,
-            stripe_customer_id=stripe_customer_id,
-            stripe_subscription_id=stripe_subscription_id,
-            blocked_reason=None,
-            current_period_end=current_period_end,
-        )
+        return _base(status="past_due", has_access=True)
 
     # 4) Trial — has access until trial_ends_at, blocked after.
     if raw_status == "trial":
         if trial_dt and trial_dt > now:
             secs_left = (trial_dt - now).total_seconds()
             days_left = max(1, int(secs_left // 86400) + (1 if secs_left % 86400 else 0))
-            return AccessStatus(
-                plan=plan,
-                status="trial",
-                has_access=True,
-                trial_ends_at=trial_ends_at,
-                trial_days_remaining=days_left,
-                admin_granted_until=admin_until,
-                stripe_customer_id=stripe_customer_id,
-                stripe_subscription_id=stripe_subscription_id,
-                blocked_reason=None,
-                current_period_end=current_period_end,
-            )
+            return _base(status="trial", has_access=True, trial_days_remaining=days_left)
         # Trial ended → treat as expired below.
 
     # 5) canceled / expired / anything else → blocked.
     blocked_reason = "trial_expired" if raw_status == "trial" else raw_status or "no_subscription"
-    return AccessStatus(
-        plan=plan,
+    return _base(
         status="expired" if raw_status == "trial" else (raw_status or "expired"),
         has_access=False,
-        trial_ends_at=trial_ends_at,
-        trial_days_remaining=0,
-        admin_granted_until=admin_until,
-        stripe_customer_id=stripe_customer_id,
-        stripe_subscription_id=stripe_subscription_id,
         blocked_reason=blocked_reason,
-        current_period_end=current_period_end,
     )
+
+
+async def count_user_sites(user_id: str) -> int:
+    """Return the number of sites under ``user_id`` (the per-site billing key).
+
+    Falls back to 1 for users with no user_sites row so checkout never tries
+    to charge for zero seats.
+    """
+    if not user_id or user_id == "default":
+        return 1
+
+    def _fetch():
+        sb = get_supabase()
+        return (
+            sb.table("user_sites")
+            .select("id", count="exact")
+            .eq("user_id", user_id)
+            .execute()
+        )
+    try:
+        res = await run_db(_fetch)
+        n = int(getattr(res, "count", None) or len(res.data or []))
+        return max(n, 1)
+    except Exception as e:
+        logger.debug("count_user_sites failed for %s: %s", user_id, e)
+        return 1
 
 
 async def get_settings_row(user_id: str) -> Dict[str, Any]:
@@ -199,7 +209,7 @@ async def get_access_status(user_id: str) -> AccessStatus:
     if not user_id or user_id == "default":
         # Internal/system callers (e.g. scheduled jobs without a tenant) skip the gate.
         return AccessStatus(
-            plan="enterprise",
+            plan="site",
             status="admin_granted",
             has_access=True,
             trial_ends_at=None,
@@ -210,7 +220,8 @@ async def get_access_status(user_id: str) -> AccessStatus:
             blocked_reason=None,
         )
     settings = await get_settings_row(user_id)
-    return _resolve(settings)
+    site_count = await count_user_sites(user_id)
+    return _resolve(settings, site_count=site_count)
 
 
 async def update_settings(user_id: str, patch: Dict[str, Any]) -> None:

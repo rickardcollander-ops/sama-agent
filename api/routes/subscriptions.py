@@ -35,6 +35,7 @@ from shared.config import settings as cfg
 from shared.database import get_supabase, run_db
 from shared.subscription import (
     AccessStatus,
+    count_user_sites,
     get_access_status,
     get_settings_row,
     update_settings,
@@ -47,12 +48,6 @@ router = APIRouter()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-
-PRICE_BY_PLAN = {
-    "starter": "STRIPE_PRICE_STARTER",
-    "growth": "STRIPE_PRICE_GROWTH",
-    "enterprise": "STRIPE_PRICE_ENTERPRISE",
-}
 
 
 def _stripe():
@@ -73,14 +68,15 @@ def _cancel_url() -> str:
     return cfg.STRIPE_CANCEL_URL or f"{cfg.DASHBOARD_BASE_URL.rstrip('/')}/c/pricing?status=cancel"
 
 
-def _resolve_price_id(plan: str) -> str:
-    plan = plan.lower().strip()
-    key = PRICE_BY_PLAN.get(plan)
-    if not key:
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {plan}")
-    price_id = getattr(cfg, key, "") or ""
+def _site_price_id() -> str:
+    """The single Stripe price id ($169/mo) used for per-site billing."""
+    price_id = (cfg.STRIPE_PRICE_SITE or "").strip()
     if not price_id:
-        raise HTTPException(status_code=503, detail=f"Stripe price not configured for plan '{plan}'")
+        # Backwards-compat: fall back to the old Growth price so existing
+        # deploys keep working until env is updated.
+        price_id = (cfg.STRIPE_PRICE_GROWTH or "").strip()
+    if not price_id:
+        raise HTTPException(status_code=503, detail="STRIPE_PRICE_SITE not configured")
     return price_id
 
 
@@ -116,7 +112,9 @@ def _require_admin(request: Request) -> str:
 
 
 class CheckoutRequest(BaseModel):
-    plan: str = Field(..., description="starter | growth | enterprise")
+    # Reserved for future use (e.g. annual plan). With per-site pricing the
+    # quantity is derived from the user's site count automatically.
+    plan: Optional[str] = Field(default="site")
 
 
 class CheckoutResponse(BaseModel):
@@ -127,9 +125,13 @@ class PortalResponse(BaseModel):
     url: str
 
 
+class SyncQuantityResponse(BaseModel):
+    quantity: int
+    synced: bool
+
+
 class AdminGrantRequest(BaseModel):
     user_id: str
-    plan: str = "growth"
     granted_until: Optional[str] = None  # ISO timestamp; null = unlimited
     note: Optional[str] = None
 
@@ -144,33 +146,64 @@ class AdminRevokeRequest(BaseModel):
 
 @router.get("/status")
 async def get_status(request: Request) -> Dict[str, Any]:
-    """Return the current subscription state for the authenticated user."""
+    """Return the current subscription state for the authenticated user.
+
+    Best-effort: when the user has an active subscription and the in-app
+    site_count drifts from the Stripe subscription quantity (e.g. they
+    just added a site), we reconcile in the background. Failures are
+    logged and ignored — never a 5xx on a read.
+    """
     user_id = _require_user(request)
     status: AccessStatus = await get_access_status(user_id)
+
+    if (
+        status.stripe_subscription_id
+        and status.status in ("active", "trialing", "past_due")
+        and status.site_count
+        and status.site_count != status.quantity
+        and cfg.STRIPE_SECRET_KEY
+    ):
+        try:
+            stripe = _stripe()
+            sub_id = status.stripe_subscription_id
+            sub = await run_db(lambda: stripe.Subscription.retrieve(sub_id))
+            item_id = sub["items"]["data"][0]["id"]
+            current_qty = int(sub["items"]["data"][0].get("quantity") or 0)
+            if current_qty != status.site_count:
+                await run_db(
+                    lambda: stripe.Subscription.modify(
+                        sub_id,
+                        items=[{"id": item_id, "quantity": status.site_count}],
+                        proration_behavior="create_prorations",
+                    )
+                )
+            await update_settings(user_id, {"subscription_quantity": status.site_count})
+            status = await get_access_status(user_id)
+        except Exception as e:
+            logger.warning("auto-sync quantity failed for %s: %s", user_id, e)
+
     return status.to_dict()
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
 async def create_checkout(body: CheckoutRequest, request: Request) -> CheckoutResponse:
-    """Create a Stripe Checkout session for ``body.plan`` and return its URL.
+    """Create a Stripe Checkout session and return its URL.
 
-    Reuses the stored stripe_customer_id when present so all charges land on
-    the same customer in Stripe. The 3-day trial is granted via signup, not
-    via Stripe's own ``trial_period_days`` — paying users start billing at
-    once. Existing trial users who haven't paid yet still see a Checkout
-    flow with subscription_data.trial_end=trial_ends_at so Stripe matches
-    the in-app countdown.
+    Per-site pricing: a single price ($169/mo) with quantity == current site
+    count. Reuses the stored stripe_customer_id when present so all charges
+    land on the same customer. Trial users keep their countdown by setting
+    Stripe's ``trial_end`` to ``trial_ends_at``.
     """
     user_id = _require_user(request)
-    price_id = _resolve_price_id(body.plan)
+    price_id = _site_price_id()
     stripe = _stripe()
 
     existing = await get_settings_row(user_id)
     customer_id = existing.get("stripe_customer_id")
     email = _lookup_email(user_id)
+    quantity = await count_user_sites(user_id)
 
     subscription_data: Dict[str, Any] = {"metadata": {"user_id": user_id}}
-    # If the user is still inside the in-app trial, honour it in Stripe too.
     if existing.get("plan_status") == "trial":
         trial_ends_at = existing.get("trial_ends_at")
         try:
@@ -183,11 +216,11 @@ async def create_checkout(body: CheckoutRequest, request: Request) -> CheckoutRe
 
     session_kwargs: Dict[str, Any] = {
         "mode": "subscription",
-        "line_items": [{"price": price_id, "quantity": 1}],
+        "line_items": [{"price": price_id, "quantity": max(quantity, 1)}],
         "success_url": _success_url(),
         "cancel_url": _cancel_url(),
         "client_reference_id": user_id,
-        "metadata": {"user_id": user_id, "plan": body.plan.lower()},
+        "metadata": {"user_id": user_id, "plan": "site", "quantity": str(quantity)},
         "subscription_data": subscription_data,
         "allow_promotion_codes": True,
     }
@@ -205,6 +238,53 @@ async def create_checkout(body: CheckoutRequest, request: Request) -> CheckoutRe
     if not session.url:  # defensive — should never happen
         raise HTTPException(status_code=502, detail="Stripe returned no checkout URL")
     return CheckoutResponse(url=session.url)
+
+
+@router.post("/sync-quantity", response_model=SyncQuantityResponse)
+async def sync_subscription_quantity(request: Request) -> SyncQuantityResponse:
+    """Reconcile the Stripe subscription quantity with the user's site count.
+
+    Called by the dashboard whenever it adds or removes a site. Idempotent —
+    if the quantity already matches, it's a no-op. Returns the resulting
+    quantity so the UI can update without a second status fetch.
+
+    Users without an active subscription (trial, expired, admin_granted)
+    don't have anything to sync; we still return their site count so the
+    UI can show "you'll be charged for N sites when you subscribe".
+    """
+    user_id = _require_user(request)
+    site_count = await count_user_sites(user_id)
+    existing = await get_settings_row(user_id)
+    sub_id = existing.get("stripe_subscription_id")
+    sub_status = (existing.get("plan_status") or "").lower()
+
+    if not sub_id or sub_status not in ("active", "trialing", "past_due"):
+        await update_settings(user_id, {"subscription_quantity": site_count})
+        return SyncQuantityResponse(quantity=site_count, synced=False)
+
+    stripe = _stripe()
+    try:
+        sub = await run_db(lambda: stripe.Subscription.retrieve(sub_id))
+        item_id = sub["items"]["data"][0]["id"]
+        current_qty = int(sub["items"]["data"][0].get("quantity") or 0)
+        if current_qty == site_count:
+            await update_settings(user_id, {"subscription_quantity": site_count})
+            return SyncQuantityResponse(quantity=site_count, synced=False)
+        await run_db(
+            lambda: stripe.Subscription.modify(
+                sub_id,
+                items=[{"id": item_id, "quantity": site_count}],
+                proration_behavior="create_prorations",
+            )
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("sync_subscription_quantity failed for %s: %s", user_id, e)
+        raise HTTPException(status_code=502, detail="Stripe quantity sync failed")
+
+    await update_settings(user_id, {"subscription_quantity": site_count})
+    return SyncQuantityResponse(quantity=site_count, synced=True)
 
 
 @router.post("/portal", response_model=PortalResponse)
@@ -231,18 +311,6 @@ async def create_portal(request: Request) -> PortalResponse:
 
 
 # ── webhook ──────────────────────────────────────────────────────────────────
-
-
-def _plan_from_price(price_id: Optional[str]) -> Optional[str]:
-    if not price_id:
-        return None
-    if price_id == cfg.STRIPE_PRICE_STARTER:
-        return "starter"
-    if price_id == cfg.STRIPE_PRICE_GROWTH:
-        return "growth"
-    if price_id == cfg.STRIPE_PRICE_ENTERPRISE:
-        return "enterprise"
-    return None
 
 
 def _user_id_from_event(obj: Dict[str, Any]) -> Optional[str]:
@@ -296,8 +364,7 @@ async def _handle_subscription_event(sub: Dict[str, Any]) -> None:
         return
 
     items = (sub.get("items") or {}).get("data") or []
-    price_id = items[0].get("price", {}).get("id") if items else None
-    plan = _plan_from_price(price_id)
+    quantity = int(items[0].get("quantity") or 0) if items else 0
 
     status = sub.get("status") or "active"  # active|trialing|past_due|canceled|unpaid|incomplete...
     status_map = {
@@ -313,15 +380,18 @@ async def _handle_subscription_event(sub: Dict[str, Any]) -> None:
     mapped = status_map.get(status, status)
 
     patch: Dict[str, Any] = {
+        "plan": "site",
         "plan_status": mapped,
         "stripe_customer_id": customer_id,
         "stripe_subscription_id": sub.get("id"),
         "subscription_current_period_end": _iso(sub.get("current_period_end")),
+        "subscription_quantity": quantity,
     }
-    if plan:
-        patch["plan"] = plan
     await update_settings(user_id, patch)
-    logger.info("Stripe sub %s -> user_settings(%s) status=%s plan=%s", sub.get("id"), user_id, mapped, plan)
+    logger.info(
+        "Stripe sub %s -> user_settings(%s) status=%s qty=%s",
+        sub.get("id"), user_id, mapped, quantity,
+    )
 
 
 async def _handle_checkout_completed(session: Dict[str, Any]) -> None:
@@ -388,10 +458,6 @@ async def admin_grant(body: AdminGrantRequest, request: Request) -> Dict[str, An
     admin_id = _require_admin(request)
     admin_email = _lookup_email(admin_id) or cfg.ADMIN_EMAIL
 
-    plan = body.plan.lower().strip() or "growth"
-    if plan not in ("starter", "growth", "enterprise"):
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {plan}")
-
     granted_until_dt: Optional[datetime] = None
     if body.granted_until:
         try:
@@ -400,7 +466,7 @@ async def admin_grant(body: AdminGrantRequest, request: Request) -> Dict[str, An
             raise HTTPException(status_code=400, detail="granted_until must be ISO 8601 or null")
 
     patch = {
-        "plan": plan,
+        "plan": "site",
         "plan_status": "admin_granted",
         "admin_granted_until": granted_until_dt.isoformat() if granted_until_dt else None,
         "admin_granted_by": admin_email,
