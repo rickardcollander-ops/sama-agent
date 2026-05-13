@@ -16,6 +16,13 @@ Resolution order for ``account_id`` / ``site_id``:
 4. ``"default"`` sentinel — set on bypass paths only (health, auth, webhooks).
    Data-bearing routes never reach this fallback; see enforcement below.
 
+Multi-user account support:
+When a JWT-authenticated user (sub=B) sends X-Sama-Account-Id=A (a shared
+account owned by user A), the middleware verifies that B is an active member
+of A's account via the account_members table before allowing the request.
+This lets invited team members access shared account data without the backend
+blind-trusting the header.
+
 Protected API prefixes (data-bearing routes) reject any request that doesn't
 resolve to a real ``account_id`` — either a verified Supabase JWT, an
 explicit ``X-Sama-Account-Id`` header, or an allowlisted ``X-Tenant-ID``.
@@ -58,11 +65,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT_ID = "default"
 
-# Per-tenant cooldown for the noisy "legacy_header_rejected" warning. Without
-# this every dashboard poll (multiple per second, dozens of endpoints) emits
-# its own WARNING — the production log becomes unreadable. We still want to
-# surface the deprecation, so we log once per tenant and then again every
-# _LEGACY_REJECT_LOG_INTERVAL_S seconds.
+# Per-tenant cooldown for the noisy "legacy_header_rejected" warning.
 _LEGACY_REJECT_LOG_INTERVAL_S = 300.0
 _legacy_reject_last_log: dict[str, float] = {}
 
@@ -75,13 +78,11 @@ def _should_log_legacy_reject(tenant: str) -> bool:
     _legacy_reject_last_log[tenant] = now
     return True
 
-# Paths that should bypass tenant resolution entirely (health checks, OAuth
-# callbacks, webhooks signed by external providers).
+# Paths that should bypass tenant resolution entirely.
 _BYPASS_PREFIXES = (
     "/health",
     "/api/auth/",
     "/api/webhooks/",
-    # Stripe posts the webhook directly to the backend — no JWT, signature-verified.
     "/api/subscriptions/webhook",
     "/docs",
     "/redoc",
@@ -90,20 +91,10 @@ _BYPASS_PREFIXES = (
 
 
 def _legacy_allowlist() -> set[str]:
-    """Tenants still allowed to use the unverified X-Tenant-ID legacy header.
-
-    Set ``LEGACY_TENANT_HEADERS_ALLOW`` to a comma-separated list of
-    tenant_ids during the deprecation window. Empty (default) means the
-    legacy header is rejected on protected paths once a JWT is required.
-    """
+    """Tenants still allowed to use the unverified X-Tenant-ID legacy header."""
     raw = os.getenv("LEGACY_TENANT_HEADERS_ALLOW", "")
     return {t.strip() for t in raw.split(",") if t.strip()}
 
-# Routes where tenant context is required. Anything tagged here that arrives
-# without a resolved account/site context (no JWT, no X-Sama-Account-Id, no
-# allowlisted X-Tenant-ID) is rejected — rather than silently falling
-# through to the legacy ``"default"`` tenant, which holds the original
-# Successifier rows from before multi-tenancy and would leak to any caller.
 _PROTECTED_PREFIXES = (
     "/api/seo/",
     "/api/ai-visibility/",
@@ -136,8 +127,6 @@ _SITE_CACHE_TTL_S = 60.0
 
 def _site_belongs_to_account(site_id: str, account_id: str) -> bool:
     """Cheap, cached check that ``site_id`` belongs to ``account_id``."""
-    import time
-
     cached = _site_owner_cache.get(site_id)
     now = time.monotonic()
     if cached and cached[1] > now:
@@ -160,6 +149,48 @@ def _site_belongs_to_account(site_id: str, account_id: str) -> bool:
     except Exception as e:
         logger.warning("site_owner_lookup_failed site=%s err=%s", site_id, e)
         return True  # fail-open — log and let through; alerts surface this
+
+
+# Cache: (account_id, user_id) -> (is_member: bool, expires_at: float)
+_member_cache: dict[tuple[str, str], tuple[bool, float]] = {}
+_MEMBER_CACHE_TTL_S = 60.0
+
+
+def _is_account_member(account_id: str, user_id: str) -> bool:
+    """Cached check that ``user_id`` is an active member of ``account_id``.
+
+    Used to allow invited team members (JWT sub != account_id) to act on
+    shared accounts without blind-trusting the X-Sama-Account-Id header.
+    Cache TTL is 60 s so revoked memberships propagate within a minute.
+    """
+    key = (account_id, user_id)
+    cached = _member_cache.get(key)
+    now = time.monotonic()
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        from shared.database import get_supabase  # local import — avoids cycle
+        sb = get_supabase()
+        if not sb:
+            return False  # fail-closed: no DB = no member access
+        res = (
+            sb.table("account_members")
+            .select("id")
+            .eq("account_id", account_id)
+            .eq("user_id", user_id)
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        )
+        is_member = len(res.data) > 0
+        _member_cache[key] = (is_member, now + _MEMBER_CACHE_TTL_S)
+        return is_member
+    except Exception as e:
+        logger.warning(
+            "account_member_lookup_failed account=%s user=%s err=%s",
+            account_id, user_id, e,
+        )
+        return False  # fail-closed on error
 
 
 def _verify_supabase_jwt(token: str) -> Optional[str]:
@@ -222,49 +253,49 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 verified_account = _verify_supabase_jwt(token)
 
         is_protected = any(path.startswith(p) for p in _PROTECTED_PREFIXES)
-        # Protection is on by default; the legacy opt-in flag is still
-        # honoured but redundant. Set ALLOW_ANONYMOUS_TENANT_FALLBACK=1 to
-        # restore the old permissive behaviour during a migration window.
         allow_anon_fallback = _truthy(os.getenv("ALLOW_ANONYMOUS_TENANT_FALLBACK"))
         require_auth = _truthy(os.getenv("REQUIRE_AUTHENTICATED_TENANT"))
 
         if verified_account:
-            # If the caller also sent X-Sama-Account-Id, reject mismatches —
-            # this catches accidental cross-tenant calls and tampering.
             if header_account_id and header_account_id != verified_account:
-                logger.warning(
-                    "tenant_mismatch account=%s header=%s path=%s",
-                    verified_account, header_account_id, path,
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "X-Sama-Account-Id does not match authenticated user"},
-                )
-            # Same check for the legacy header so old clients can't slip past.
-            if legacy_tid and not header_account_id and legacy_tid != verified_account:
-                logger.warning(
-                    "legacy_tenant_mismatch account=%s legacy=%s path=%s",
-                    verified_account, legacy_tid, path,
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "X-Tenant-ID does not match authenticated user"},
-                )
+                # The JWT user is requesting access to a different account.
+                # Allow if they are an active member of that account — this is
+                # the normal case for invited team members (JWT sub=B, account=A).
+                if not _is_account_member(header_account_id, verified_account):
+                    logger.warning(
+                        "tenant_mismatch account=%s header=%s path=%s",
+                        verified_account, header_account_id, path,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "X-Sama-Account-Id does not match authenticated user and user is not a member of that account"},
+                    )
+                account_id = header_account_id
+            else:
+                # Same check for the legacy header so old clients can't slip past.
+                if legacy_tid and not header_account_id and legacy_tid != verified_account:
+                    logger.warning(
+                        "legacy_tenant_mismatch account=%s legacy=%s path=%s",
+                        verified_account, legacy_tid, path,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "X-Tenant-ID does not match authenticated user"},
+                    )
+                account_id = verified_account
+
             # If client sent X-Sama-Site-Id, verify the site belongs to the
-            # authenticated account before honouring it. Skipped when
-            # STRICT_SITE_VALIDATION is off to avoid an extra round-trip on
-            # every request — dashboard proxy already validates server-side.
+            # authenticated account before honouring it.
             if header_site_id and _truthy(os.getenv("STRICT_SITE_VALIDATION")):
-                if not _site_belongs_to_account(header_site_id, verified_account):
+                if not _site_belongs_to_account(header_site_id, account_id):
                     logger.warning(
                         "site_mismatch account=%s site=%s path=%s",
-                        verified_account, header_site_id, path,
+                        account_id, header_site_id, path,
                     )
                     return JSONResponse(
                         status_code=403,
                         content={"detail": "X-Sama-Site-Id does not belong to authenticated account"},
                     )
-            account_id = verified_account
             authenticated = True
         else:
             # No JWT. Decide what to do with header-only callers.
@@ -274,9 +305,6 @@ class TenantMiddleware(BaseHTTPMiddleware):
                     status_code=401,
                     content={"detail": "Authentication required for protected route"},
                 )
-            # Legacy X-Tenant-ID is unverified and trivially spoofable. Only
-            # honour it for tenants on the explicit allowlist during the
-            # deprecation window.
             if legacy_tid and legacy_tid not in _legacy_allowlist():
                 if _should_log_legacy_reject(legacy_tid):
                     logger.warning(
@@ -292,17 +320,6 @@ class TenantMiddleware(BaseHTTPMiddleware):
 
         site_id = header_site_id or legacy_tid
 
-        # Enforcement: protected routes must carry a tenant context. Without
-        # this, anonymous callers fall through to ``DEFAULT_TENANT_ID`` and
-        # see the legacy Successifier partition.
-        #
-        # Read-side concession for the dashboard: unauthenticated GET/HEAD on
-        # protected prefixes returns 200 ``{}`` instead of 401. The dashboard
-        # polls these endpoints during page load before its auth context is
-        # fully wired, and the resulting 401 spam fills the browser console.
-        # No data leaks because we never reach the route — the empty payload
-        # is fixed in middleware. Writes (POST/PUT/PATCH/DELETE) still 401.
-        # Set ``STRICT_PROTECTED_GET_AUTH=1`` to restore strict 401 on reads.
         if is_protected and not account_id and not allow_anon_fallback:
             method = request.method.upper()
             strict_get = _truthy(os.getenv("STRICT_PROTECTED_GET_AUTH"))
@@ -326,8 +343,6 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        # tenant_id is the field every existing route reads. Prefer site_id
-        # (the granular dimension), fall back to account_id, then 'default'.
         tenant_id = site_id or account_id or DEFAULT_TENANT_ID
         tenant_resolved = bool(site_id or account_id)
 
