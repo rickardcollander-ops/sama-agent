@@ -146,6 +146,28 @@ class Settings(BaseSettings):
     BREVO_API_KEY: str = ""
     LEAD_CAPTURE_FORM_URL: str = ""  # URL to hosted lead capture form
 
+    # Stripe (subscriptions + 3-day trial)
+    # When STRIPE_SECRET_KEY is empty the /api/subscriptions routes refuse
+    # to serve checkout/portal links; the dashboard surfaces this as
+    # "billing not configured" rather than crashing.
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    # Per-site pricing. One Stripe price ($169/mo recurring) charged with
+    # quantity == number of sites the customer has connected.
+    STRIPE_PRICE_SITE: str = ""
+    SITE_PRICE_USD: int = 169                 # used for display copy in the dashboard
+    # Legacy tier prices — no longer used in checkout, kept so existing env
+    # files don't fail validation. Remove once the rollout is complete.
+    STRIPE_PRICE_STARTER: str = ""
+    STRIPE_PRICE_GROWTH: str = ""
+    STRIPE_PRICE_ENTERPRISE: str = ""
+    STRIPE_SUCCESS_URL: str = ""       # defaults to DASHBOARD_BASE_URL/c/settings/billing?status=success
+    STRIPE_CANCEL_URL: str = ""        # defaults to DASHBOARD_BASE_URL/c/pricing?status=cancel
+    TRIAL_DAYS: int = 3                # matches the 3-day trial copy on the pricing page
+
+    # Admin gate — must match the dashboard's lib/admin.ts ADMIN_EMAIL.
+    ADMIN_EMAIL: str = "rc@successifier.com"
+
     # Email (Resend) — used for weekly status emails and other transactional sends
     RESEND_API_KEY: str = ""
     EMAIL_FROM_ADDRESS: str = ""           # e.g. notifications@successifier.com

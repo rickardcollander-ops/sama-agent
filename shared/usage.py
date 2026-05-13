@@ -58,9 +58,13 @@ PLANS: Dict[str, PlanLimits] = {
         agent_runs=1000,
         review_responses=300,
     ),
+    # Legacy tier names kept as aliases so old user_settings.plan values
+    # ("starter" / "growth" / "enterprise") still resolve to limits while
+    # the rollout settles.
+    "starter": PlanLimits(name="Site", content_pieces=100, ad_creatives=50, agent_runs=1000, review_responses=300),
+    "growth": PlanLimits(name="Site", content_pieces=100, ad_creatives=50, agent_runs=1000, review_responses=300),
     "enterprise": PlanLimits(
-        name="Enterprise",
-        # Effectively unlimited; we still record usage for billing visibility.
+        name="Site",
         content_pieces=10**9,
         ad_creatives=10**9,
         agent_runs=10**9,
@@ -68,7 +72,7 @@ PLANS: Dict[str, PlanLimits] = {
     ),
 }
 
-DEFAULT_PLAN = "starter"
+DEFAULT_PLAN = "site"
 
 # Known metrics — keep in sync with PlanLimits attributes.
 METRICS = ("content_pieces", "ad_creatives", "agent_runs", "review_responses")
@@ -85,6 +89,19 @@ class UsageLimitExceeded(Exception):
         super().__init__(
             f"Plan limit reached: {metric} = {current}/{limit} on {plan} plan"
         )
+
+
+class SubscriptionRequired(Exception):
+    """Raised when a tenant's trial has expired and no active subscription exists.
+
+    Different from UsageLimitExceeded so the API surface can map this to a
+    distinct 402 Payment Required response that the dashboard handles by
+    nudging the user to the pricing page.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Subscription required: {reason}")
 
 
 # ── Plan resolution ──────────────────────────────────────────────────────────
@@ -165,10 +182,25 @@ async def increment_usage(tenant_id: str, metric: str, by: int = 1) -> int:
 async def check_and_increment(tenant_id: str, metric: str, by: int = 1) -> int:
     """
     Enforce the plan limit for ``metric`` and increment when within budget.
-    Raises UsageLimitExceeded when the new value would exceed the cap.
+
+    Raises ``SubscriptionRequired`` when the tenant's trial has expired and no
+    active Stripe subscription / admin grant is in place — billable actions
+    must not run for a user who hasn't paid.
+
+    Raises ``UsageLimitExceeded`` when the new value would exceed the cap on
+    the tenant's current plan.
     """
     if tenant_id == "default":
         return 0
+
+    # Gate on access first — running the metered call for an expired trial
+    # would waste an LLM token quota slot before the route can 402.
+    from shared.subscription import get_access_status  # local import to avoid cycles
+
+    access = await get_access_status(tenant_id)
+    if not access.has_access:
+        raise SubscriptionRequired(access.blocked_reason or "no_subscription")
+
     plan = await get_tenant_plan(tenant_id)
     limit = getattr(plan, metric)
     current = await get_usage(tenant_id, metric)
@@ -178,7 +210,7 @@ async def check_and_increment(tenant_id: str, metric: str, by: int = 1) -> int:
 
 
 async def get_usage_summary(tenant_id: str) -> Dict[str, Dict[str, int]]:
-    """Return current-month usage and limits for the tenant, keyed by metric."""
+    """Return current-month usage, limits, and subscription state for the tenant."""
     plan = await get_tenant_plan(tenant_id)
     out: Dict[str, Dict[str, int]] = {"plan": {"name": plan.name}}
     for metric in METRICS:
@@ -186,4 +218,10 @@ async def get_usage_summary(tenant_id: str) -> Dict[str, Dict[str, int]]:
             "used": await get_usage(tenant_id, metric),
             "limit": getattr(plan, metric),
         }
+    try:
+        from shared.subscription import get_access_status  # local import
+        access = await get_access_status(tenant_id)
+        out["subscription"] = access.to_dict()  # type: ignore[assignment]
+    except Exception as e:
+        logger.debug("usage subscription enrich failed for %s: %s", tenant_id, e)
     return out

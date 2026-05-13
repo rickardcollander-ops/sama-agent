@@ -16,6 +16,7 @@ PyNaCl>=1.5.0
 sentry-sdk[fastapi]>=2.0.0
 asyncpg>=0.29.0
 redis>=5.0.0
+stripe>=8.0.0
 # Headless Chromium for the PDF render service used by the Apollo
 # telemarketing flow in the dashboard. The browser binary is installed via
 # `playwright install --with-deps chromium` in the Dockerfile.
