@@ -33,36 +33,34 @@ class PlanLimits:
     review_responses: int
 
 
+_SITE_LIMITS = PlanLimits(
+    name="Site",
+    content_pieces=100,
+    ad_creatives=50,
+    agent_runs=1000,
+    review_responses=300,
+)
+
 PLANS: Dict[str, PlanLimits] = {
+    # Single paid tier ($169/mo per site). plan="site" is what the Stripe
+    # webhook + signup trigger write to user_settings.settings.plan.
+    "site": _SITE_LIMITS,
+    # Admin-granted bypass — effectively unlimited so comp / internal /
+    # beta accounts never bump into the metered caps. Used by the
+    # /api/admin/grant-free-access flow (it also flips plan_status to
+    # 'admin_granted' which is what shared/subscription.py gates on).
     "free": PlanLimits(
         name="Free",
-        # Comp accounts (beta users, internal demos, friends-and-family). We
-        # still record usage for visibility but never block. Set when admin
-        # toggles the plan on /c/admin so the tenant doesn't hit a paywall.
         content_pieces=10**9,
         ad_creatives=10**9,
         agent_runs=10**9,
         review_responses=10**9,
     ),
-    "starter": PlanLimits(
-        name="Starter",
-        content_pieces=20,
-        ad_creatives=10,
-        agent_runs=200,
-        review_responses=50,
-    ),
-    "growth": PlanLimits(
-        name="Growth",
-        content_pieces=100,
-        ad_creatives=50,
-        agent_runs=1000,
-        review_responses=300,
-    ),
     # Legacy tier names kept as aliases so old user_settings.plan values
-    # ("starter" / "growth" / "enterprise") still resolve to limits while
-    # the rollout settles.
-    "starter": PlanLimits(name="Site", content_pieces=100, ad_creatives=50, agent_runs=1000, review_responses=300),
-    "growth": PlanLimits(name="Site", content_pieces=100, ad_creatives=50, agent_runs=1000, review_responses=300),
+    # ("starter" / "growth" / "enterprise") still resolve while the
+    # rollout settles.
+    "starter": _SITE_LIMITS,
+    "growth": _SITE_LIMITS,
     "enterprise": PlanLimits(
         name="Site",
         content_pieces=10**9,
