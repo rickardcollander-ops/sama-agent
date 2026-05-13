@@ -43,11 +43,19 @@ logger = logging.getLogger(__name__)
 # to a slimmer SELECT so the calendar endpoint stops spamming the error log
 # for every dashboard poll.
 _EXTERNAL_URL_PRESENT: Optional[bool] = None
+# Same lazy probe for the premium-article columns from migration 044.
+_PREMIUM_PIECE_COLUMNS_PRESENT: Optional[bool] = None
 
 _FULL_PIECE_COLUMNS = (
-    "id,title,content_type,status,published_at,target_url,external_url,created_at"
+    "id,title,content_type,status,published_at,target_url,external_url,"
+    "created_at,featured_image_url,article_score,slug"
 )
 _LEGACY_PIECE_COLUMNS = (
+    "id,title,content_type,status,published_at,target_url,created_at,"
+    "featured_image_url,article_score,slug"
+)
+# Used when even the premium-article columns are missing (pre-044 schema).
+_BASE_PIECE_COLUMNS = (
     "id,title,content_type,status,published_at,target_url,created_at"
 )
 
@@ -278,8 +286,13 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
     visible window; we return both rows that have a scheduled_for inside
     the window AND content_pieces that were created/published inside the
     window (so finished work shows up too).
+
+    Scheduled rows are enriched with the linked content_pieces fields
+    (featured_image_url, article_score, slug, piece_status) so the
+    dashboard can render image thumbnails and score chips for drafts and
+    approved pieces sitting in the plan.
     """
-    global _EXTERNAL_URL_PRESENT
+    global _EXTERNAL_URL_PRESENT, _PREMIUM_PIECE_COLUMNS_PRESENT
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
 
@@ -297,11 +310,14 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
         logger.error(f"list_plan_for_calendar scheduled error: {e}")
         return {"scheduled": [], "published_pieces": [], "error": str(e)}
 
-    columns = (
-        _LEGACY_PIECE_COLUMNS
-        if _EXTERNAL_URL_PRESENT is False
-        else _FULL_PIECE_COLUMNS
-    )
+    # Pick the widest column set we believe the schema supports. Lazy probe
+    # narrows on 42703 errors below so subsequent polls don't spam the log.
+    if _PREMIUM_PIECE_COLUMNS_PRESENT is False:
+        columns = _BASE_PIECE_COLUMNS
+    elif _EXTERNAL_URL_PRESENT is False:
+        columns = _LEGACY_PIECE_COLUMNS
+    else:
+        columns = _FULL_PIECE_COLUMNS
 
     def _query(cols: str):
         return (
@@ -314,38 +330,124 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
             .execute()
         )
 
-    try:
-        pieces_published = _query(columns)
-        if _EXTERNAL_URL_PRESENT is None:
-            _EXTERNAL_URL_PRESENT = True
-    except Exception as e:
-        if _EXTERNAL_URL_PRESENT is not False and _is_missing_column_error(e):
-            _EXTERNAL_URL_PRESENT = False
-            logger.warning(
-                "content_pieces.external_url missing — falling back to legacy "
-                "SELECT. Apply migration 024_tenant_usage_and_plans.sql to enable."
-            )
-            try:
-                pieces_published = _query(_LEGACY_PIECE_COLUMNS)
-            except Exception as e2:
-                logger.error(f"list_plan_for_calendar pieces error (legacy): {e2}")
+    pieces_published = None
+    last_err: Optional[Exception] = None
+    # Try the widest set first, then narrow on each failure. Dedup so we
+    # don't repeat a query if the cached state already starts narrow.
+    tiers: List[str] = []
+    for c in (columns, _LEGACY_PIECE_COLUMNS, _BASE_PIECE_COLUMNS):
+        if c not in tiers:
+            tiers.append(c)
+    for attempt_cols in tiers:
+        try:
+            pieces_published = _query(attempt_cols)
+            if attempt_cols is _FULL_PIECE_COLUMNS:
+                _EXTERNAL_URL_PRESENT = True
+                _PREMIUM_PIECE_COLUMNS_PRESENT = True
+            elif attempt_cols is _LEGACY_PIECE_COLUMNS:
+                _EXTERNAL_URL_PRESENT = False
+                _PREMIUM_PIECE_COLUMNS_PRESENT = True
+            else:
+                _PREMIUM_PIECE_COLUMNS_PRESENT = False
+            break
+        except Exception as e:
+            last_err = e
+            if not _is_missing_column_error(e):
+                logger.error(f"list_plan_for_calendar pieces error: {e}")
                 return {
-                    "scheduled": [_row(x) for x in (scheduled.data or [])],
+                    "scheduled": _enrich_scheduled(sb, scheduled.data or []),
                     "published_pieces": [],
-                    "error": str(e2),
+                    "error": str(e),
                 }
-        else:
-            logger.error(f"list_plan_for_calendar pieces error: {e}")
-            return {
-                "scheduled": [_row(x) for x in (scheduled.data or [])],
-                "published_pieces": [],
-                "error": str(e),
-            }
+            # Narrow and retry with a slimmer SELECT.
+            if attempt_cols is _FULL_PIECE_COLUMNS:
+                _EXTERNAL_URL_PRESENT = False
+                logger.warning(
+                    "content_pieces.external_url missing — falling back to legacy "
+                    "SELECT. Apply migration 024_tenant_usage_and_plans.sql to enable."
+                )
+            elif attempt_cols is _LEGACY_PIECE_COLUMNS:
+                _PREMIUM_PIECE_COLUMNS_PRESENT = False
+                logger.warning(
+                    "content_pieces premium columns missing — falling back to base "
+                    "SELECT. Apply migration 044_premium_articles.sql to enable."
+                )
+
+    if pieces_published is None:
+        logger.error(f"list_plan_for_calendar pieces error (all tiers failed): {last_err}")
+        return {
+            "scheduled": _enrich_scheduled(sb, scheduled.data or []),
+            "published_pieces": [],
+            "error": str(last_err) if last_err else "unknown",
+        }
 
     return {
-        "scheduled": [_row(x) for x in (scheduled.data or [])],
+        "scheduled": _enrich_scheduled(sb, scheduled.data or []),
         "published_pieces": pieces_published.data or [],
     }
+
+
+def _enrich_scheduled(sb, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add featured_image_url / article_score / slug / piece_status to each
+    scheduled row whose content_piece_id resolves to an actual piece.
+
+    Lets the calendar's "färdiga artiklar" section render thumbnails and
+    score chips without a second round-trip per item. Falls back silently
+    if migration 044 hasn't been applied.
+    """
+    global _PREMIUM_PIECE_COLUMNS_PRESENT
+    out = [_row(r) for r in rows]
+    piece_ids = list({
+        r.get("content_piece_id") for r in rows
+        if r.get("content_piece_id")
+    })
+    if not piece_ids:
+        return out
+
+    piece_cols = (
+        "id,status,title"
+        if _PREMIUM_PIECE_COLUMNS_PRESENT is False
+        else "id,status,title,featured_image_url,article_score,slug"
+    )
+
+    pieces_by_id: Dict[str, Dict[str, Any]] = {}
+    try:
+        result = (
+            sb.table("content_pieces")
+            .select(piece_cols)
+            .in_("id", piece_ids)
+            .execute()
+        )
+        pieces_by_id = {str(p["id"]): p for p in (result.data or [])}
+    except Exception as e:
+        if _PREMIUM_PIECE_COLUMNS_PRESENT is not False and _is_missing_column_error(e):
+            _PREMIUM_PIECE_COLUMNS_PRESENT = False
+            try:
+                result = (
+                    sb.table("content_pieces")
+                    .select("id,status,title")
+                    .in_("id", piece_ids)
+                    .execute()
+                )
+                pieces_by_id = {str(p["id"]): p for p in (result.data or [])}
+            except Exception as e2:
+                logger.debug(f"_enrich_scheduled piece fetch failed (base): {e2}")
+        else:
+            logger.debug(f"_enrich_scheduled piece fetch failed: {e}")
+
+    for r in out:
+        pid = r.get("content_piece_id")
+        if not pid:
+            continue
+        piece = pieces_by_id.get(str(pid))
+        if not piece:
+            continue
+        r["piece_status"] = piece.get("status")
+        r["piece_title"] = piece.get("title")
+        r["featured_image_url"] = piece.get("featured_image_url")
+        r["article_score"] = piece.get("article_score")
+        r["slug"] = piece.get("slug")
+    return out
 
 
 # ── Create one ───────────────────────────────────────────────────────────────

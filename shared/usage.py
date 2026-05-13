@@ -34,12 +34,25 @@ class PlanLimits:
 
 
 PLANS: Dict[str, PlanLimits] = {
-    # Per-site billing: every subscriber gets the same flat caps. Limits
-    # are intentionally generous since they're charged $169/mo per site,
-    # not per usage. Usage is still recorded so we can spot anomalies and
-    # add billing later if needed.
-    "site": PlanLimits(
-        name="Site",
+    "free": PlanLimits(
+        name="Free",
+        # Comp accounts (beta users, internal demos, friends-and-family). We
+        # still record usage for visibility but never block. Set when admin
+        # toggles the plan on /c/admin so the tenant doesn't hit a paywall.
+        content_pieces=10**9,
+        ad_creatives=10**9,
+        agent_runs=10**9,
+        review_responses=10**9,
+    ),
+    "starter": PlanLimits(
+        name="Starter",
+        content_pieces=20,
+        ad_creatives=10,
+        agent_runs=200,
+        review_responses=50,
+    ),
+    "growth": PlanLimits(
+        name="Growth",
         content_pieces=100,
         ad_creatives=50,
         agent_runs=1000,
