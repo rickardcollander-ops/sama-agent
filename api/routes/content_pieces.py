@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
-from shared.usage import UsageLimitExceeded, check_and_increment
+from shared.usage import UsageLimitExceeded, SubscriptionRequired, check_and_increment, increment_usage
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class ContentPieceCreate(BaseModel):
     featured_image_alt: Optional[str] = None
     article_score: Optional[int] = None
     article_data: Optional[Dict[str, Any]] = None
+    source: Optional[str] = None
 
 
 class ContentPieceUpdate(BaseModel):
@@ -105,16 +106,34 @@ async def list_content_pieces(request: Request, limit: int = 100):
 async def create_content_piece(request: Request, payload: ContentPieceCreate):
     """Create a new content piece."""
     tenant_id = getattr(request.state, "tenant_id", "default")
-    try:
-        await check_and_increment(tenant_id, "content_pieces")
-    except UsageLimitExceeded as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "limit_exceeded": True,
-            "metric": e.metric,
-            "limit": e.limit,
-        }
+    is_onboarding = payload.source == "onboarding"
+    if is_onboarding:
+        # Onboarding drafts must always land regardless of trial/subscription
+        # state — blocking here would leave new users with an empty content
+        # list after completing setup. Still increment best-effort so the
+        # usage counter stays accurate once they subscribe.
+        try:
+            await increment_usage(tenant_id, "content_pieces")
+        except Exception:
+            pass
+    else:
+        try:
+            await check_and_increment(tenant_id, "content_pieces")
+        except SubscriptionRequired as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "subscription_required": True,
+                "reason": e.reason,
+            }
+        except UsageLimitExceeded as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "limit_exceeded": True,
+                "metric": e.metric,
+                "limit": e.limit,
+            }
     try:
         sb = get_supabase()
         # Drop None values so optional columns added in later migrations
