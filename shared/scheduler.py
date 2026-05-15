@@ -49,6 +49,7 @@ _job_history: Dict[str, Dict[str, Any]] = {
     "weekly_social_analysis": {"last_run": None, "last_status": None, "last_error": None},
     "daily_lead_scoring":     {"last_run": None, "last_status": None, "last_error": None},
     "weekly_status_email":    {"last_run": None, "last_status": None, "last_error": None},
+    "daily_content_refresh":  {"last_run": None, "last_status": None, "last_error": None},
 }
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -638,6 +639,223 @@ async def _run_weekly_status_email():
         await _notify_failure("weekly_status_email", str(e))
 
 
+async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
+    """Ensure the next 2 upcoming plan items have written articles, and append one new idea."""
+    from datetime import date, timedelta
+    import json as _json
+    import anthropic
+    from shared.config import settings as _settings
+
+    today_str = date.today().isoformat()
+    written = 0
+    added = 0
+
+    brand: dict = {}
+    try:
+        row = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+        brand = (row.data or {}).get("settings", {}) if row.data else {}
+    except Exception:
+        pass
+
+    brand_name = brand.get("brand_name") or ""
+    brand_desc = brand.get("brand_description") or ""
+    target_audience = brand.get("target_audience") or ""
+    content_language = brand.get("content_language") or "sv"
+
+    # Step 1: ensure next 2 upcoming plan items have a written piece
+    upcoming = (
+        sb.table("content_plan_items")
+        .select("*")
+        .eq("tenant_id", tenant_id)
+        .not_.is_("scheduled_for", "null")
+        .gte("scheduled_for", today_str)
+        .is_("content_piece_id", "null")
+        .order("scheduled_for", desc=False)
+        .limit(2)
+        .execute()
+    )
+    items_to_fill = upcoming.data or []
+
+    if items_to_fill:
+        client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
+        for item in items_to_fill:
+            try:
+                title = item.get("title") or "Article"
+                keyword = (item.get("target_keyword") or "").strip()
+                topic = item.get("topic") or keyword or title
+                ctype = item.get("content_type") or "blog_article"
+
+                # Prefer linking an existing onboarding draft with matching keyword
+                if keyword:
+                    ex = (
+                        sb.table("content_pieces")
+                        .select("id")
+                        .eq("tenant_id", tenant_id)
+                        .eq("target_keyword", keyword)
+                        .eq("status", "draft")
+                        .eq("source", "onboarding")
+                        .is_("content_plan_item_id", "null")
+                        .limit(1)
+                        .execute()
+                    )
+                    if ex.data:
+                        sb.table("content_plan_items").update(
+                            {"status": "draft", "content_piece_id": ex.data[0]["id"]}
+                        ).eq("id", item["id"]).execute()
+                        written += 1
+                        continue
+
+                # Write a fresh article with Claude
+                msg = client.messages.create(
+                    model=_settings.CLAUDE_MODEL,
+                    max_tokens=8000,
+                    system=(
+                        "You are a senior content writer. Write a high-quality SEO blog post. "
+                        "1500-2500 words, Markdown only (no HTML). Use ## for H2, ### for H3. "
+                        "Start with a 2-3 sentence engaging intro (no H1). "
+                        "4-7 H2 sections, weave the target keyword naturally. "
+                        "Include a 'Key takeaways' section near the end. "
+                        "End with a conclusion referencing the brand. "
+                        f"Write in: {content_language}. Output ONLY the markdown body."
+                    ),
+                    messages=[{"role": "user", "content": (
+                        f"Brand: {brand_name}\nDescription: {brand_desc}\n"
+                        f"Target audience: {target_audience}\nYear: {date.today().year}\n"
+                        f"Title: \"{title}\"\nTarget keyword: {keyword}\nAngle: {topic}"
+                    )}],
+                )
+                body_md = msg.content[0].text.strip()
+                word_count = len(body_md.split())
+                first_para = next(
+                    (p for p in body_md.split("\n\n") if len(p.strip()) > 60), ""
+                )
+                inserted = sb.table("content_pieces").insert({
+                    "tenant_id": tenant_id,
+                    "title": title,
+                    "content": body_md,
+                    "content_type": ctype,
+                    "meta_title": title[:60],
+                    "meta_description": first_para.replace("\n", " ").strip()[:160],
+                    "target_keyword": keyword or None,
+                    "word_count": word_count,
+                    "status": "draft",
+                    "source": "daily_refresh",
+                }).execute()
+                piece_id = ((inserted.data or [{}])[0]).get("id")
+                if piece_id:
+                    sb.table("content_plan_items").update(
+                        {"status": "draft", "content_piece_id": piece_id}
+                    ).eq("id", item["id"]).execute()
+                written += 1
+            except Exception as e:
+                logger.warning(f"[content_refresh] write failed for item {item.get('id')}: {e}")
+
+    # Step 2: add one new calendar suggestion for the day after the last scheduled entry
+    try:
+        last_res = (
+            sb.table("content_plan_items")
+            .select("scheduled_for")
+            .eq("tenant_id", tenant_id)
+            .not_.is_("scheduled_for", "null")
+            .order("scheduled_for", desc=True)
+            .limit(1)
+            .execute()
+        )
+        last_row = (last_res.data or [{}])[0]
+        if not last_row.get("scheduled_for"):
+            return written, added
+
+        last_date = date.fromisoformat(last_row["scheduled_for"][:10])
+        next_date = last_date + timedelta(days=1)
+
+        kw_res = (
+            sb.table("content_plan_items")
+            .select("target_keyword")
+            .eq("tenant_id", tenant_id)
+            .not_.is_("target_keyword", "null")
+            .limit(200)
+            .execute()
+        )
+        used_kws = {(r.get("target_keyword") or "").strip().lower() for r in (kw_res.data or [])}
+
+        client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model=_settings.CLAUDE_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": (
+                f"Brand: {brand_name}\nDescription: {brand_desc}\n"
+                f"Audience: {target_audience}\nLanguage: {content_language}\n"
+                f"Keywords already planned (avoid): {', '.join(list(used_kws)[:30])}\n\n"
+                "Generate ONE new blog post idea with a fresh keyword not listed above. "
+                "Return ONLY valid JSON (no markdown): "
+                '{"title":"...","target_keyword":"...","topic":"one sentence angle"}'
+            )}],
+        )
+        raw = msg.content[0].text.strip()
+        try:
+            idea = _json.loads(raw)
+        except Exception:
+            idea = _json.loads(raw.split("```")[1].lstrip("json").strip()) if "```" in raw else {}
+
+        sb.table("content_plan_items").insert({
+            "tenant_id": tenant_id,
+            "title": str(idea.get("title") or "New content idea")[:300],
+            "topic": str(idea.get("topic") or "")[:1000],
+            "content_type": "blog_article",
+            "target_keyword": str(idea.get("target_keyword") or "")[:200] or None,
+            "priority": "medium",
+            "status": "idea",
+            "source": "daily_refresh",
+            "scheduled_for": f"{next_date.isoformat()}T09:00:00.000Z",
+        }).execute()
+        added = 1
+    except Exception as e:
+        logger.warning(f"[content_refresh] suggestion failed for tenant={tenant_id}: {e}")
+
+    return written, added
+
+
+async def _run_daily_content_refresh():
+    """Maintain two-ahead invariant: ensure next 2 plan items always have written articles."""
+    job_id = "daily_content_refresh"
+    logger.info("[scheduler] Running daily content refresh...")
+    try:
+        from shared.database import get_supabase
+        sb = get_supabase()
+
+        # Collect all tenants that have any content plan items
+        tenants_res = (
+            sb.table("content_plan_items")
+            .select("tenant_id")
+            .limit(500)
+            .execute()
+        )
+        tenant_ids = list({
+            r["tenant_id"] for r in (tenants_res.data or []) if r.get("tenant_id")
+        })
+        logger.info(f"[content_refresh] processing {len(tenant_ids)} tenant(s)")
+
+        total_written = 0
+        total_added = 0
+        for tenant_id in tenant_ids:
+            try:
+                w, a = await _refresh_content_for_tenant(tenant_id, sb)
+                total_written += w
+                total_added += a
+            except Exception as e:
+                logger.warning(f"[content_refresh] tenant={tenant_id} failed: {e}")
+
+        logger.info(
+            f"[content_refresh] done -- wrote {total_written} articles, "
+            f"added {total_added} calendar suggestions"
+        )
+        _record(job_id, "success")
+    except Exception as e:
+        logger.error(f"[scheduler] {job_id} failed: {e}")
+        _record(job_id, "error", str(e))
+        await _notify_failure(job_id, str(e))
+
+
 async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
     job_id = f"tenants_{agent_name}_{schedule}"
     logger.info(f"[scheduler] {job_id}: fan-out start")
@@ -819,6 +1037,7 @@ def start():
     scheduler.add_job(_run_weekly_content_analysis, CronTrigger(day_of_week="wed", hour=5, minute=0), id="weekly_content_analysis", replace_existing=True)
     scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
     scheduler.add_job(_run_due_content_drafts, CronTrigger(minute=0), id="hourly_due_content_drafts", replace_existing=True)
+    scheduler.add_job(_run_daily_content_refresh, CronTrigger(hour=7, minute=30), id="daily_content_refresh", replace_existing=True)
 
     # Email jobs — cron pulled from email_schedules so admin can edit it live.
     weekly_status_job_id, *_ = _EMAIL_JOBS["weekly_status"]
@@ -865,7 +1084,8 @@ def start():
     logger.info(
         "[scheduler] Started -- "
         "keywords 02:00, SEO Mon 03:00, metrics 04:00, "
-        "agent-reports 05:00, dev-health 05:30, workflow 06:00, ads 08:00, "
+        "agent-reports 05:00, dev-health 05:30, workflow 06:00, lead-scoring 07:00, "
+        "content-refresh 07:30, ads 08:00, "
         "social Tue 11:00, reviews 14:00, content Wed 05:00, autopilot Wed 06:00, "
         "due-content-drafts hourly :00, social-emails admin-configurable, "
         "weekly-status admin-configurable, "
