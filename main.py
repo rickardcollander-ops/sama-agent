@@ -19,7 +19,7 @@ from api.routes import (
     agent_reports, agent_chat, user_settings, leads, webhooks,
     content_pieces, content_generate, social_posts, analytics_overview,
     analytics_debug,
-    ads_creatives, ads_credentials, google_oauth, tenant_activation,
+    ads_creatives, ads_credentials, ads_meta, google_oauth, tenant_activation,
     github_integration, usage, social_schedule, analytics_attribution,
     content_validation, analysis as analysis_routes, approvals,
     site_audit as site_audit_routes,
@@ -292,6 +292,7 @@ app.include_router(analytics_debug.router, prefix="/api/analytics", tags=["analy
 app.include_router(analytics_attribution.router, prefix="/api/analytics", tags=["analytics-attribution"])
 app.include_router(ads_creatives.router, prefix="/api/ads", tags=["ads-creatives"])
 app.include_router(ads_credentials.router, prefix="/api/ads", tags=["ads-credentials"])
+app.include_router(ads_meta.router, prefix="/api/ads", tags=["ads-meta"])
 app.include_router(google_oauth.router, prefix="/api/auth/google", tags=["google-oauth"])
 app.include_router(tenant_activation.router, prefix="/api/tenant", tags=["tenant"])
 app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
@@ -341,6 +342,7 @@ async def root():
             "seo": "active",
             "content": "active",
             "ads": "active",
+            "ads_meta": "active",
             "social": "active",
             "reviews": "active",
             "analytics": "active",
