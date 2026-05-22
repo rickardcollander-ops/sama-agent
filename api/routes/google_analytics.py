@@ -7,9 +7,17 @@ These endpoints let the dashboard:
 
 1. List GA4 properties accessible to the connected Google account
    (``GET /properties``).
-2. Save the chosen property to ``user_settings.ga4_property_id`` so the
-   tenant-scoped analytics agent picks it up (``POST /select-property``).
+2. Save the chosen property so the tenant-scoped analytics agent picks it up
+   (``POST /select-property``).
 3. Read the currently selected property (``GET /selected-property``).
+
+Storage routing for the selected GA4 property mirrors the dashboard's
+``getTenantSettingsAccess`` logic:
+- Primary/legacy site (site_id == account_id): ``user_settings.settings``
+- Secondary site  (site_id != account_id): ``user_sites.settings``
+
+This is required because ``user_settings.user_id`` references ``auth.users``
+via a FK; using a site UUID there causes a 23503 violation.
 """
 
 import logging
@@ -141,7 +149,9 @@ async def list_ga4_properties(request: Request, tenant_id: Optional[str] = Query
         logger.error(f"GA4 properties fetch failed for {tid}: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to fetch properties: {e}")
 
-    selected = await _get_selected_property_id(tid)
+    req_account_id = getattr(request.state, "account_id", None) or tid
+    req_site_id = getattr(request.state, "site_id", None) or tid
+    selected = await _get_selected_property_id(tid, account_id=req_account_id, site_id=req_site_id)
 
     return {
         "tenant_id": tid,
@@ -159,8 +169,17 @@ class SelectPropertyPayload(BaseModel):
 
 @router.post("/select-property")
 async def select_ga4_property(payload: SelectPropertyPayload, request: Request):
-    """Save the chosen GA4 property to user_settings so the analytics agent uses it."""
+    """Save the chosen GA4 property so the analytics agent uses it.
+
+    Routes to user_sites.settings for secondary sites (site_id != account_id)
+    and user_settings for the primary/legacy site, mirroring the dashboard's
+    getTenantSettingsAccess logic. This avoids a FK violation that occurred when
+    a site UUID (not an auth user UUID) was used as user_settings.user_id.
+    """
     tid = _tenant_id(request)
+    account_id: str = getattr(request.state, "account_id", None) or tid
+    site_id: str = getattr(request.state, "site_id", None) or tid
+
     if not payload.property_id.strip():
         raise HTTPException(status_code=400, detail="property_id is required")
 
@@ -171,39 +190,63 @@ async def select_ga4_property(payload: SelectPropertyPayload, request: Request):
         prop_id = prop_id.split("/", 1)[1]
 
     sb = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Merge into existing settings rather than overwriting.
-    try:
-        existing = (
-            sb.table("user_settings")
-            .select("settings")
-            .eq("user_id", tid)
-            .single()
-            .execute()
-        )
-        current_settings = (existing.data or {}).get("settings", {}) if existing.data else {}
-    except Exception:
-        current_settings = {}
+    if site_id != account_id:
+        # Secondary site: write to user_sites.settings.
+        # user_settings.user_id is a FK on auth.users — a site UUID would violate it.
+        try:
+            existing = (
+                sb.table("user_sites")
+                .select("settings")
+                .eq("id", site_id)
+                .maybeSingle()
+                .execute()
+            )
+            current_settings = (existing.data or {}).get("settings", {}) if existing.data else {}
+        except Exception:
+            current_settings = {}
 
-    current_settings["ga4_property_id"] = prop_id
-    if payload.display_name:
-        current_settings["ga4_property_name"] = payload.display_name
+        current_settings["ga4_property_id"] = prop_id
+        if payload.display_name:
+            current_settings["ga4_property_name"] = payload.display_name
 
-    try:
-        sb.table("user_settings").upsert(
-            {
-                "user_id": tid,
-                "settings": current_settings,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            on_conflict="user_id",
-        ).execute()
-    except Exception as e:
-        logger.error(f"select-property save failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not save property: {e}")
+        try:
+            sb.table("user_sites").update(
+                {"settings": current_settings, "updated_at": now_iso}
+            ).eq("id", site_id).execute()
+        except Exception as e:
+            logger.error(f"select-property save failed (user_sites site={site_id}): {e}")
+            raise HTTPException(status_code=500, detail=f"Could not save property: {e}")
+    else:
+        # Primary/legacy site: write to user_settings keyed by auth user UUID.
+        try:
+            existing = (
+                sb.table("user_settings")
+                .select("settings")
+                .eq("user_id", account_id)
+                .maybeSingle()
+                .execute()
+            )
+            current_settings = (existing.data or {}).get("settings", {}) if existing.data else {}
+        except Exception:
+            current_settings = {}
+
+        current_settings["ga4_property_id"] = prop_id
+        if payload.display_name:
+            current_settings["ga4_property_name"] = payload.display_name
+
+        try:
+            sb.table("user_settings").upsert(
+                {"user_id": account_id, "settings": current_settings, "updated_at": now_iso},
+                on_conflict="user_id",
+            ).execute()
+        except Exception as e:
+            logger.error(f"select-property save failed (user_settings user={account_id}): {e}")
+            raise HTTPException(status_code=500, detail=f"Could not save property: {e}")
 
     # Drop cached TenantConfig so next request reads the fresh value.
-    invalidate_tenant_cache(tid)
+    invalidate_tenant_cache(tid, account_id=account_id, site_id=site_id if site_id != account_id else None)
 
     return {
         "success": True,
@@ -216,24 +259,32 @@ async def select_ga4_property(payload: SelectPropertyPayload, request: Request):
 @router.get("/selected-property")
 async def get_selected_property(request: Request, tenant_id: Optional[str] = Query(None)):
     tid = _tenant_id(request, tenant_id)
+    req_account_id = getattr(request.state, "account_id", None) or tid
+    req_site_id = getattr(request.state, "site_id", None) or tid
     return {
         "tenant_id": tid,
-        "property_id": await _get_selected_property_id(tid),
+        "property_id": await _get_selected_property_id(tid, account_id=req_account_id, site_id=req_site_id),
     }
 
 
-async def _get_selected_property_id(tenant_id: str) -> Optional[str]:
-    sb = get_supabase()
+async def _get_selected_property_id(
+    tenant_id: str,
+    *,
+    account_id: Optional[str] = None,
+    site_id: Optional[str] = None,
+) -> Optional[str]:
+    """Read the selected GA4 property, checking user_sites first then user_settings."""
+    from shared.tenant import get_tenant_config
+    _account_id = account_id or tenant_id
+    _site_id = site_id or tenant_id
     try:
-        res = (
-            sb.table("user_settings")
-            .select("settings")
-            .eq("user_id", tenant_id)
-            .single()
-            .execute()
+        config = await get_tenant_config(
+            tenant_id,
+            account_id=_account_id,
+            site_id=_site_id,
         )
-        if res.data:
-            return (res.data.get("settings") or {}).get("ga4_property_id")
+        prop = config.ga4_property_id
+        return prop if prop else None
     except Exception:
         pass
     return None
