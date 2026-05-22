@@ -204,6 +204,25 @@ async def get_settings_row(user_id: str) -> Dict[str, Any]:
         return {}
 
 
+async def _resolve_site_owner(site_id: str) -> Optional[str]:
+    """If site_id is a UUID in user_sites, return the owner's user_id."""
+    def _fetch():
+        sb = get_supabase()
+        return (
+            sb.table("user_sites")
+            .select("user_id")
+            .eq("id", site_id)
+            .maybe_single()
+            .execute()
+        )
+    try:
+        res = await run_db(_fetch)
+        return (res.data or {}).get("user_id")
+    except Exception as e:
+        logger.debug("_resolve_site_owner failed for %s: %s", site_id, e)
+        return None
+
+
 async def get_access_status(user_id: str) -> AccessStatus:
     """Resolve the subscription state for ``user_id``."""
     if not user_id or user_id == "default":
@@ -220,6 +239,17 @@ async def get_access_status(user_id: str) -> AccessStatus:
             blocked_reason=None,
         )
     settings = await get_settings_row(user_id)
+    # When no settings row is found the caller may have passed a site_id
+    # (user_sites.id) rather than the auth user_id. The dashboard sends
+    # X-Sama-Site-Id which TenantMiddleware promotes to tenant_id, so
+    # check_and_increment ends up here with a site UUID. Resolve the site
+    # owner and retry so admin-granted / active-subscription status is read
+    # from the correct user_settings row.
+    if not settings:
+        owner_id = await _resolve_site_owner(user_id)
+        if owner_id and owner_id != user_id:
+            settings = await get_settings_row(owner_id)
+            user_id = owner_id
     site_count = await count_user_sites(user_id)
     return _resolve(settings, site_count=site_count)
 
