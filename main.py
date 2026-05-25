@@ -28,6 +28,7 @@ from api.routes import (
     strategy as strategy_routes, menu as menu_routes,
     content_performance as content_performance_routes,
     google_analytics as google_analytics_routes,
+    google_search_console as google_search_console_routes,
     integrations_gsc as integrations_gsc_routes,
     content_plan as content_plan_routes,
     content_plan_create as content_plan_create_routes,
@@ -315,6 +316,11 @@ app.include_router(
     google_analytics_routes.router,
     prefix="/api/integrations/google/analytics",
     tags=["google-analytics"],
+)
+app.include_router(
+    google_search_console_routes.router,
+    prefix="/api/integrations/google/search-console",
+    tags=["google-search-console"],
 )
 app.include_router(
     integrations_gsc_routes.router,
