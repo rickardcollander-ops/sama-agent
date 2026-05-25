@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from shared.database import get_supabase
 from shared.domain import normalize_host, same_domain
-from shared.tenant import get_tenant_config
+from shared.tenant import get_tenant_config, invalidate_tenant_cache
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -54,6 +54,11 @@ async def run_site_audit(payload: RunPayload, request: Request):
     Falls back to the tenant's configured domain if `domain` is not supplied.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
+    # Bust the cache so kickoffs see fresh settings — the dashboard writes
+    # user_sites.settings directly during onboarding and stale config would
+    # leave _expected_domain empty (skipping the guard) or, worse, blocking
+    # an audit whose domain was just persisted.
+    invalidate_tenant_cache(tenant_id)
     config = await get_tenant_config(tenant_id)
 
     domain = (payload.domain or config.domain or "").strip()

@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from shared.database import get_supabase
 from shared.domain import normalize_host, same_domain
-from shared.tenant import get_tenant_config
+from shared.tenant import get_tenant_config, invalidate_tenant_cache
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -447,6 +447,13 @@ async def run_analysis(payload: RunPayload, request: Request):
     gets measured" guarantee that the rest of the product depends on.
     """
     tenant_id = getattr(request.state, "tenant_id", "default")
+    # Bust the in-memory tenant cache before reading. The dashboard writes
+    # settings directly to user_sites via the Supabase admin client (e.g.
+    # during onboarding) without notifying the backend, so a cached config
+    # populated minutes earlier can be missing the geo_queries / domain the
+    # user just saved — which would falsely 400 this endpoint with
+    # "No queries configured" and silently drop the onboarding kickoff.
+    invalidate_tenant_cache(tenant_id)
     config = await get_tenant_config(tenant_id)
 
     queries = [q.strip() for q in (getattr(config, "geo_queries", []) or []) if q and q.strip()]
