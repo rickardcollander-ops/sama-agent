@@ -280,6 +280,57 @@ class SchemaMarkupGenerator:
                 "errors": [str(e)]
             }
     
+    def generate_local_business_schema(
+        self,
+        locations: List[Dict[str, Any]],
+        site_info: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Generate LocalBusiness JSON-LD for each configured physical location.
+
+        Returns one schema dict per location (caller can embed as separate
+        <script type="application/ld+json"> blocks or combine via @graph).
+        """
+        schemas: List[Dict[str, Any]] = []
+        brand_name = site_info.get("brand_name", "")
+        site_url = site_info.get("site_url", "")
+
+        for loc in locations:
+            city = (loc.get("city") or "").strip()
+            country = (loc.get("country") or "").strip().upper()
+            if not city or not country:
+                continue
+
+            schema: Dict[str, Any] = {
+                "@context": "https://schema.org",
+                "@type": "LocalBusiness",
+                "name": brand_name,
+            }
+            if site_url:
+                schema["url"] = site_url
+
+            postal_address: Dict[str, Any] = {
+                "@type": "PostalAddress",
+                "addressLocality": city,
+                "addressCountry": country,
+            }
+            if loc.get("region"):
+                postal_address["addressRegion"] = loc["region"]
+            if loc.get("address"):
+                postal_address["streetAddress"] = loc["address"]
+            if loc.get("postal_code"):
+                postal_address["postalCode"] = loc["postal_code"]
+            schema["address"] = postal_address
+
+            if loc.get("phone"):
+                schema["telephone"] = loc["phone"]
+
+            region = loc.get("region", "")
+            schema["areaServed"] = f"{city}, {region}, {country}".replace(", , ", ", ") if region else f"{city}, {country}"
+
+            schemas.append(schema)
+
+        return schemas
+
     def combine_schemas(self, schemas: List[Dict[str, Any]]) -> str:
         """
         Combine multiple schemas into a single JSON-LD script tag

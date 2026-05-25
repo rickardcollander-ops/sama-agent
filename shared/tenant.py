@@ -301,6 +301,19 @@ class TenantConfig:
             return val
         return {}
 
+    @property
+    def target_locations(self) -> List[Dict[str, Any]]:
+        """Physical locations for local SEO (city, country, address, NAP data)."""
+        val = self._settings.get("target_locations")
+        if val and isinstance(val, list):
+            return [
+                loc for loc in val
+                if isinstance(loc, dict)
+                and loc.get("city")
+                and loc.get("country")
+            ]
+        return []
+
     # ── Raw access ────────────────────────────────────────────────────
 
     def get_raw(self, key: str, default: Any = None) -> Any:
