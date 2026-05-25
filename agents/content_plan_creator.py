@@ -146,6 +146,8 @@ def _load_tenant_brand_context(tenant_id: str) -> Dict[str, Any]:
 def _bucket_for_gap(gap_type: str, ai_mention: bool) -> str:
     """Map analysis gap classification to a 30/60/90 bucket."""
     gt = (gap_type or "").lower()
+    if gt == "local_landing_page":
+        return "30"
     if gt in ("competitor_dominates", "both_losers") or not ai_mention:
         return "30"
     if gt == "seo_winner_geo_loser":
@@ -832,6 +834,7 @@ async def create_plan_from_analysis(
         or ""
     )
     competitors = list(tenant_config.competitors) if tenant_config else []
+    target_locations = list(tenant_config.target_locations) if tenant_config else []
 
     # 3. Voice for title generation. Use the tenant's own voice when one
     # has been scraped/persisted; otherwise fall back to the default voice
@@ -848,6 +851,35 @@ async def create_plan_from_analysis(
     # runs are also topped up the same way so the calendar isn't half-empty.
     target_total = articles_per_week * 13  # ~13 weeks across 90 days
     topics = _extract_topics_from_run(payload)
+
+    # Local landing page seeds — one per configured physical location.
+    # These are high-intent "service in city" pages that directly drive
+    # local pack rankings and should land in the first 30-day bucket.
+    if target_locations:
+        local_seeds: List[Dict[str, Any]] = []
+        existing_queries_lower = {t["query"].lower() for t in topics}
+        for loc in target_locations[:3]:
+            city = loc.get("city", "")
+            if not city:
+                continue
+            query = f"{brand_name} {city}" if brand_name else city
+            if query.lower() not in existing_queries_lower:
+                local_seeds.append({
+                    "query": query,
+                    "gap_type": "local_landing_page",
+                    "ai_mention": False,
+                    "seo_rank": None,
+                    "competitors": competitors[:3],
+                    "angle_hint": f"Local landing page for {city} — service overview, contact, and why choose {brand_name} in {city}.",
+                    "rationale_hint": f"Geo-specific page targeting local search intent in {city}.",
+                })
+                existing_queries_lower.add(query.lower())
+        if local_seeds:
+            logger.info(
+                "content_plan_creator: injecting %d local landing page seeds for tenant=%s",
+                len(local_seeds), tenant_id,
+            )
+            topics = local_seeds + topics
 
     if len(topics) < target_total:
         seed_count = target_total - len(topics)

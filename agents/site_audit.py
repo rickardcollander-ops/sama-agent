@@ -1326,6 +1326,35 @@ class SiteAuditAgent:
                  how_to_fix="Fix or remove each broken link; for moved targets use a 301 to the new URL.",
                  impact="medium", effort="low", group="quick_win")
 
+        # Local SEO: if the tenant has physical locations configured but the
+        # homepage has no LocalBusiness schema, surface it as a quick win.
+        tenant_locations = getattr(getattr(self, "tenant_config", None), "target_locations", [])
+        if tenant_locations and pages:
+            homepage = next(
+                (p for p in pages if p.url.rstrip("/") == base_url.rstrip("/")),
+                pages[0],
+            )
+            has_local_schema = any(
+                "localbusiness" in t.lower() for t in homepage.schema_types
+            )
+            if not has_local_schema:
+                _add(
+                    "local_seo", "warning",
+                    "LocalBusiness schema missing on homepage",
+                    "Physical locations are configured but the homepage has no "
+                    "LocalBusiness JSON-LD. This markup is required for Google's "
+                    "local pack and Maps results.",
+                    1,
+                    affected_urls=[homepage.url],
+                    how_to_fix=(
+                        'Add a <script type="application/ld+json"> block with '
+                        "@type: LocalBusiness, including name, address "
+                        "(PostalAddress), telephone, and url. Use SAMA's Local "
+                        "SEO generator to build the correct markup automatically."
+                    ),
+                    impact="high", effort="low", group="quick_win",
+                )
+
         # Healthy signals
         if all(p.has_schema for p in pages) and pages:
             _add("geo", "success", "All audited pages include structured data",

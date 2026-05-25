@@ -91,14 +91,72 @@ class SERPAnalyzer:
             logger.error(f"SERP analysis failed: {e}")
             return {"success": False, "error": str(e)}
 
-    async def _fetch_search_results(self, keyword: str, num_results: int) -> List[Dict[str, str]]:
+    async def analyze_serp_local(
+        self,
+        keyword: str,
+        country_code: str,
+        language_code: str = "en",
+        num_results: int = 5,
+    ) -> Dict[str, Any]:
+        """Like analyze_serp() but targets a specific country/language market.
+
+        ``country_code`` is an ISO 3166-1 alpha-2 code (e.g. "SE").
+        ``language_code`` is an ISO 639-1 code (e.g. "sv").
+        """
+        if not self._is_configured():
+            return {
+                "success": False,
+                "error": "VALUESERP_API_KEY not configured. Get a free key at valueserp.com",
+            }
+        try:
+            search_results = await self._fetch_search_results(
+                keyword, num_results,
+                gl=country_code.lower(),
+                hl=language_code.lower(),
+            )
+            if not search_results:
+                return {"success": False, "error": "No search results returned from ValueSERP"}
+
+            analyzed_results = []
+            for i, result in enumerate(search_results, 1):
+                analysis = await self._analyze_page(result["url"])
+                if analysis:
+                    analyzed_results.append({
+                        "position": i,
+                        "url": result["url"],
+                        "title": result.get("title", ""),
+                        "snippet": result.get("snippet", ""),
+                        **analysis,
+                    })
+
+            insights = self._generate_insights(analyzed_results, keyword)
+            return {
+                "success": True,
+                "keyword": keyword,
+                "country": country_code,
+                "language": language_code,
+                "results_analyzed": len(analyzed_results),
+                "results": analyzed_results,
+                "insights": insights,
+            }
+        except Exception as e:
+            logger.error(f"Local SERP analysis failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _fetch_search_results(
+        self,
+        keyword: str,
+        num_results: int,
+        gl: str = "us",
+        hl: str = "en",
+    ) -> List[Dict[str, str]]:
         """Fetch real Google search results via ValueSERP API"""
         params = {
             "api_key": settings.VALUESERP_API_KEY,
             "q": keyword,
             "num": min(num_results, 10),
-            "gl": "us",
-            "hl": "en",
+            "gl": gl,
+            "hl": hl,
             "google_domain": "google.com"
         }
 
