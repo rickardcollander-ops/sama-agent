@@ -5,8 +5,10 @@ Runs automated workflows on a schedule using APScheduler.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -262,6 +264,47 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
     stats = {"plan_items_added": 0, "ideas_generated": 0, "drafted": 0, "queued": 0, "published": 0}
     sb = get_supabase()
 
+    # Resolve the scheduled target date (today + N days) once. We pin the local
+    # time-of-day to 09:00 Europe/Stockholm and store the instant as UTC, so the
+    # hourly UTC publish job fires on the correct local calendar day (and stays
+    # inside that local day regardless of DST).
+    _STO = ZoneInfo("Europe/Stockholm")
+    days_ahead = ap_cfg.get("scheduled_for_days_ahead")
+    target_dt_iso: Optional[str] = None
+    target_date = None
+    if days_ahead is not None:
+        local = (datetime.now(_STO) + timedelta(days=int(days_ahead))).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        target_dt_iso = local.astimezone(timezone.utc).isoformat()
+        target_date = local.date()
+
+    # Gap-fill, not blind generation: if the daily cron has already filled the
+    # target date, skip this run entirely.
+    if ap_cfg.get("source") == "daily_cron" and target_date is not None:
+        try:
+            day_start = datetime(
+                target_date.year, target_date.month, target_date.day, tzinfo=_STO
+            ).astimezone(timezone.utc)
+            day_end = day_start + timedelta(days=1)
+            existing = (
+                sb.table("content_plan_items")
+                .select("id")
+                .eq("tenant_id", tenant_id)
+                .gte("scheduled_for", day_start.isoformat())
+                .lt("scheduled_for", day_end.isoformat())
+                .in_("status", ["idea", "drafting", "draft", "scheduled", "published"])
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                logger.info(
+                    f"[autopilot {tenant_id}] skip: already scheduled for {target_date.isoformat()}"
+                )
+                return {**stats, "skipped": True, "reason": "already_scheduled_for_target_date"}
+        except Exception as e:
+            logger.warning(f"[autopilot {tenant_id}] gap-fill check failed: {e}")
+
     try:
         result = await run_content_analysis_with_ooda(tenant_id=tenant_id)
         stats["plan_items_added"] = int(result.get("plan_items_added") or 0)
@@ -373,10 +416,13 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                     inserted = sb.table("content_pieces").insert(piece_data).execute()
                     piece = (inserted.data or [{}])[0]
                     piece_id = piece.get("id")
-                    sb.table("content_plan_items").update({
-                        "status": "draft",
-                        "content_piece_id": piece_id,
-                    }).eq("id", item["id"]).execute()
+                    plan_update = {"status": "draft", "content_piece_id": piece_id}
+                    # Pin the calendar date + opt into scheduled auto-publish so the
+                    # hourly publish job (process_due_scheduled_items) ships it on day +N.
+                    if target_dt_iso:
+                        plan_update["scheduled_for"] = target_dt_iso
+                        plan_update["auto_publish_on_schedule"] = True
+                    sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
                     stats["drafted"] += 1
 
                     score = _heuristic_checks(piece_data)["score"]
@@ -396,6 +442,13 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             stats["published"] += 1
                             continue
 
+                    # When the piece is scheduled for auto-publish on its target
+                    # date, the schedule IS the approval mechanism — don't also
+                    # queue it for manual review (avoids a confusing double state).
+                    if target_dt_iso:
+                        stats["scheduled"] = stats.get("scheduled", 0) + 1
+                        continue
+
                     sb.table("pending_approvals").insert({
                         "tenant_id": tenant_id,
                         "kind": "content",
@@ -413,6 +466,8 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
         except Exception as e:
             logger.warning(f"[autopilot {tenant_id}] draft phase failed: {e}")
 
+    if target_dt_iso:
+        stats["scheduled_for"] = target_dt_iso
     return stats
 
 
@@ -1035,7 +1090,11 @@ def start():
     scheduler.add_job(_run_daily_metrics, CronTrigger(hour=4, minute=0), id="daily_metrics", replace_existing=True)
     scheduler.add_job(_run_daily_ads_check, CronTrigger(hour=8, minute=0), id="daily_ads_check", replace_existing=True)
     scheduler.add_job(_run_weekly_content_analysis, CronTrigger(day_of_week="wed", hour=5, minute=0), id="weekly_content_analysis", replace_existing=True)
-    scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
+    # Content autopilot is driven by the dashboard Vercel cron (daily + weekly)
+    # via POST /api/tenant/agents/content/trigger — the single source of truth.
+    # The internal fan-out is kept behind a flag to avoid duplicate generation.
+    if os.getenv("ENABLE_INTERNAL_CONTENT_AUTOPILOT", "").lower() in ("1", "true", "yes"):
+        scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
     scheduler.add_job(_run_due_content_drafts, CronTrigger(minute=0), id="hourly_due_content_drafts", replace_existing=True)
     scheduler.add_job(_run_daily_content_refresh, CronTrigger(hour=7, minute=30), id="daily_content_refresh", replace_existing=True)
 
@@ -1069,7 +1128,8 @@ def start():
         ("analytics", "daily", CronTrigger(hour=4, minute=30)),
         ("social", "daily", CronTrigger(hour=6, minute=30)),
         ("reviews", "daily", CronTrigger(hour=14, minute=30)),
-        ("content", "weekly", CronTrigger(day_of_week="wed", hour=5, minute=30)),
+        # "content" intentionally omitted: the generic content agent duplicates
+        # the autopilot pipeline. Content runs via the dashboard cron trigger.
         ("geo", "weekly", CronTrigger(day_of_week="thu", hour=10, minute=30)),
         ("strategy", "weekly", CronTrigger(day_of_week="sun", hour=18, minute=0)),
     ]
@@ -1086,7 +1146,8 @@ def start():
         "keywords 02:00, SEO Mon 03:00, metrics 04:00, "
         "agent-reports 05:00, dev-health 05:30, workflow 06:00, lead-scoring 07:00, "
         "content-refresh 07:30, ads 08:00, "
-        "social Tue 11:00, reviews 14:00, content Wed 05:00, autopilot Wed 06:00, "
+        "social Tue 11:00, reviews 14:00, content-analysis Wed 05:00, "
+        "content-autopilot via dashboard cron, "
         "due-content-drafts hourly :00, social-emails admin-configurable, "
         "weekly-status admin-configurable, "
         "digest 17:00, reflection 22:00, goals Fri 09:00 (UTC)"
