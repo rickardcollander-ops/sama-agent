@@ -241,6 +241,17 @@ class TogglePayload(BaseModel):
     enabled: bool
 
 
+class ContentTriggerPayload(BaseModel):
+    """Body for POST /agents/content/trigger. All optional — absent fields fall
+    back to saved user settings, then to the cron-contract defaults."""
+    source: Optional[str] = None
+    ideas_per_run: Optional[int] = None
+    auto_draft_top_n: Optional[int] = None
+    auto_publish: Optional[bool] = None
+    min_score_for_publish: Optional[int] = None
+    scheduled_for_days_ahead: Optional[int] = None
+
+
 @router.post("/agents/{agent_name}/toggle")
 async def toggle_agent(agent_name: str, payload: TogglePayload, request: Request):
     """Enable or disable a specific agent for this tenant."""
@@ -264,12 +275,58 @@ async def toggle_agent(agent_name: str, payload: TogglePayload, request: Request
 
 # ── Helpers: agent dispatch + run record management ──────────────────────────
 
-async def _dispatch_agent_cycle(agent_name: str, tenant_id: str) -> str:
+def _resolve_autopilot_cfg(tenant_id: str, params: Optional[dict]) -> dict:
+    """Merge request-body params over the tenant's saved content_autopilot
+    settings, falling back to the cron-contract defaults. The resulting dict
+    uses the same keys that ``_run_content_autopilot_for_tenant`` reads."""
+    saved = {}
+    try:
+        row = (
+            get_supabase()
+            .table("user_settings")
+            .select("settings")
+            .eq("user_id", tenant_id)
+            .single()
+            .execute()
+        )
+        saved = ((row.data or {}).get("settings") or {}).get("content_autopilot") or {}
+    except Exception:
+        saved = {}
+
+    p = params or {}
+
+    def pick(key, default):
+        v = p.get(key)
+        return v if v is not None else saved.get(key, default)
+
+    return {
+        "ideas_per_run": pick("ideas_per_run", 6),
+        "auto_draft_top_n": pick("auto_draft_top_n", 3),
+        "auto_publish": pick("auto_publish", False),
+        "min_score_for_publish": pick("min_score_for_publish", 70),
+        # Per-run intent — not persisted in settings, only honored if sent.
+        "source": p.get("source"),
+        "scheduled_for_days_ahead": p.get("scheduled_for_days_ahead"),
+    }
+
+
+async def _dispatch_agent_cycle(
+    agent_name: str, tenant_id: str, params: Optional[dict] = None
+) -> str:
     """
     Run one cycle of the given agent for the given tenant. Returns a short
     human-readable summary. Raises on failure so the caller can mark the
     agent_runs row as failed with the exception message.
     """
+    # The content agent is driven by the autopilot pipeline (ideas → drafts →
+    # schedule/publish), parameterized by the trigger body. This is the path the
+    # dashboard cron jobs rely on; the generic agent factory is bypassed for it.
+    if agent_name == "content":
+        from shared.scheduler import _run_content_autopilot_for_tenant
+        ap_cfg = _resolve_autopilot_cfg(tenant_id, params)
+        result = await _run_content_autopilot_for_tenant(tenant_id, ap_cfg)
+        return json.dumps(result)
+
     from shared.tenant_agents import AGENT_FACTORIES, get_agent
     if agent_name not in AGENT_FACTORIES:
         return f"{agent_name} triggered"
@@ -278,7 +335,12 @@ async def _dispatch_agent_cycle(agent_name: str, tenant_id: str) -> str:
     return result or f"{agent_name} cycle completed"
 
 
-async def _execute_run(run_id: Optional[str], tenant_id: str, agent_name: str) -> None:
+async def _execute_run(
+    run_id: Optional[str],
+    tenant_id: str,
+    agent_name: str,
+    params: Optional[dict] = None,
+) -> None:
     """
     Background task: runs the agent cycle and updates the agent_runs row.
     Never raises — failures are recorded as status=failed.
@@ -286,7 +348,7 @@ async def _execute_run(run_id: Optional[str], tenant_id: str, agent_name: str) -
     sb = get_supabase()
     started = datetime.now(timezone.utc).isoformat()
     try:
-        summary = await _dispatch_agent_cycle(agent_name, tenant_id)
+        summary = await _dispatch_agent_cycle(agent_name, tenant_id, params)
         status = "completed"
         error_msg: Optional[str] = None
     except Exception as e:
@@ -333,6 +395,16 @@ async def trigger_agent(agent_name: str, request: Request):
     if agent_name not in ALL_AGENTS:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
 
+    # The content trigger is parameterized by its JSON body (source, ideas_per_run,
+    # scheduled_for_days_ahead, …). A body-less or non-JSON call falls back to
+    # saved settings / defaults, preserving the manual "Run now" behavior.
+    params: Optional[dict] = None
+    if agent_name == "content":
+        try:
+            params = ContentTriggerPayload(**(await request.json())).model_dump()
+        except Exception:
+            params = None
+
     try:
         await check_and_increment(tenant_id, "agent_runs")
     except UsageLimitExceeded as e:
@@ -360,7 +432,7 @@ async def trigger_agent(agent_name: str, request: Request):
     except Exception as e:
         logger.warning(f"Could not record agent run: {e}")
 
-    asyncio.create_task(_execute_run(run_id, tenant_id, agent_name))
+    asyncio.create_task(_execute_run(run_id, tenant_id, agent_name, params))
 
     return {
         "success": True,
