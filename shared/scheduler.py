@@ -417,17 +417,22 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                     piece = (inserted.data or [{}])[0]
                     piece_id = piece.get("id")
                     plan_update = {"status": "draft", "content_piece_id": piece_id}
-                    # Pin the calendar date + opt into scheduled auto-publish so the
-                    # hourly publish job (process_due_scheduled_items) ships it on day +N.
+                    # Pin the calendar date. Only opt into scheduled auto-publish
+                    # (process_due_scheduled_items ships it unattended on day +N)
+                    # when the user actually enabled auto_publish. With
+                    # auto_publish off — the default for daily/weekly cron — the
+                    # piece is scheduled on the calendar but still needs manual
+                    # approval before it goes live.
+                    auto_pub = bool(ap_cfg.get("auto_publish"))
                     if target_dt_iso:
                         plan_update["scheduled_for"] = target_dt_iso
-                        plan_update["auto_publish_on_schedule"] = True
+                        plan_update["auto_publish_on_schedule"] = auto_pub
                     sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
                     stats["drafted"] += 1
 
                     score = _heuristic_checks(piece_data)["score"]
                     min_score = int(ap_cfg.get("min_score_for_publish", 70))
-                    if ap_cfg.get("auto_publish") and score >= min_score:
+                    if auto_pub and score >= min_score:
                         from api.routes.content_validation import _publish_via_github
                         gh = await _publish_via_github(piece_data)
                         if gh.get("success"):
@@ -442,10 +447,12 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             stats["published"] += 1
                             continue
 
-                    # When the piece is scheduled for auto-publish on its target
-                    # date, the schedule IS the approval mechanism — don't also
-                    # queue it for manual review (avoids a confusing double state).
-                    if target_dt_iso:
+                    # When auto_publish is on, the scheduled date IS the approval
+                    # mechanism — the hourly job publishes it on day +N, so don't
+                    # also queue it for manual review (avoids a confusing double
+                    # state). With auto_publish off the schedule will NOT publish
+                    # it, so it must fall through to the approval queue below.
+                    if target_dt_iso and auto_pub:
                         stats["scheduled"] = stats.get("scheduled", 0) + 1
                         continue
 

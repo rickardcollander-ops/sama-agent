@@ -49,6 +49,8 @@ class ContentPieceUpdate(BaseModel):
     meta_description: Optional[str] = None
     target_keyword: Optional[str] = None
     target_url: Optional[str] = None
+    external_url: Optional[str] = None
+    published_at: Optional[str] = None
     word_count: Optional[int] = None
     status: Optional[str] = None
     source_gap_id: Optional[str] = None
@@ -187,6 +189,12 @@ async def update_content_piece(piece_id: str, payload: ContentPieceUpdate):
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if not update_data:
             return {"success": True, "message": "Nothing to update"}
+        # When a piece flips to "published" (manual publish from the dashboard or
+        # the auto-publish bridge), stamp published_at if the caller didn't. The
+        # 24h social-promo email keys off this timestamp, so without it that
+        # follow-up never fires.
+        if update_data.get("status") == "published" and not update_data.get("published_at"):
+            update_data["published_at"] = datetime.now(timezone.utc).isoformat()
         result = sb.table("content_pieces").update(update_data).eq("id", piece_id).execute()
         if result.data:
             return {"success": True, "piece": _ensure_numeric(result.data[0])}
