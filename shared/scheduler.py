@@ -258,8 +258,8 @@ async def _run_weekly_content_analysis():
 
 async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, Any]) -> Dict[str, int]:
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
-    from api.routes.content_validation import _heuristic_checks
     from shared.database import get_supabase
+    from shared.publishing import finalize_published_piece, heuristic_checks, publish_via_github
 
     stats = {"plan_items_added": 0, "ideas_generated": 0, "drafted": 0, "queued": 0, "published": 0}
     sb = get_supabase()
@@ -430,20 +430,19 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                     sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
                     stats["drafted"] += 1
 
-                    score = _heuristic_checks(piece_data)["score"]
+                    score = heuristic_checks(piece_data)["score"]
                     min_score = int(ap_cfg.get("min_score_for_publish", 70))
                     if auto_pub and score >= min_score:
-                        from api.routes.content_validation import _publish_via_github
-                        gh = await _publish_via_github(piece_data)
+                        gh = await publish_via_github(piece_data)
                         if gh.get("success"):
-                            sb.table("content_pieces").update({
-                                "status": "published",
-                                "published_at": datetime.now(timezone.utc).isoformat(),
-                                "external_url": gh.get("url"),
-                                "target_url": gh.get("url"),
-                                "validation_score": score,
-                            }).eq("id", piece_id).execute()
-                            sb.table("content_plan_items").update({"status": "published"}).eq("content_piece_id", piece_id).execute()
+                            await finalize_published_piece(
+                                sb,
+                                piece_id,
+                                tenant_id=tenant_id,
+                                url=gh.get("url"),
+                                score=score,
+                                plan_item_id=item["id"],
+                            )
                             stats["published"] += 1
                             continue
 

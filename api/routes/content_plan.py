@@ -1261,18 +1261,24 @@ async def process_due_scheduled_items() -> Dict[str, int]:
                 continue
             piece = piece_rows[0]
 
-            from api.routes.content_validation import _publish_via_github
-            gh = await _publish_via_github(piece)
+            from shared.publishing import (
+                finalize_published_piece,
+                heuristic_checks,
+                publish_via_github,
+            )
+            gh = await publish_via_github(piece)
             if gh.get("success"):
-                sb.table("content_pieces").update({
-                    "status": "published",
-                    "published_at": now_iso,
-                    "external_url": gh.get("url"),
-                    "target_url": gh.get("url"),
-                }).eq("id", piece_id).execute()
-                sb.table("content_plan_items").update({"status": "published"}).eq(
-                    "id", item["id"]
-                ).execute()
+                score = piece.get("validation_score")
+                if score is None:
+                    score = heuristic_checks(piece)["score"]
+                await finalize_published_piece(
+                    sb,
+                    piece_id,
+                    tenant_id=tenant_id,
+                    url=gh.get("url"),
+                    score=score,
+                    plan_item_id=item["id"],
+                )
                 stats["published"] += 1
         except Exception as e:
             logger.warning(

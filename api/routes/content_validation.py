@@ -15,7 +15,6 @@ disabled until the score crosses the threshold.
 """
 
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -24,74 +23,15 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.publishing import (
+    finalize_published_piece,
+    heuristic_checks,
+    publish_via_github,
+)
 from shared.tenant import get_tenant_config
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-# ── Heuristic checks ────────────────────────────────────────────────────────
-
-def _heuristic_checks(piece: Dict[str, Any]) -> Dict[str, Any]:
-    body = piece.get("content") or piece.get("body") or ""
-    title = piece.get("title") or ""
-    keyword = (piece.get("target_keyword") or "").lower()
-
-    word_count = len([w for w in re.split(r"\s+", body) if w])
-    headings = len(re.findall(r"^#{1,3}\s", body, flags=re.MULTILINE))
-    has_meta = bool(piece.get("meta_title")) and bool(piece.get("meta_description"))
-    keyword_in_title = bool(keyword and keyword in title.lower())
-    keyword_in_body = bool(keyword and keyword in body.lower())
-    paragraphs = len([p for p in body.split("\n\n") if p.strip()])
-
-    notes: List[str] = []
-    score = 0
-
-    if word_count >= 600:
-        score += 25
-    elif word_count >= 300:
-        score += 12
-        notes.append("Body is short — aim for at least 600 words for blog posts.")
-    else:
-        notes.append("Body is very short.")
-
-    if headings >= 2:
-        score += 15
-    else:
-        notes.append("Add at least two H2/H3 headings for scannability.")
-
-    if has_meta:
-        score += 15
-    else:
-        notes.append("Missing meta_title or meta_description.")
-
-    if keyword:
-        if keyword_in_title:
-            score += 15
-        else:
-            notes.append("Target keyword is not in the title.")
-        if keyword_in_body:
-            score += 10
-        else:
-            notes.append("Target keyword does not appear in the body.")
-    else:
-        notes.append("No target_keyword set.")
-
-    if paragraphs >= 4:
-        score += 10
-    else:
-        notes.append("Break the content into more paragraphs.")
-
-    score = max(0, min(score, 100))
-    return {
-        "score": score,
-        "word_count": word_count,
-        "headings": headings,
-        "has_meta": has_meta,
-        "keyword_in_title": keyword_in_title,
-        "keyword_in_body": keyword_in_body,
-        "notes": notes,
-    }
 
 
 # ── /pieces/{id}/validate ───────────────────────────────────────────────────
@@ -123,7 +63,7 @@ async def validate_piece(piece_id: str, request: Request):
     if not piece:
         raise HTTPException(status_code=404, detail="Piece not found")
 
-    details = _heuristic_checks(piece)
+    details = heuristic_checks(piece)
     score = details["score"]
 
     try:
@@ -146,10 +86,6 @@ async def validate_piece(piece_id: str, request: Request):
 class PublishPayload(BaseModel):
     force: bool = False  # Skip the score gate
     via: Optional[str] = None  # "cms" | "github" — default: prefer CMS, fall back to GitHub
-
-
-def _slugify(text: str) -> str:
-    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (text or "").lower())).strip("-")
 
 
 async def _push_to_cms(cms_api_url: str, cms_api_key: str, piece: Dict[str, Any]) -> Optional[str]:
@@ -177,57 +113,6 @@ async def _push_to_cms(cms_api_url: str, cms_api_key: str, piece: Dict[str, Any]
     except Exception as e:
         logger.warning(f"CMS push exception: {e}")
     return None
-
-
-async def _publish_via_github(piece: Dict[str, Any]) -> Dict[str, Any]:
-    """Raise a GitHub PR with the article. Returns dict with success + pr_url + url."""
-    title = piece.get("title") or "Untitled"
-    content = piece.get("content") or ""
-    keyword = piece.get("target_keyword") or ""
-    meta_description = piece.get("meta_description") or ""
-    ctype = piece.get("content_type") or "blog_article"
-
-    if ctype == "comparison":
-        from shared.github_helper import create_comparison_page_pr
-        m = re.search(r"vs\s+([A-Za-z0-9_\- ]+)", title)
-        competitor = (m.group(1).strip().lower().split()[0] if m else (keyword or "competitor"))
-        result = await create_comparison_page_pr(competitor=competitor, content=content)
-        url = f"https://successifier.com/vs/{competitor.replace(' ', '-')}"
-    else:
-        from shared.github_helper import create_blog_post_pr
-        slug = _slugify(title)
-        result = await create_blog_post_pr(
-            title=title,
-            content=content,
-            slug=slug,
-            excerpt=meta_description[:160],
-            keywords=[keyword] if keyword else [],
-            meta_description=meta_description,
-            author="SAMA Content Agent",
-        )
-        url = f"https://successifier.com/blog/{slug}"
-
-    if result.get("success"):
-        result["url"] = url
-    return result
-
-
-async def _post_publish_sync(sb, piece_id: str) -> None:
-    """Mark linked plan_item + pending_approvals row as published, fire event."""
-    try:
-        sb.table("content_plan_items").update({"status": "published"}).eq(
-            "content_piece_id", piece_id
-        ).execute()
-    except Exception as e:
-        logger.debug(f"Failed to update plan_item status: {e}")
-
-    try:
-        sb.table("pending_approvals").update({
-            "status": "published",
-            "published_at": datetime.now(timezone.utc).isoformat(),
-        }).contains("metadata", {"piece_id": piece_id}).execute()
-    except Exception as e:
-        logger.debug(f"Failed to update pending_approvals: {e}")
 
 
 @router.post("/pieces/{piece_id}/publish")
@@ -270,7 +155,7 @@ async def publish_piece(piece_id: str, payload: PublishPayload, request: Request
     min_score = int((cfg.get_raw("auto_publish_min_score", 70) if cfg else 70) or 70)
     score = piece.get("validation_score")
     if score is None:
-        details = _heuristic_checks(piece)
+        details = heuristic_checks(piece)
         score = details["score"]
 
     if not payload.force and score < min_score:
@@ -289,7 +174,7 @@ async def publish_piece(piece_id: str, payload: PublishPayload, request: Request
     if via == "cms" and cms_url:
         external_url = await _push_to_cms(cms_url, cfg.cms_api_key if cfg else "", piece)
     else:
-        github_result = await _publish_via_github(piece)
+        github_result = await publish_via_github(piece)
         if not github_result.get("success"):
             raise HTTPException(
                 status_code=502,
@@ -298,16 +183,9 @@ async def publish_piece(piece_id: str, payload: PublishPayload, request: Request
         external_url = github_result.get("url")
         pr_url = github_result.get("pr_url")
 
-    update = {
-        "status": "published",
-        "published_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if external_url:
-        update["external_url"] = external_url
-        update["target_url"] = external_url
-
-    sb.table("content_pieces").update(update).eq("id", piece_id).execute()
-    await _post_publish_sync(sb, piece_id)
+    await finalize_published_piece(
+        sb, piece_id, tenant_id=tenant_id, url=external_url, score=score
+    )
 
     # Promote on social channels.
     try:
@@ -363,7 +241,7 @@ async def auto_publish(request: Request):
     published = 0
     skipped = 0
     for piece in drafts:
-        details = _heuristic_checks(piece)
+        details = heuristic_checks(piece)
         score = details["score"]
         if score < min_score:
             sb.table("content_pieces").update(
@@ -377,17 +255,17 @@ async def auto_publish(request: Request):
             continue
 
         external_url = await _push_to_cms(cfg.cms_api_url, cfg.cms_api_key, piece)
-        update = {
-            "status": "published",
-            "published_at": datetime.now(timezone.utc).isoformat(),
-            "validation_score": score,
-            "validation_notes": details["notes"],
-            "validated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if external_url:
-            update["external_url"] = external_url
-        sb.table("content_pieces").update(update).eq("id", piece["id"]).execute()
-        await _post_publish_sync(sb, piece["id"])
+        await finalize_published_piece(
+            sb,
+            piece["id"],
+            tenant_id=tenant_id,
+            url=external_url,
+            score=score,
+            extra_fields={
+                "validation_notes": details["notes"],
+                "validated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         published += 1
 
     return {"published": published, "skipped": skipped, "min_score": min_score}
