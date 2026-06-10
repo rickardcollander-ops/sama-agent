@@ -182,8 +182,9 @@ async def get_content_piece(piece_id: str, request: Request):
 # ── Update ───────────────────────────────────────────────────────────────────
 
 @router.patch("/pieces/{piece_id}")
-async def update_content_piece(piece_id: str, payload: ContentPieceUpdate):
-    """Update an existing content piece."""
+async def update_content_piece(piece_id: str, payload: ContentPieceUpdate, request: Request):
+    """Update an existing content piece (tenant-scoped)."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
@@ -195,10 +196,18 @@ async def update_content_piece(piece_id: str, payload: ContentPieceUpdate):
         # follow-up never fires.
         if update_data.get("status") == "published" and not update_data.get("published_at"):
             update_data["published_at"] = datetime.now(timezone.utc).isoformat()
-        result = sb.table("content_pieces").update(update_data).eq("id", piece_id).execute()
+        result = (
+            sb.table("content_pieces")
+            .update(update_data)
+            .eq("id", piece_id)
+            .eq("tenant_id", tenant_id)
+            .execute()
+        )
         if result.data:
             return {"success": True, "piece": _ensure_numeric(result.data[0])}
-        return {"success": True, "message": "Updated"}
+        # No row matched: the piece doesn't exist or belongs to another tenant.
+        # Don't report success — callers would silently believe state was saved.
+        return {"success": False, "error": "not_found"}
     except Exception as e:
         logger.error(f"update_content_piece error: {e}")
         return {"success": False, "error": str(e)}
