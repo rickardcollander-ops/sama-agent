@@ -736,6 +736,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
     import json as _json
     import anthropic
     from shared.config import settings as _settings
+    from shared.llm import call_claude
 
     today_str = date.today().isoformat()
     written = 0
@@ -797,9 +798,11 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
                         continue
 
                 # Write a fresh article with Claude
-                msg = client.messages.create(
+                msg = await call_claude(
+                    client=client,
                     model=_settings.CLAUDE_MODEL,
                     max_tokens=8000,
+                    tenant_id=tenant_id,
                     system=(
                         "You are a senior content writer. Write a high-quality SEO blog post. "
                         "1500-2500 words, Markdown only (no HTML). Use ## for H2, ### for H3. "
@@ -870,9 +873,11 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
         used_kws = {(r.get("target_keyword") or "").strip().lower() for r in (kw_res.data or [])}
 
         client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
-        msg = client.messages.create(
+        msg = await call_claude(
+            client=client,
             model=_settings.CLAUDE_MODEL,
             max_tokens=300,
+            tenant_id=tenant_id,
             messages=[{"role": "user", "content": (
                 f"Brand: {brand_name}\nDescription: {brand_desc}\n"
                 f"Audience: {target_audience}\nLanguage: {content_language}\n"

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from shared.database import get_supabase
 from shared.config import settings
+from shared.llm import call_claude
 
 logger = logging.getLogger(__name__)
 
@@ -1336,12 +1337,14 @@ Regler:
             reply = ""
 
             for _ in range(5):  # max 5 tool-call rounds — keeps token cost bounded
-                response = client.messages.create(
+                response = await call_claude(
+                    client=client,
                     model=settings.CLAUDE_MODEL,
                     max_tokens=2000,
                     system=system,
                     messages=loop_messages,
-                    tools=FORGE_TOOLS,
+                    tenant_id="default",
+                    extra_kwargs={"tools": FORGE_TOOLS},
                 )
 
                 if response.stop_reason == "tool_use":
@@ -1383,11 +1386,13 @@ Regler:
         else:
             # ── Single call for all other agents ─────────────────────────────
             tool_calls_log = []
-            response = client.messages.create(
+            response = await call_claude(
+                client=client,
                 model=settings.CLAUDE_MODEL,
                 max_tokens=800,
                 system=system,
                 messages=messages,
+                tenant_id="default",
             )
             reply = response.content[0].text
 
@@ -1459,10 +1464,12 @@ Svara BARA med JSON-arrayen, inget annat."""
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        response = client.messages.create(
+        response = await call_claude(
+            client=client,
             model="claude-haiku-4-5-20251001",  # Fast model for routing
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id="default",
         )
         text = response.content[0].text.strip()
         start = text.find("[")

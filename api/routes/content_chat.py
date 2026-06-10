@@ -7,6 +7,7 @@ from fastapi import APIRouter, Body, HTTPException
 from typing import Dict, Any
 from agents.content import content_agent
 from shared.chat_db import save_message, get_chat_history
+from shared.llm import call_claude
 import logging
 
 router = APIRouter()
@@ -62,9 +63,11 @@ async def chat_with_content_agent(request: Dict[str, Any] = Body(...)):
             content_summary += f"- {cp.get('title', 'Untitled')} ({cp.get('status', 'draft')}, {cp.get('type', 'unknown')}, {cp.get('word_count', 0)} words)\n"
         
         # Ask Claude to interpret the user's request
-        interpretation = content_agent.client.messages.create(
+        interpretation = await call_claude(
+            client=content_agent.client,
             model=content_agent.model,
             max_tokens=1024,
+            tenant_id=user_id,
             messages=[{
                 "role": "user",
                 "content": f"""You are the Content Agent for Successifier. A user has sent you this message:
@@ -299,9 +302,11 @@ EXPLANATION: [brief explanation of what you'll do]"""
         
         else:
             # General question - let Claude answer
-            answer = content_agent.client.messages.create(
+            answer = await call_claude(
+                client=content_agent.client,
                 model=content_agent.model,
                 max_tokens=512,
+                tenant_id=user_id,
                 messages=[{
                     "role": "user",
                     "content": f"""You are the Content Agent for Successifier, a customer success platform. Answer this question:

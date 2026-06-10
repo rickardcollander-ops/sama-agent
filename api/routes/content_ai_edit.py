@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.llm import call_claude
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -119,10 +120,12 @@ Return ONLY a JSON object (no markdown fences):
 """
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        message = client.messages.create(
+        message = await call_claude(
+            client=client,
             model=settings.CLAUDE_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
         )
         text = message.content[0].text
         try:
@@ -199,10 +202,12 @@ Return ONLY a JSON object (no markdown fences):
 """
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        message = client.messages.create(
+        message = await call_claude(
+            client=client,
             model=settings.CLAUDE_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
         )
         text = message.content[0].text
         try:

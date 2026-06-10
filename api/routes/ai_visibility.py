@@ -384,12 +384,15 @@ async def test_single(request: Request):
     try:
         from anthropic import Anthropic
         from shared.config import settings
+        from shared.llm import call_claude
         c = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        msg = c.messages.create(
+        msg = await call_claude(
+            client=c,
             model=settings.CLAUDE_MODEL,
             max_tokens=200,
             system="You are ChatGPT. Answer helpfully.",
             messages=[{"role": "user", "content": "What are the best customer success tools?"}],
+            tenant_id=tenant_id,
         )
         response_text = msg.content[0].text
         mentioned = "successifier" in response_text.lower()

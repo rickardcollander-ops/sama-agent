@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from agents.audit_brief import build_audit_brief
 from shared.config import settings
 from shared.database import get_supabase
+from shared.llm import call_claude
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -410,11 +411,13 @@ async def suggest_tech_changes(payload: SuggestRequest, request: Request):
                 max_suggestions=max(1, min(payload.max_suggestions, 10)),
                 repo_hint=repo_hint,
             )
-            message = client.messages.create(
+            message = await call_claude(
+                client=client,
                 model=settings.CLAUDE_MODEL,
                 max_tokens=4096,
                 system=_SUGGEST_SYSTEM,
                 messages=[{"role": "user", "content": user_prompt}],
+                tenant_id=tenant_id,
             )
         else:
             # Degraded path: brand metadata only. Same JSON shape so the
@@ -437,10 +440,12 @@ For each suggestion, return an object with these fields:
 Return ONLY a JSON array (no markdown):
 [ {{ ... }} ]
 """
-            message = client.messages.create(
+            message = await call_claude(
+                client=client,
                 model=settings.CLAUDE_MODEL,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": legacy}],
+                tenant_id=tenant_id,
             )
             allowed_urls = set()
 
@@ -603,10 +608,12 @@ Rules:
 - Prefer a single file. Two files only if strictly necessary.
 - Keep changes small and reviewable.
 """
-                    message = ai.messages.create(
+                    message = await call_claude(
+                        client=ai,
                         model=settings.CLAUDE_MODEL,
                         max_tokens=4096,
                         messages=[{"role": "user", "content": prompt}],
+                        tenant_id=tenant_id,
                     )
                     text = message.content[0].text.strip()
                     if "```" in text:
@@ -807,10 +814,12 @@ Rules:
 - Keep changes minimal and reviewable.
 - If file hint is unknown, use a sensible generic path.
 """
-                message = ai.messages.create(
+                message = await call_claude(
+                    client=ai,
                     model=settings.CLAUDE_MODEL,
                     max_tokens=4096,
                     messages=[{"role": "user", "content": prompt}],
+                    tenant_id=tenant_id,
                 )
                 text = message.content[0].text.strip()
                 if "```" in text:
