@@ -12,11 +12,12 @@ Plans are stored in ``user_settings.settings.plan`` (defaults to ``starter``).
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Dict, Optional
 
-from shared.database import get_supabase
+from shared.database import get_supabase, run_db
 
 logger = logging.getLogger(__name__)
 
@@ -104,23 +105,37 @@ class SubscriptionRequired(Exception):
 
 # ── Plan resolution ──────────────────────────────────────────────────────────
 
+# Short-TTL cache for the per-tenant plan. The plan only changes on
+# upgrade/downgrade (rare), and a stale limit for up to a minute is harmless in
+# either direction — so caching this read keeps it off the hot metered path
+# (check_and_increment runs it on every billable action).
+_plan_cache: Dict[str, "tuple[PlanLimits, float]"] = {}
+_PLAN_CACHE_TTL_S = 60.0
+
+
 async def get_tenant_plan(tenant_id: str) -> PlanLimits:
     if tenant_id == "default":
         return PLANS["enterprise"]
+    cached = _plan_cache.get(tenant_id)
+    now = time.monotonic()
+    if cached and cached[1] > now:
+        return cached[0]
     try:
         sb = get_supabase()
-        res = (
+        res = await run_db(lambda: (
             sb.table("user_settings")
             .select("settings")
             .eq("user_id", tenant_id)
             .single()
             .execute()
-        )
+        ))
         plan_key = (res.data or {}).get("settings", {}).get("plan") or DEFAULT_PLAN
     except Exception as e:
         logger.debug(f"Plan lookup failed for {tenant_id}: {e}; using default")
         plan_key = DEFAULT_PLAN
-    return PLANS.get(plan_key, PLANS[DEFAULT_PLAN])
+    plan = PLANS.get(plan_key, PLANS[DEFAULT_PLAN])
+    _plan_cache[tenant_id] = (plan, now + _PLAN_CACHE_TTL_S)
+    return plan
 
 
 # ── Counter helpers ──────────────────────────────────────────────────────────
@@ -136,7 +151,7 @@ async def get_usage(tenant_id: str, metric: str, month: Optional[str] = None) ->
     month = month or _current_month()
     try:
         sb = get_supabase()
-        res = (
+        res = await run_db(lambda: (
             sb.table("tenant_usage")
             .select("count")
             .eq("tenant_id", tenant_id)
@@ -144,14 +159,23 @@ async def get_usage(tenant_id: str, metric: str, month: Optional[str] = None) ->
             .eq("metric", metric)
             .maybe_single()
             .execute()
-        )
+        ))
         return int((res.data or {}).get("count", 0))
     except Exception:
         return 0
 
 
-async def increment_usage(tenant_id: str, metric: str, by: int = 1) -> int:
-    """Increment the counter and return the new value. Best-effort — never raises."""
+async def increment_usage(
+    tenant_id: str,
+    metric: str,
+    by: int = 1,
+    known_current: Optional[int] = None,
+) -> int:
+    """Increment the counter and return the new value. Best-effort — never raises.
+
+    ``known_current`` lets a caller that already read the current value (e.g.
+    check_and_increment) skip the extra read here, saving a DB round-trip.
+    """
     if metric not in METRICS:
         raise ValueError(f"Unknown metric: {metric}")
     if tenant_id == "default":
@@ -159,9 +183,9 @@ async def increment_usage(tenant_id: str, metric: str, by: int = 1) -> int:
     month = _current_month()
     try:
         sb = get_supabase()
-        current = await get_usage(tenant_id, metric, month)
+        current = known_current if known_current is not None else await get_usage(tenant_id, metric, month)
         new_value = current + by
-        sb.table("tenant_usage").upsert(
+        await run_db(lambda: sb.table("tenant_usage").upsert(
             {
                 "tenant_id": tenant_id,
                 "month": month,
@@ -170,7 +194,7 @@ async def increment_usage(tenant_id: str, metric: str, by: int = 1) -> int:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
             on_conflict="tenant_id,month,metric",
-        ).execute()
+        ).execute())
         return new_value
     except Exception as e:
         logger.warning(f"increment_usage failed ({tenant_id}/{metric}): {e}")
@@ -204,7 +228,8 @@ async def check_and_increment(tenant_id: str, metric: str, by: int = 1) -> int:
     current = await get_usage(tenant_id, metric)
     if current + by > limit:
         raise UsageLimitExceeded(metric, plan.name.lower(), limit, current)
-    return await increment_usage(tenant_id, metric, by=by)
+    # Reuse the count we just read instead of having increment_usage re-read it.
+    return await increment_usage(tenant_id, metric, by=by, known_current=current)
 
 
 async def get_usage_summary(tenant_id: str) -> Dict[str, Dict[str, int]]:
