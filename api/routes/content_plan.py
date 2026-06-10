@@ -31,7 +31,7 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
 from shared.config import settings
-from shared.database import get_supabase
+from shared.database import get_supabase, run_db
 from shared.llm import call_claude
 
 router = APIRouter()
@@ -272,7 +272,7 @@ async def list_plan(
             q = q.eq("status", status)
         if source:
             q = q.eq("source", source)
-        result = q.execute()
+        result = await run_db(lambda: q.execute())
         return {"items": [_row(x) for x in (result.data or [])]}
     except Exception as e:
         logger.error(f"list_plan error: {e}")
@@ -298,7 +298,7 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
     sb = get_supabase()
 
     try:
-        scheduled = (
+        scheduled = await run_db(lambda: (
             sb.table("content_plan_items")
             .select("*")
             .eq("tenant_id", tenant_id)
@@ -306,7 +306,7 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
             .gte("scheduled_for", start)
             .lte("scheduled_for", end)
             .execute()
-        )
+        ))
     except Exception as e:
         logger.error(f"list_plan_for_calendar scheduled error: {e}")
         return {"scheduled": [], "published_pieces": [], "error": str(e)}
@@ -341,7 +341,7 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
             tiers.append(c)
     for attempt_cols in tiers:
         try:
-            pieces_published = _query(attempt_cols)
+            pieces_published = await run_db(lambda c=attempt_cols: _query(c))
             if attempt_cols is _FULL_PIECE_COLUMNS:
                 _EXTERNAL_URL_PRESENT = True
                 _PREMIUM_PIECE_COLUMNS_PRESENT = True
@@ -1187,24 +1187,24 @@ async def get_piece_lineage(piece_id: str, request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        plan_q = (
+        plan_q = await run_db(lambda: (
             sb.table("content_plan_items")
             .select("*")
             .eq("tenant_id", tenant_id)
             .eq("content_piece_id", piece_id)
             .limit(1)
             .execute()
-        )
+        ))
         plan_rows = plan_q.data or []
         plan_item = _row(plan_rows[0]) if plan_rows else None
 
-        piece_q = (
+        piece_q = await run_db(lambda: (
             sb.table("content_pieces")
             .select("status,created_at,target_url,title")
             .eq("id", piece_id)
             .limit(1)
             .execute()
-        )
+        ))
         piece_rows = piece_q.data or []
         piece = piece_rows[0] if piece_rows else None
 
