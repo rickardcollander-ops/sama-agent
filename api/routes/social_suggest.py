@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.llm import call_claude
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -73,10 +74,12 @@ Return ONLY a JSON array (no markdown, no code fences):
   }}
 ]
 """
-        message = client.messages.create(
+        message = await call_claude(
+            client=client,
             model=settings.CLAUDE_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
         )
         text = message.content[0].text.strip()
         try:

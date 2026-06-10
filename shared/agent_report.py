@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 
 from shared.database import get_supabase
 from shared.config import settings
+from shared.llm import call_claude
 
 logger = logging.getLogger(__name__)
 
@@ -171,10 +172,12 @@ Skriv på svenska. Om det inte fanns någon aktivitet, rapportera det och föres
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        response = client.messages.create(
+        response = await call_claude(
+            client=client,
             model=settings.CLAUDE_MODEL,
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
         )
         import json
         text = response.content[0].text

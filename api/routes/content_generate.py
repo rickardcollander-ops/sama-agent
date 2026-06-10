@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.llm import call_claude
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -91,10 +92,12 @@ For blog_article: body should be 800-1200 words in markdown.
 For linkedin_post: body should be 100-200 words, optimized for LinkedIn.
 For email: body should include subject line (in title), and the email body with a clear CTA.
 """
-        message = client.messages.create(
+        message = await call_claude(
+            client=client,
             model=settings.CLAUDE_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
         )
         text = message.content[0].text.strip()
         try:

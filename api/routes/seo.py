@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from agents.seo import seo_agent
+from shared.llm import call_claude
 
 logger = logging.getLogger(__name__)
 from api.routes.seo_chat import router as chat_router
@@ -886,10 +887,12 @@ Focus on:
 - Long-tail keywords with lower competition
 - Keywords the competitors likely target
 """
-        message = client.messages.create(
+        message = await call_claude(
+            client=client,
             model=settings.CLAUDE_MODEL,
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
         )
         text = message.content[0].text.strip()
         try:

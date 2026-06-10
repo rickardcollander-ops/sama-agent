@@ -259,6 +259,7 @@ async def _run_weekly_content_analysis():
 async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, Any]) -> Dict[str, int]:
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
     from shared.database import get_supabase
+    from shared.llm import call_claude
     from shared.publishing import finalize_published_piece, heuristic_checks, publish_via_github
 
     stats = {"plan_items_added": 0, "ideas_generated": 0, "drafted": 0, "queued": 0, "published": 0}
@@ -332,7 +333,17 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
             f"Mix: 60% blog_article, 25% linkedin_post, 15% email.\n"
             'Return ONLY a JSON array of objects {title, topic, content_type, target_keyword, pillar, priority, reason}.'
         )
-        msg = client.messages.create(model=_settings.CLAUDE_MODEL, max_tokens=2048, messages=[{"role": "user", "content": prompt}])
+        # Route through call_claude so the (otherwise blocking) sync SDK call is
+        # offloaded to a thread — without this the worker's whole event loop is
+        # frozen for the full LLM duration, stalling every other scheduled job.
+        # Also adds a wall-clock timeout and the global concurrency cap.
+        msg = await call_claude(
+            client=client,
+            model=_settings.CLAUDE_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+            tenant_id=tenant_id,
+        )
         import json as _json
         text = msg.content[0].text.strip()
         try:
@@ -395,7 +406,13 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                         f"Pillar: {item.get('pillar','')}\nLength: {target_words}.\n"
                         'Return ONLY a JSON object {title, content, meta_title, meta_description, word_count}.'
                     )
-                    m = client.messages.create(model=_settings.CLAUDE_MODEL, max_tokens=4096, messages=[{"role": "user", "content": p}])
+                    m = await call_claude(
+                        client=client,
+                        model=_settings.CLAUDE_MODEL,
+                        max_tokens=4096,
+                        messages=[{"role": "user", "content": p}],
+                        tenant_id=tenant_id,
+                    )
                     raw = m.content[0].text.strip()
                     try:
                         article = _json.loads(raw)
@@ -496,13 +513,26 @@ async def _run_content_autopilot():
 
         logger.info(f"[scheduler] autopilot: {len(tenants)} tenant(s) opted in")
         totals = {"drafted": 0, "queued": 0, "published": 0}
-        for tenant_id, cfg in tenants:
-            try:
-                stats = await _run_content_autopilot_for_tenant(tenant_id, cfg)
-                for k in totals:
-                    totals[k] += stats.get(k, 0)
-            except Exception as e:
-                logger.error(f"[autopilot {tenant_id}] failed: {e}")
+
+        # Run tenants concurrently with a small bound rather than strictly
+        # sequentially. Each tenant does ~5 LLM calls of 30–90s; serial fan-out
+        # turned an N-tenant run into N × several minutes. The per-tenant LLM
+        # pool still caps actual API concurrency, so a Semaphore here just lets
+        # the long awaits overlap.
+        sem = asyncio.Semaphore(4)
+
+        async def _run_one(tenant_id: str, cfg: Dict[str, Any]) -> Dict[str, int]:
+            async with sem:
+                try:
+                    return await _run_content_autopilot_for_tenant(tenant_id, cfg)
+                except Exception as e:
+                    logger.error(f"[autopilot {tenant_id}] failed: {e}")
+                    return {}
+
+        results = await asyncio.gather(*(_run_one(t, c) for t, c in tenants))
+        for stats in results:
+            for k in totals:
+                totals[k] += stats.get(k, 0)
 
         logger.info(f"[scheduler] autopilot done -- drafted {totals['drafted']}, queued {totals['queued']}, published {totals['published']}")
         _record("weekly_content_autopilot", "success")
@@ -706,6 +736,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
     import json as _json
     import anthropic
     from shared.config import settings as _settings
+    from shared.llm import call_claude
 
     today_str = date.today().isoformat()
     written = 0
@@ -767,9 +798,11 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
                         continue
 
                 # Write a fresh article with Claude
-                msg = client.messages.create(
+                msg = await call_claude(
+                    client=client,
                     model=_settings.CLAUDE_MODEL,
                     max_tokens=8000,
+                    tenant_id=tenant_id,
                     system=(
                         "You are a senior content writer. Write a high-quality SEO blog post. "
                         "1500-2500 words, Markdown only (no HTML). Use ## for H2, ### for H3. "
@@ -840,9 +873,11 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
         used_kws = {(r.get("target_keyword") or "").strip().lower() for r in (kw_res.data or [])}
 
         client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
-        msg = client.messages.create(
+        msg = await call_claude(
+            client=client,
             model=_settings.CLAUDE_MODEL,
             max_tokens=300,
+            tenant_id=tenant_id,
             messages=[{"role": "user", "content": (
                 f"Brand: {brand_name}\nDescription: {brand_desc}\n"
                 f"Audience: {target_audience}\nLanguage: {content_language}\n"
