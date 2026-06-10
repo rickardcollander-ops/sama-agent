@@ -11,7 +11,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from shared.config import settings
-from shared.database import get_supabase
+from shared.database import get_supabase, run_db
 from shared.usage import UsageLimitExceeded, SubscriptionRequired, check_and_increment, increment_usage
 
 router = APIRouter()
@@ -87,14 +87,14 @@ async def list_content_pieces(request: Request, limit: int = 100):
 
     try:
         sb = get_supabase()
-        result = (
+        result = await run_db(lambda: (
             sb.table("content_pieces")
             .select("*")
             .eq("tenant_id", tenant_id)
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
-        )
+        ))
         pieces = [_ensure_numeric(r) for r in (result.data or [])]
         return {"pieces": pieces}
     except Exception as e:
@@ -147,7 +147,7 @@ async def create_content_piece(request: Request, payload: ContentPieceCreate):
             "tenant_id": tenant_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        result = sb.table("content_pieces").insert(data).execute()
+        result = await run_db(lambda: sb.table("content_pieces").insert(data).execute())
         return {"success": True, "piece": _ensure_numeric(result.data[0]) if result.data else data}
     except Exception as e:
         logger.error(f"create_content_piece error: {e}")
@@ -162,14 +162,14 @@ async def get_content_piece(piece_id: str, request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = (
+        result = await run_db(lambda: (
             sb.table("content_pieces")
             .select("*")
             .eq("id", piece_id)
             .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
-        )
+        ))
         rows = result.data or []
         if not rows:
             return {"piece": None, "error": "not_found"}
@@ -196,13 +196,13 @@ async def update_content_piece(piece_id: str, payload: ContentPieceUpdate, reque
         # follow-up never fires.
         if update_data.get("status") == "published" and not update_data.get("published_at"):
             update_data["published_at"] = datetime.now(timezone.utc).isoformat()
-        result = (
+        result = await run_db(lambda: (
             sb.table("content_pieces")
             .update(update_data)
             .eq("id", piece_id)
             .eq("tenant_id", tenant_id)
             .execute()
-        )
+        ))
         if result.data:
             return {"success": True, "piece": _ensure_numeric(result.data[0])}
         # No row matched: the piece doesn't exist or belongs to another tenant.
@@ -226,13 +226,13 @@ async def delete_archived_content_pieces(request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        result = (
+        result = await run_db(lambda: (
             sb.table("content_pieces")
             .delete()
             .eq("tenant_id", tenant_id)
             .eq("status", "archived")
             .execute()
-        )
+        ))
         return {"success": True, "deleted": len(result.data or [])}
     except Exception as e:
         logger.error(f"delete_archived_content_pieces error: {e}")
@@ -245,7 +245,7 @@ async def delete_content_piece(piece_id: str, request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     try:
         sb = get_supabase()
-        sb.table("content_pieces").delete().eq("id", piece_id).eq("tenant_id", tenant_id).execute()
+        await run_db(lambda: sb.table("content_pieces").delete().eq("id", piece_id).eq("tenant_id", tenant_id).execute())
         return {"success": True}
     except Exception as e:
         logger.error(f"delete_content_piece error: {e}")

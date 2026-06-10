@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from shared.database import get_supabase
+from shared.database import get_supabase, run_db
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ async def list_approvals(request: Request, status: str = "pending", limit: int =
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
-        result = (
+        result = await run_db(lambda: (
             sb.table("pending_approvals")
             .select("*")
             .eq("tenant_id", tenant_id)
@@ -55,7 +55,7 @@ async def list_approvals(request: Request, status: str = "pending", limit: int =
             .order("created_at", desc=True)
             .limit(min(limit, 100))
             .execute()
-        )
+        ))
         return {"approvals": result.data or []}
     except Exception as e:
         logger.error(f"list_approvals failed: {e}")
@@ -67,14 +67,14 @@ async def get_approval(approval_id: str, request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
-        result = (
+        result = await run_db(lambda: (
             sb.table("pending_approvals")
             .select("*")
             .eq("id", approval_id)
             .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
-        )
+        ))
         rows = result.data or []
         if not rows:
             raise HTTPException(status_code=404, detail="Approval not found")
@@ -100,7 +100,7 @@ async def edit_approval(approval_id: str, payload: ApprovalEdit, request: Reques
         raise HTTPException(status_code=400, detail="nothing to update")
     sb = get_supabase()
     try:
-        sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute()
+        await run_db(lambda: sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute())
         return {"ok": True}
     except Exception as e:
         logger.error(f"edit_approval failed: {e}")
@@ -117,7 +117,7 @@ async def approve(approval_id: str, payload: ApprovalDecision, request: Request)
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "reviewer_note": payload.note,
         }
-        sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute()
+        await run_db(lambda: sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute())
         # The owning agent picks up status='approved' on next cycle and
         # publishes. Future: kick off an async publish task here for instant
         # turnaround instead of waiting on the next scheduled run.
@@ -137,7 +137,7 @@ async def reject(approval_id: str, payload: ApprovalDecision, request: Request):
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "reviewer_note": payload.note,
         }
-        sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute()
+        await run_db(lambda: sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute())
         return {"ok": True, "status": "rejected"}
     except Exception as e:
         logger.error(f"reject failed: {e}")

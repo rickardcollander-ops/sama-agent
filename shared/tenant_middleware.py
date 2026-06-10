@@ -125,24 +125,24 @@ _site_owner_cache: dict[str, tuple[str, float]] = {}
 _SITE_CACHE_TTL_S = 60.0
 
 
-def _site_belongs_to_account(site_id: str, account_id: str) -> bool:
+async def _site_belongs_to_account(site_id: str, account_id: str) -> bool:
     """Cheap, cached check that ``site_id`` belongs to ``account_id``."""
     cached = _site_owner_cache.get(site_id)
     now = time.monotonic()
     if cached and cached[1] > now:
         return cached[0] == account_id
     try:
-        from shared.database import get_supabase  # local import — avoids cycle
+        from shared.database import get_supabase, run_db  # local import — avoids cycle
         sb = get_supabase()
         if not sb:
             return True  # fail-open if DB not configured (e.g. tests)
-        res = (
+        res = await run_db(lambda: (
             sb.table("user_sites")
             .select("user_id")
             .eq("id", site_id)
             .limit(1)
             .execute()
-        )
+        ))
         owner = (res.data[0]["user_id"] if res.data else "")
         _site_owner_cache[site_id] = (owner, now + _SITE_CACHE_TTL_S)
         return owner == account_id
@@ -156,7 +156,7 @@ _member_cache: dict[tuple[str, str], tuple[bool, float]] = {}
 _MEMBER_CACHE_TTL_S = 60.0
 
 
-def _is_account_member(account_id: str, user_id: str) -> bool:
+async def _is_account_member(account_id: str, user_id: str) -> bool:
     """Cached check that ``user_id`` is an active member of ``account_id``.
 
     Used to allow invited team members (JWT sub != account_id) to act on
@@ -169,11 +169,11 @@ def _is_account_member(account_id: str, user_id: str) -> bool:
     if cached and cached[1] > now:
         return cached[0]
     try:
-        from shared.database import get_supabase  # local import — avoids cycle
+        from shared.database import get_supabase, run_db  # local import — avoids cycle
         sb = get_supabase()
         if not sb:
             return False  # fail-closed: no DB = no member access
-        res = (
+        res = await run_db(lambda: (
             sb.table("account_members")
             .select("id")
             .eq("account_id", account_id)
@@ -181,7 +181,7 @@ def _is_account_member(account_id: str, user_id: str) -> bool:
             .eq("status", "active")
             .limit(1)
             .execute()
-        )
+        ))
         is_member = len(res.data) > 0
         _member_cache[key] = (is_member, now + _MEMBER_CACHE_TTL_S)
         return is_member
@@ -261,7 +261,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 # The JWT user is requesting access to a different account.
                 # Allow if they are an active member of that account — this is
                 # the normal case for invited team members (JWT sub=B, account=A).
-                if not _is_account_member(header_account_id, verified_account):
+                if not await _is_account_member(header_account_id, verified_account):
                     logger.warning(
                         "tenant_mismatch account=%s header=%s path=%s",
                         verified_account, header_account_id, path,
@@ -287,7 +287,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
             # If client sent X-Sama-Site-Id, verify the site belongs to the
             # authenticated account before honouring it.
             if header_site_id and _truthy(os.getenv("STRICT_SITE_VALIDATION")):
-                if not _site_belongs_to_account(header_site_id, account_id):
+                if not await _site_belongs_to_account(header_site_id, account_id):
                     logger.warning(
                         "site_mismatch account=%s site=%s path=%s",
                         account_id, header_site_id, path,

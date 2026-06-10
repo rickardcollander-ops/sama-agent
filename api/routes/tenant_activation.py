@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from shared.config import settings
-from shared.database import get_supabase
+from shared.database import get_supabase, run_db
 from shared.usage import UsageLimitExceeded, check_and_increment
 
 router = APIRouter()
@@ -366,17 +366,17 @@ async def _execute_run(
             }
             if error_msg:
                 update["error"] = error_msg
-            sb.table("agent_runs").update(update).eq("id", run_id).execute()
+            await run_db(lambda: sb.table("agent_runs").update(update).eq("id", run_id).execute())
         except Exception:
             logger.warning(f"Could not update agent_runs {run_id}", exc_info=True)
 
     try:
-        sb.table("tenant_agent_config").upsert({
+        await run_db(lambda: sb.table("tenant_agent_config").upsert({
             "tenant_id": tenant_id,
             "agent_name": agent_name,
             "last_run_at": started,
             "schedule": DEFAULT_SCHEDULES.get(agent_name, "daily"),
-        }, on_conflict="tenant_id,agent_name").execute()
+        }, on_conflict="tenant_id,agent_name").execute())
     except Exception:
         pass
 
@@ -422,11 +422,11 @@ async def trigger_agent(agent_name: str, request: Request):
 
     run_id = None
     try:
-        run_result = sb.table("agent_runs").insert({
+        run_result = await run_db(lambda: sb.table("agent_runs").insert({
             "tenant_id": tenant_id,
             "agent_name": agent_name,
             "status": "running",
-        }).execute()
+        }).execute())
         if run_result.data:
             run_id = run_result.data[0]["id"]
     except Exception as e:
@@ -451,14 +451,14 @@ async def get_agent_runs(request: Request, limit: int = 10):
     sb = get_supabase()
 
     try:
-        result = (
+        result = await run_db(lambda: (
             sb.table("agent_runs")
             .select("*")
             .eq("tenant_id", tenant_id)
             .order("started_at", desc=True)
             .limit(limit)
             .execute()
-        )
+        ))
         return {"runs": result.data or []}
     except Exception as e:
         logger.error(f"get_agent_runs error: {e}")
@@ -473,14 +473,14 @@ async def get_agent_run(run_id: str, request: Request):
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
-        result = (
+        result = await run_db(lambda: (
             sb.table("agent_runs")
             .select("*")
             .eq("id", run_id)
             .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
-        )
+        ))
         rows = result.data or []
         if not rows:
             raise HTTPException(status_code=404, detail="Run not found")
