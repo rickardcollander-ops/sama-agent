@@ -260,7 +260,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
     from shared.database import get_supabase
     from shared.llm import call_claude
-    from shared.publishing import finalize_published_piece, heuristic_checks, publish_via_github
+    from shared.publishing import heuristic_checks
 
     stats = {"plan_items_added": 0, "ideas_generated": 0, "drafted": 0, "queued": 0, "published": 0}
     sb = get_supabase()
@@ -434,44 +434,39 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                     piece = (inserted.data or [{}])[0]
                     piece_id = piece.get("id")
                     plan_update = {"status": "draft", "content_piece_id": piece_id}
-                    # Pin the calendar date. Only opt into scheduled auto-publish
-                    # (process_due_scheduled_items ships it unattended on day +N)
-                    # when the user actually enabled auto_publish. With
-                    # auto_publish off — the default for daily/weekly cron — the
-                    # piece is scheduled on the calendar but still needs manual
-                    # approval before it goes live.
-                    auto_pub = bool(ap_cfg.get("auto_publish"))
-                    if target_dt_iso:
-                        plan_update["scheduled_for"] = target_dt_iso
-                        plan_update["auto_publish_on_schedule"] = auto_pub
-                    sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
-                    stats["drafted"] += 1
-
                     score = heuristic_checks(piece_data)["score"]
                     min_score = int(ap_cfg.get("min_score_for_publish", 70))
-                    if auto_pub and score >= min_score:
-                        gh = await publish_via_github(piece_data)
-                        if gh.get("success"):
-                            await finalize_published_piece(
-                                sb,
-                                piece_id,
-                                tenant_id=tenant_id,
-                                url=gh.get("url"),
-                                score=score,
-                                plan_item_id=item["id"],
-                            )
-                            stats["published"] += 1
-                            continue
+                    auto_pub = bool(ap_cfg.get("auto_publish"))
+                    # Fully-automatic mode publishes without review, but only when
+                    # the article clears the quality bar; below it we still route
+                    # to the approval queue so a human can fix or reject it.
+                    auto_approve = auto_pub and score >= min_score
 
-                    # When auto_publish is on, the scheduled date IS the approval
-                    # mechanism — the hourly job publishes it on day +N, so don't
-                    # also queue it for manual review (avoids a confusing double
-                    # state). With auto_publish off the schedule will NOT publish
-                    # it, so it must fall through to the approval queue below.
-                    if target_dt_iso and auto_pub:
+                    # Pin the calendar date when the cron asked for one.
+                    if target_dt_iso:
+                        plan_update["scheduled_for"] = target_dt_iso
+                    plan_update["auto_publish_on_schedule"] = auto_approve
+
+                    if auto_approve:
+                        # Auto-approve the piece and let the frontend publish
+                        # bridge ship it to the tenant's own destination (CMS or
+                        # GitHub) — it ingests pieces whose status is 'approved'
+                        # and whose scheduled_for has arrived. With no pinned date,
+                        # publish promptly.
+                        if not target_dt_iso:
+                            plan_update["scheduled_for"] = datetime.now(timezone.utc).isoformat()
+                        sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
+                        sb.table("content_pieces").update({"status": "approved"}).eq("id", piece_id).execute()
+                        stats["drafted"] += 1
                         stats["scheduled"] = stats.get("scheduled", 0) + 1
                         continue
 
+                    # Review-first mode (or a sub-threshold score): queue for a
+                    # human. Approving in /c/approvals flips the piece to
+                    # 'approved' + scheduled_for=now so the SAME bridge publishes
+                    # it within ~5 min. The backend never publishes directly.
+                    sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
+                    stats["drafted"] += 1
                     sb.table("pending_approvals").insert({
                         "tenant_id": tenant_id,
                         "kind": "content",
