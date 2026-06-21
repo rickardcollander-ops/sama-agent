@@ -86,6 +86,7 @@ def _label_for(tenant_id: str, by_site_id: Dict[str, str], by_user_id: Dict[str,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fix", action="store_true", help="apply repairs (default: report only)")
+    parser.add_argument("--dry-run", action="store_true", help="report only (the default; accepted for clarity)")
     parser.add_argument("--tenant", help="limit to a single tenant_id")
     parser.add_argument("--drafting-stale-hours", type=int, default=6)
     args = parser.parse_args()
@@ -140,7 +141,8 @@ def main() -> int:
     for p in pieces:
         pieces_by_tenant.setdefault(str(p.get("tenant_id")), []).append(p)
 
-    totals = {"sync_published": 0, "reset_drafting": 0}
+    # Candidate counts (always tallied so --dry-run reports what --fix would do).
+    totals = {"stale_published": 0, "stuck_drafting": 0}
 
     for tenant_id in sorted(tenant_ids):
         label = _label_for(tenant_id, by_site_id, by_user_id)
@@ -182,16 +184,24 @@ def main() -> int:
             if ts is None or ts < drafting_cutoff:
                 stuck_drafting.append(r)
 
-        # Past due but not published yet (bridge will handle — report only).
-        past_due_unpublished = []
+        # Past-due rows, split by whether the publish bridge will actually act:
+        #   bridge_due  — linked piece is 'approved' + due → bridge ships next tick
+        #   stale_backlog — past-due idea/draft that will NOT auto-publish (it was
+        #                   scheduled for a date that came and went without action)
+        bridge_due = []
+        stale_backlog = []
         for r in plan:
             sf = _parse_ts(r.get("scheduled_for"))
-            if not sf or sf > now_utc:
+            if not sf or sf > now_utc or r.get("status") == "published":
                 continue
             piece = piece_by_id.get(str(r.get("content_piece_id"))) if r.get("content_piece_id") else None
             piece_st = (piece or {}).get("status")
-            if r.get("status") != "published" and piece_st != "published":
-                past_due_unpublished.append(r)
+            if piece_st == "published":
+                continue
+            if piece_st == "approved":
+                bridge_due.append(r)
+            else:
+                stale_backlog.append(r)
 
         # ── Report ──────────────────────────────────────────────────────────
         log.info("──────────────────────────────────────────────────────────")
@@ -207,10 +217,15 @@ def main() -> int:
             log.info("  ⚠ published pieces with non-published plan row: %d", len(stale_published))
         if stuck_drafting:
             log.info("  ⚠ stuck in 'drafting' > %dh: %d", args.drafting_stale_hours, len(stuck_drafting))
-        if past_due_unpublished:
-            log.info("  · past-due not yet published (bridge will ship): %d", len(past_due_unpublished))
+        if bridge_due:
+            log.info("  · approved & due — bridge ships next tick: %d", len(bridge_due))
+        if stale_backlog:
+            log.info("  · past-due idea/draft (won't auto-publish, needs drafting/approval): %d", len(stale_backlog))
         if orphans:
             log.info("  · plan rows pointing at a missing piece: %d", len(orphans))
+
+        totals["stale_published"] += len(stale_published)
+        totals["stuck_drafting"] += len(stuck_drafting)
 
         # ── Fix ─────────────────────────────────────────────────────────────
         if not args.fix:
@@ -228,22 +243,21 @@ def main() -> int:
                     ).contains("metadata", {"piece_id": pid}).eq("tenant_id", tenant_id).execute()
                 except Exception as e:
                     log.warning("  approval sync failed for piece %s: %s", pid, e)
-            totals["sync_published"] += len(ids)
             log.info("  ✔ synced %d plan item(s) to published", len(ids))
 
         if stuck_drafting:
             ids = [r["id"] for r in stuck_drafting]
             sb.table("content_plan_items").update({"status": "idea"}).in_("id", ids).eq("tenant_id", tenant_id).execute()
-            totals["reset_drafting"] += len(ids)
             log.info("  ✔ reset %d stuck 'drafting' item(s) to 'idea'", len(ids))
 
     log.info("══════════════════════════════════════════════════════════")
-    mode = "FIX" if args.fix else "DRY-RUN (no changes)"
+    verb = "fixed" if args.fix else "to fix"
     log.info(
-        "done [%s]: sites=%d  synced_published=%d  reset_drafting=%d",
-        mode, len(tenant_ids), totals["sync_published"], totals["reset_drafting"],
+        "done [%s]: sites=%d  stale_published(%s)=%d  stuck_drafting(%s)=%d",
+        "FIX" if args.fix else "DRY-RUN (no changes)",
+        len(tenant_ids), verb, totals["stale_published"], verb, totals["stuck_drafting"],
     )
-    if not args.fix:
+    if not args.fix and (totals["stale_published"] or totals["stuck_drafting"]):
         log.info("re-run with --fix to apply the repairs above")
     return 0
 
