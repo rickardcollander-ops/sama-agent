@@ -112,15 +112,45 @@ async def approve(approval_id: str, payload: ApprovalDecision, request: Request)
     tenant_id = getattr(request.state, "tenant_id", "default")
     sb = get_supabase()
     try:
+        # Load the row first so we can hand the linked content piece off to the
+        # publish bridge once it's approved.
+        existing = await run_db(lambda: (
+            sb.table("pending_approvals")
+            .select("kind, metadata")
+            .eq("id", approval_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        ))
+        row = (existing.data or [{}])[0]
+
         update = {
             "status": "approved",
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "reviewer_note": payload.note,
         }
         await run_db(lambda: sb.table("pending_approvals").update(update).eq("id", approval_id).eq("tenant_id", tenant_id).execute())
-        # The owning agent picks up status='approved' on next cycle and
-        # publishes. Future: kick off an async publish task here for instant
-        # turnaround instead of waiting on the next scheduled run.
+
+        # Hand the approved content piece to the frontend publish bridge: flip
+        # the piece to 'approved' and pin its plan item to publish now. The
+        # dashboard's 5-min publish cron ingests pieces whose status is
+        # 'approved' with a due scheduled_for and ships them to the tenant's own
+        # destination (CMS or GitHub) — the single publisher for both modes.
+        # Best-effort: a hiccup here must not fail the approval itself.
+        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        piece_id = (meta or {}).get("piece_id")
+        if row.get("kind") == "content" and piece_id:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            try:
+                await run_db(lambda: sb.table("content_pieces").update(
+                    {"status": "approved"}
+                ).eq("id", piece_id).eq("tenant_id", tenant_id).execute())
+                await run_db(lambda: sb.table("content_plan_items").update(
+                    {"scheduled_for": now_iso, "auto_publish_on_schedule": True}
+                ).eq("content_piece_id", piece_id).eq("tenant_id", tenant_id).execute())
+            except Exception as e:
+                logger.warning(f"approve: publish handoff failed for piece {piece_id}: {e}")
+
         return {"ok": True, "status": "approved"}
     except Exception as e:
         logger.error(f"approve failed: {e}")

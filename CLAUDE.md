@@ -60,10 +60,21 @@ Intent: generate a batch of ideas and draft the best ones for manual review.
 2. If `auto_draft_top_n > 0`: draft the top N scored ideas (async LLM call, 30–90 s)
    - If `scheduled_for_days_ahead` is set: pin the `scheduled_for` date to today + N days
    - Create `content_pieces` rows with `status = "draft"`
-3. If `auto_publish = true` and article score ≥ `min_score_for_publish`: publish directly
-4. Otherwise: insert into `approvals` with `status = "pending"` for manual review
+3. **Mode = fully automatic (`auto_publish = true`) and score ≥ `min_score_for_publish`:**
+   flip the `content_pieces` row to `status = "approved"` and set
+   `auto_publish_on_schedule = true`. **Do not publish here.**
+4. **Otherwise (review-first mode, or score below threshold):** insert into `approvals`
+   with `status = "pending"`. Approving in `/c/approvals` flips the piece to
+   `status = "approved"` and sets `scheduled_for = now`.
 5. Return immediately with `{ run_id, status: "running" }` — work happens async
 
-> **Critical:** `scheduled_for_days_ahead: 2` is the parameter that determines whether
-> the article lands on the correct date in the calendar. If the backend does not read this
-> parameter, that is the single thing that needs to be implemented for the full flow to work.
+> **Publishing is owned by the dashboard, not the backend.** The backend's job ends at
+> generate → draft → schedule/approve. The dashboard's 5-min publish cron
+> (`/api/integrations/cron` → auto-publish bridge) ingests pieces whose `piece_status`
+> is `"approved"` with a due `scheduled_for` and ships them to that tenant's own
+> destination (CMS or GitHub). The old hardcoded-GitHub publish in
+> `process_due_scheduled_items` is disabled to avoid double-publishing.
+
+> **Critical:** `scheduled_for_days_ahead: 2` pins the article to the correct calendar
+> date. A fully-automatic piece auto-publishes on that date; a review-first piece
+> publishes within ~5 min of approval.

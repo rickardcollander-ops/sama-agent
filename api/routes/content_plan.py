@@ -1217,76 +1217,17 @@ async def get_piece_lineage(piece_id: str, request: Request):
 # ── Scheduler hook: process due scheduled items ──────────────────────────────
 
 async def process_due_scheduled_items() -> Dict[str, int]:
-    """Auto-publish previously-approved drafts whose scheduled_for has passed.
+    """Disabled: publishing is owned by the frontend publish bridge.
 
-    Note: ideas (``status='idea'``) are intentionally **not** drafted here.
-    Drafting only happens when the user explicitly approves an idea via
-    POST /plan/{id}/draft. The scheduler's job is the publish step for
-    items that are already drafted and opted-in via
-    ``auto_publish_on_schedule=True``.
+    Historically this published due drafts straight to a hardcoded GitHub repo
+    (``successifier-homepage``). That only worked for a single tenant and raced
+    the dashboard's per-tenant publish cron, which can double-publish the same
+    piece. Publishing now lives entirely in the dashboard
+    (``/api/integrations/cron`` → ``auto-publish-bridge``), which ships each
+    article to that tenant's own destination (CMS or GitHub) and marks the piece
+    published. The backend's job stops at generate → draft → schedule/approve.
+
+    Kept as an inert no-op so the hourly scheduler hook and any callers keep
+    working without re-introducing the double-publish.
     """
-    sb = get_supabase()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    stats = {"drafted": 0, "published": 0, "failed": 0}
-
-    try:
-        result = (
-            sb.table("content_plan_items")
-            .select("*")
-            .lte("scheduled_for", now_iso)
-            .eq("status", "draft")
-            .eq("auto_publish_on_schedule", True)
-            .limit(50)
-            .execute()
-        )
-        due = result.data or []
-    except Exception as e:
-        logger.error(f"process_due_scheduled_items: query failed: {e}")
-        return stats
-
-    for item in due:
-        tenant_id = item.get("tenant_id") or "default"
-        piece_id = item.get("content_piece_id")
-        if not piece_id:
-            # No drafted piece to publish; skip silently.
-            continue
-
-        try:
-            piece_q = (
-                sb.table("content_pieces")
-                .select("*")
-                .eq("id", piece_id)
-                .limit(1)
-                .execute()
-            )
-            piece_rows = piece_q.data or []
-            if not piece_rows:
-                continue
-            piece = piece_rows[0]
-
-            from shared.publishing import (
-                finalize_published_piece,
-                heuristic_checks,
-                publish_via_github,
-            )
-            gh = await publish_via_github(piece)
-            if gh.get("success"):
-                score = piece.get("validation_score")
-                if score is None:
-                    score = heuristic_checks(piece)["score"]
-                await finalize_published_piece(
-                    sb,
-                    piece_id,
-                    tenant_id=tenant_id,
-                    url=gh.get("url"),
-                    score=score,
-                    plan_item_id=item["id"],
-                )
-                stats["published"] += 1
-        except Exception as e:
-            logger.warning(
-                f"scheduled publish for piece {piece_id} (plan_item {item.get('id')}) failed: {e}"
-            )
-            stats["failed"] += 1
-
-    return stats
+    return {"drafted": 0, "published": 0, "failed": 0, "disabled": True}
