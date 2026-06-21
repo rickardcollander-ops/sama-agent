@@ -204,6 +204,29 @@ async def update_content_piece(piece_id: str, payload: ContentPieceUpdate, reque
             .execute()
         ))
         if result.data:
+            # Keep the plan/calendar in sync: when a piece goes live, mirror that
+            # onto its content_plan_items row (otherwise the article stays a
+            # 'draft' on the calendar forever) and any approval that produced it.
+            # Best-effort — a sync hiccup must not fail an already-saved publish.
+            if update_data.get("status") == "published":
+                published_at = update_data.get("published_at") or datetime.now(timezone.utc).isoformat()
+                try:
+                    await run_db(lambda: (
+                        sb.table("content_plan_items")
+                        .update({"status": "published"})
+                        .eq("content_piece_id", piece_id)
+                        .eq("tenant_id", tenant_id)
+                        .execute()
+                    ))
+                    await run_db(lambda: (
+                        sb.table("pending_approvals")
+                        .update({"status": "published", "published_at": published_at})
+                        .contains("metadata", {"piece_id": piece_id})
+                        .eq("tenant_id", tenant_id)
+                        .execute()
+                    ))
+                except Exception as sync_err:
+                    logger.warning(f"update_content_piece: publish sync failed for {piece_id}: {sync_err}")
             return {"success": True, "piece": _ensure_numeric(result.data[0])}
         # No row matched: the piece doesn't exist or belongs to another tenant.
         # Don't report success — callers would silently believe state was saved.
