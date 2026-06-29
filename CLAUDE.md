@@ -78,3 +78,13 @@ Intent: generate a batch of ideas and draft the best ones for manual review.
 > **Critical:** `scheduled_for_days_ahead: 2` pins the article to the correct calendar
 > date. A fully-automatic piece auto-publishes on that date; a review-first piece
 > publishes within ~5 min of approval.
+
+### Ops scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/audit_content_pipeline.py` | Report/repair the idea→draft→publish chain across all tenants. `--fix` syncs stale-published plan rows and resets stuck `drafting`. |
+| `scripts/content_flow_se.py` | Per-tenant reset + refill. `--archive-backlog` archives stale unpublished plan items/pieces (reversible; never touches published rows); `--fill-forward N` gap-fills the next N calendar days via the autopilot pipeline. Dry-run by default; `--apply` to write. Identify the tenant with `--tenant <site_id>` or `--domain successifier.se`. |
+
+Both need the backend env (Supabase service role; `content_flow_se.py --fill-forward`
+also needs `ANTHROPIC_API_KEY`). Content is keyed under `tenant_id = site_id`.
