@@ -306,23 +306,47 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
         except Exception as e:
             logger.warning(f"[autopilot {tenant_id}] gap-fill check failed: {e}")
 
-    try:
-        result = await run_content_analysis_with_ooda(tenant_id=tenant_id)
-        stats["plan_items_added"] = int(result.get("plan_items_added") or 0)
-    except Exception as e:
-        logger.warning(f"[autopilot {tenant_id}] analyze failed: {e}")
+    # The OODA content analysis bulk-generates a large strategic plan — useful
+    # for the weekly batch run, but on a daily gap-fill it floods the plan with
+    # hundreds of low-quality keyword stubs ("Create content for: '…'"). The
+    # daily path only needs to generate one idea and draft it, so skip it there.
+    if ap_cfg.get("source") != "daily_cron":
+        try:
+            result = await run_content_analysis_with_ooda(tenant_id=tenant_id)
+            stats["plan_items_added"] = int(result.get("plan_items_added") or 0)
+        except Exception as e:
+            logger.warning(f"[autopilot {tenant_id}] analyze failed: {e}")
 
     try:
         from shared.config import settings as _settings
         import anthropic
         ideas_count = max(1, min(int(ap_cfg.get("ideas_per_run", 6)), 12))
 
+        # Content is keyed by site_id, so the brand profile lives in user_sites
+        # (per-site), NOT user_settings (per-user). For a secondary site
+        # (site_id != user_id) the old user_settings lookup returned nothing, so
+        # generation ran with an empty brand and drifted to the wrong domain
+        # (e.g. a consultancy got Customer-Success topics). Read the site row
+        # first, then fall back to the owner's user_settings for primary/legacy
+        # sites.
         brand = {}
         try:
-            row = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
-            brand = (row.data or {}).get("settings", {}) if row.data else {}
+            site_row = (
+                sb.table("user_sites").select("user_id,settings").eq("id", tenant_id).single().execute()
+            )
+            site_settings = (site_row.data or {}).get("settings") or {}
+            if site_settings.get("brand_name"):
+                brand = site_settings
+            else:
+                owner_id = (site_row.data or {}).get("user_id") or tenant_id
+                us = sb.table("user_settings").select("settings").eq("user_id", owner_id).single().execute()
+                brand = (us.data or {}).get("settings") or {}
         except Exception:
-            brand = {}
+            try:
+                us = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+                brand = (us.data or {}).get("settings") or {}
+            except Exception:
+                brand = {}
 
         client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
         prompt = (
@@ -398,43 +422,77 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                 try:
                     sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item["id"]).execute()
                     ctype = item.get("content_type") or "blog_article"
-                    target_words = "1500-2200 words" if ctype == "blog_article" else "120-180 words" if ctype == "linkedin_post" else "300-500 words"
-                    p = (
-                        f"Write a {ctype.replace('_',' ')}.\n"
-                        f"Title: {item.get('title','')}\nTopic: {item.get('topic','')}\n"
-                        f"Target keyword: {item.get('target_keyword','')}\n"
-                        f"Pillar: {item.get('pillar','')}\nLength: {target_words}.\n"
-                        'Return ONLY a JSON object {title, content, meta_title, meta_description, word_count}.'
-                    )
-                    m = await call_claude(
-                        client=client,
-                        model=_settings.CLAUDE_MODEL,
-                        max_tokens=4096,
-                        messages=[{"role": "user", "content": p}],
-                        tenant_id=tenant_id,
-                    )
-                    raw = m.content[0].text.strip()
-                    try:
-                        article = _json.loads(raw)
-                    except Exception:
-                        article = _json.loads(raw.split("```")[1].lstrip("json").strip()) if "```" in raw else {"title": item.get("title"), "content": raw}
-
-                    piece_data = {
-                        "tenant_id": tenant_id,
-                        "title": article.get("title") or item.get("title") or "Untitled",
-                        "content": article.get("content") or "",
-                        "content_type": ctype,
-                        "meta_title": article.get("meta_title") or "",
-                        "meta_description": article.get("meta_description") or "",
-                        "target_keyword": item.get("target_keyword") or "",
-                        "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
-                        "status": "draft",
-                    }
+                    # Long-form articles go through the same premium writer the
+                    # manual draft path uses (agents.article_writer): TOC, key
+                    # takeaways, FAQ, imagery, internal/external links, and a
+                    # quality score. The old inline JSON prompt produced weak (or
+                    # empty) drafts and is kept only for short social types.
+                    if ctype == "blog_article":
+                        from agents.article_writer import generate_premium_article
+                        article = await generate_premium_article(
+                            title=item.get("title") or "",
+                            topic=item.get("topic") or "",
+                            primary_keyword=item.get("target_keyword") or "",
+                            pillar=item.get("pillar") or "",
+                            tenant_id=tenant_id,
+                        )
+                        piece_data = {
+                            "tenant_id": tenant_id,
+                            "title": article.get("title") or item.get("title") or "Untitled",
+                            "slug": article.get("slug"),
+                            "content": article.get("content") or "",
+                            "content_type": ctype,
+                            "meta_title": article.get("meta_title") or "",
+                            "meta_description": article.get("meta_description") or "",
+                            "target_keyword": item.get("target_keyword") or "",
+                            "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+                            "featured_image_url": article.get("featured_image_url"),
+                            "featured_image_alt": article.get("featured_image_alt"),
+                            "article_score": article.get("article_score"),
+                            "article_data": article.get("article_data"),
+                            "status": "draft",
+                        }
+                    else:
+                        target_words = "120-180 words" if ctype == "linkedin_post" else "300-500 words"
+                        p = (
+                            f"Write a {ctype.replace('_',' ')}.\n"
+                            f"Title: {item.get('title','')}\nTopic: {item.get('topic','')}\n"
+                            f"Target keyword: {item.get('target_keyword','')}\n"
+                            f"Pillar: {item.get('pillar','')}\nLength: {target_words}.\n"
+                            'Return ONLY a JSON object {title, content, meta_title, meta_description, word_count}.'
+                        )
+                        m = await call_claude(
+                            client=client,
+                            model=_settings.CLAUDE_MODEL,
+                            max_tokens=4096,
+                            messages=[{"role": "user", "content": p}],
+                            tenant_id=tenant_id,
+                        )
+                        raw = m.content[0].text.strip()
+                        try:
+                            article = _json.loads(raw)
+                        except Exception:
+                            article = _json.loads(raw.split("```")[1].lstrip("json").strip()) if "```" in raw else {"title": item.get("title"), "content": raw}
+                        piece_data = {
+                            "tenant_id": tenant_id,
+                            "title": article.get("title") or item.get("title") or "Untitled",
+                            "content": article.get("content") or "",
+                            "content_type": ctype,
+                            "meta_title": article.get("meta_title") or "",
+                            "meta_description": article.get("meta_description") or "",
+                            "target_keyword": item.get("target_keyword") or "",
+                            "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+                            "status": "draft",
+                        }
                     inserted = sb.table("content_pieces").insert(piece_data).execute()
                     piece = (inserted.data or [{}])[0]
                     piece_id = piece.get("id")
                     plan_update = {"status": "draft", "content_piece_id": piece_id}
-                    score = heuristic_checks(piece_data)["score"]
+                    # Prefer the premium writer's own quality score; fall back to
+                    # the lightweight heuristic for short social types.
+                    score = piece_data.get("article_score")
+                    if not isinstance(score, (int, float)):
+                        score = heuristic_checks(piece_data)["score"]
                     min_score = int(ap_cfg.get("min_score_for_publish", 70))
                     auto_pub = bool(ap_cfg.get("auto_publish"))
                     # Fully-automatic mode publishes without review, but only when
