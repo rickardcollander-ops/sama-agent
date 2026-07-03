@@ -24,14 +24,17 @@ Header: X-Sama-Intent: user-action
 
 ### Two cron callers
 
-**Daily cron** — runs every day 06:00 Europe/Stockholm for ALL onboarded users:
+**Daily cron** — runs every day 06:00 Europe/Stockholm for onboarded sites
+with `user_sites.settings.content_autopilot.enabled = true` (opt-in, same
+gate as the weekly cron; sites onboarded < 30 days ago are skipped):
 
 ```json
 {
   "source": "daily_cron",
   "ideas_per_run": 1,
   "auto_draft_top_n": 1,
-  "auto_publish": false,
+  "auto_publish": <site content_autopilot.auto_publish>,
+  "min_score_for_publish": <site setting, default 70>,
   "scheduled_for_days_ahead": 2
 }
 ```
@@ -39,15 +42,16 @@ Header: X-Sama-Intent: user-action
 Intent: generate 1 idea and write the article for the day after tomorrow. This is the core
 rolling flow that keeps the content calendar continuously filled.
 
-**Weekly autopilot** — runs every Monday 07:30 Europe/Stockholm, only for users with
-`user_settings.settings.content_autopilot.enabled = true`:
+**Weekly autopilot** — runs every Monday 07:30 Europe/Stockholm, only for sites
+with `user_sites.settings.content_autopilot.enabled = true`. The payload
+forwards the site's own autopilot settings (defaults shown):
 
 ```json
 {
   "source": "weekly_cron",
   "ideas_per_run": 6,
   "auto_draft_top_n": 3,
-  "auto_publish": false,
+  "auto_publish": <site content_autopilot.auto_publish, default false>,
   "min_score_for_publish": 70
 }
 ```
@@ -62,7 +66,8 @@ Intent: generate a batch of ideas and draft the best ones for manual review.
    - Create `content_pieces` rows with `status = "draft"`
 3. **Mode = fully automatic (`auto_publish = true`) and score ≥ `min_score_for_publish`:**
    flip the `content_pieces` row to `status = "approved"` and set
-   `auto_publish_on_schedule = true`. **Do not publish here.**
+   `auto_publish_on_schedule = true` on the `content_plan_items` row (the
+   calendar row the dashboard bridge reads). **Do not publish here.**
 4. **Otherwise (review-first mode, or score below threshold):** insert into `approvals`
    with `status = "pending"`. Approving in `/c/approvals` flips the piece to
    `status = "approved"` and sets `scheduled_for = now`.
@@ -88,3 +93,21 @@ Intent: generate a batch of ideas and draft the best ones for manual review.
 
 Both need the backend env (Supabase service role; `content_flow_se.py --fill-forward`
 also needs `ANTHROPIC_API_KEY`). Content is keyed under `tenant_id = site_id`.
+
+
+## Service-to-service auth (`SAMA_INTERNAL_TOKEN`)
+
+The tenant middleware only trusts header-based tenant context
+(`X-Sama-Account-Id` / `X-Sama-Site-Id` without a Supabase JWT) from callers
+presenting `X-Sama-Internal-Token: {SAMA_INTERNAL_TOKEN}` — the dashboard
+proxy, its cron routes, and the publish bridge all send it. Configure the
+same value on Railway and Vercel. While the env var is unset the middleware
+runs in a logged migration mode that still trusts bare headers (so existing
+deployments keep working), but every such request is warned about. The token
+also gates the `/api/dev-agent/*` FORGE endpoints (fail closed: without the
+env var they are disabled) and marks OAuth/tenant-sensitive calls as trusted.
+
+Related env flags: `STRICT_SITE_VALIDATION` (site↔account ownership check for
+JWT callers, **on by default**, set `0` to disable), `BACKEND_PAUSED=1`
+(emergency 503 for all `/api/*` traffic), `BREVO_WEBHOOK_SECRET` (shared
+token for the Brevo webhook, sent as `?token=` or `X-Brevo-Token`).

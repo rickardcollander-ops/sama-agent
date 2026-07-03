@@ -2,16 +2,37 @@
 Dev Agent API — system health checks, diagnostics, and FORGE operations
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel
 from typing import Optional, List
+import hmac
 import logging
+import os
 
 from agents.dev_agent import dev_agent
 from shared.database import get_supabase
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+
+
+def _require_ops_auth(
+    x_sama_internal_token: Optional[str] = Header(default=None),
+) -> None:
+    """Operator-only gate for the entire dev-agent router.
+
+    These endpoints run raw SQL migrations and push commits/PRs with the ops
+    GITHUB_TOKEN — they must never be reachable by unauthenticated callers.
+    Fail closed: if SAMA_INTERNAL_TOKEN isn't provisioned, everything here is
+    denied rather than left open.
+    """
+    expected = (os.getenv("SAMA_INTERNAL_TOKEN") or "").strip()
+    if not expected or not x_sama_internal_token:
+        raise HTTPException(status_code=403, detail="Operator token required")
+    if not hmac.compare_digest(x_sama_internal_token.strip(), expected):
+        raise HTTPException(status_code=403, detail="Operator token required")
+
+
+router = APIRouter(dependencies=[Depends(_require_ops_auth)])
 
 
 # ── Health Checks ──────────────────────────────────────────────────────────

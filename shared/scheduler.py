@@ -14,7 +14,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from shared.database import run_db
+
 logger = logging.getLogger(__name__)
+
+# Strong references for fire-and-forget background tasks. asyncio only holds a
+# weak ref to tasks created via create_task; without keeping this set, a task
+# can be garbage-collected mid-run (e.g. during a long LLM call) before it
+# completes. Tasks remove themselves via add_done_callback when finished.
+_background_tasks: set = set()
 
 
 async def _notify_failure(job_id: str, error: str):
@@ -288,7 +296,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                 target_date.year, target_date.month, target_date.day, tzinfo=_STO
             ).astimezone(timezone.utc)
             day_end = day_start + timedelta(days=1)
-            existing = (
+            existing = await run_db(lambda: (
                 sb.table("content_plan_items")
                 .select("id")
                 .eq("tenant_id", tenant_id)
@@ -297,7 +305,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                 .in_("status", ["idea", "drafting", "draft", "scheduled", "published"])
                 .limit(1)
                 .execute()
-            )
+            ))
             if existing.data:
                 logger.info(
                     f"[autopilot {tenant_id}] skip: already scheduled for {target_date.isoformat()}"
@@ -331,19 +339,19 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
         # sites.
         brand = {}
         try:
-            site_row = (
+            site_row = await run_db(lambda: (
                 sb.table("user_sites").select("user_id,settings").eq("id", tenant_id).single().execute()
-            )
+            ))
             site_settings = (site_row.data or {}).get("settings") or {}
             if site_settings.get("brand_name"):
                 brand = site_settings
             else:
                 owner_id = (site_row.data or {}).get("user_id") or tenant_id
-                us = sb.table("user_settings").select("settings").eq("user_id", owner_id).single().execute()
+                us = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", owner_id).single().execute())
                 brand = (us.data or {}).get("settings") or {}
         except Exception:
             try:
-                us = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+                us = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute())
                 brand = (us.data or {}).get("settings") or {}
             except Exception:
                 brand = {}
@@ -375,7 +383,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
         except Exception:
             ideas = _json.loads(text.split("```")[1].lstrip("json").strip()) if "```" in text else []
 
-        existing = sb.table("content_plan_items").select("target_keyword").eq("tenant_id", tenant_id).execute()
+        existing = await run_db(lambda: sb.table("content_plan_items").select("target_keyword").eq("tenant_id", tenant_id).execute())
         existing_kw = {(r.get("target_keyword") or "").strip().lower() for r in (existing.data or [])}
         rows = []
         for raw in ideas if isinstance(ideas, list) else []:
@@ -397,7 +405,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
             })
             existing_kw.add(kw.lower())
         if rows:
-            sb.table("content_plan_items").insert(rows).execute()
+            await run_db(lambda: sb.table("content_plan_items").insert(rows).execute())
         stats["ideas_generated"] = len(rows)
     except Exception as e:
         logger.warning(f"[autopilot {tenant_id}] generate failed: {e}")
@@ -405,14 +413,14 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
     top_n = max(0, min(int(ap_cfg.get("auto_draft_top_n", 3)), 6))
     if top_n > 0:
         try:
-            ideas_q = (
+            ideas_q = await run_db(lambda: (
                 sb.table("content_plan_items")
                 .select("*")
                 .eq("tenant_id", tenant_id)
                 .eq("status", "idea")
                 .limit(50)
                 .execute()
-            )
+            ))
             ideas = ideas_q.data or []
             order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
             ideas.sort(key=lambda x: order.get((x.get("priority") or "medium").lower(), 3))
@@ -420,7 +428,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
 
             for item in picked:
                 try:
-                    sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item["id"]).execute()
+                    await run_db(lambda: sb.table("content_plan_items").update({"status": "drafting"}).eq("id", item["id"]).execute())
                     ctype = item.get("content_type") or "blog_article"
                     # Long-form articles go through the same premium writer the
                     # manual draft path uses (agents.article_writer): TOC, key
@@ -484,7 +492,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
                             "status": "draft",
                         }
-                    inserted = sb.table("content_pieces").insert(piece_data).execute()
+                    inserted = await run_db(lambda: sb.table("content_pieces").insert(piece_data).execute())
                     piece = (inserted.data or [{}])[0]
                     piece_id = piece.get("id")
                     plan_update = {"status": "draft", "content_piece_id": piece_id}
@@ -513,8 +521,8 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                         # publish promptly.
                         if not target_dt_iso:
                             plan_update["scheduled_for"] = datetime.now(timezone.utc).isoformat()
-                        sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
-                        sb.table("content_pieces").update({"status": "approved"}).eq("id", piece_id).execute()
+                        await run_db(lambda: sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute())
+                        await run_db(lambda: sb.table("content_pieces").update({"status": "approved"}).eq("id", piece_id).execute())
                         stats["drafted"] += 1
                         stats["scheduled"] = stats.get("scheduled", 0) + 1
                         continue
@@ -523,9 +531,9 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                     # human. Approving in /c/approvals flips the piece to
                     # 'approved' + scheduled_for=now so the SAME bridge publishes
                     # it within ~5 min. The backend never publishes directly.
-                    sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute()
+                    await run_db(lambda: sb.table("content_plan_items").update(plan_update).eq("id", item["id"]).execute())
                     stats["drafted"] += 1
-                    sb.table("pending_approvals").insert({
+                    await run_db(lambda: sb.table("pending_approvals").insert({
                         "tenant_id": tenant_id,
                         "kind": "content",
                         "channel": ctype,
@@ -534,11 +542,11 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                         "body": piece_data["content"][:8000],
                         "metadata": {"piece_id": piece_id, "score": score, "min_score": min_score},
                         "status": "pending",
-                    }).execute()
+                    }).execute())
                     stats["queued"] += 1
                 except Exception as e:
                     logger.warning(f"[autopilot {tenant_id}] draft failed for {item.get('id')}: {e}")
-                    sb.table("content_plan_items").update({"status": "idea"}).eq("id", item["id"]).execute()
+                    await run_db(lambda: sb.table("content_plan_items").update({"status": "idea"}).eq("id", item["id"]).execute())
         except Exception as e:
             logger.warning(f"[autopilot {tenant_id}] draft phase failed: {e}")
 
@@ -552,7 +560,7 @@ async def _run_content_autopilot():
     try:
         from shared.database import get_supabase
         sb = get_supabase()
-        rows = sb.table("user_settings").select("user_id,settings").execute()
+        rows = await run_db(lambda: sb.table("user_settings").select("user_id,settings").execute())
         tenants = []
         for row in (rows.data or []):
             cfg = (row.get("settings") or {}).get("content_autopilot") or {}
@@ -664,16 +672,16 @@ async def _run_daily_digest():
         from datetime import datetime, timedelta
         today = (datetime.utcnow() - timedelta(hours=24)).isoformat()
 
-        executed = sb.table("agent_actions") \
-            .select("id", count="exact") \
-            .in_("status", ["completed", "auto_executed"]) \
-            .gte("executed_at", today) \
-            .limit(0).execute()
+        executed = await run_db(lambda: sb.table("agent_actions")
+            .select("id", count="exact")
+            .in_("status", ["completed", "auto_executed"])
+            .gte("executed_at", today)
+            .limit(0).execute())
 
-        pending = sb.table("agent_actions") \
-            .select("id", count="exact") \
-            .eq("status", "pending") \
-            .limit(0).execute()
+        pending = await run_db(lambda: sb.table("agent_actions")
+            .select("id", count="exact")
+            .eq("status", "pending")
+            .limit(0).execute())
 
         summary = {
             "actions_executed": executed.count or 0,
@@ -740,12 +748,12 @@ async def _run_daily_lead_scoring():
         from shared.database import get_supabase
         from shared.lead_scoring import score_lead, check_and_escalate
         sb = get_supabase()
-        leads = sb.table("leads").select("id,score").in_("status", ["new", "contacted"]).limit(200).execute()
+        leads = await run_db(lambda: sb.table("leads").select("id,score").in_("status", ["new", "contacted"]).limit(200).execute())
         updated = 0
         for lead in (leads.data or []):
             new_score = await score_lead(lead["id"])
             if new_score != (lead.get("score") or 0):
-                sb.table("leads").update({"score": new_score}).eq("id", lead["id"]).execute()
+                await run_db(lambda: sb.table("leads").update({"score": new_score}).eq("id", lead["id"]).execute())
                 await check_and_escalate(lead["id"], new_score)
                 updated += 1
         logger.info(f"[scheduler] Lead re-scoring done -- {updated}/{len(leads.data or [])} scores updated")
@@ -797,7 +805,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
 
     brand: dict = {}
     try:
-        row = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+        row = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute())
         brand = (row.data or {}).get("settings", {}) if row.data else {}
     except Exception:
         pass
@@ -808,7 +816,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
     content_language = brand.get("content_language") or "sv"
 
     # Step 1: ensure next 2 upcoming plan items have a written piece
-    upcoming = (
+    upcoming = await run_db(lambda: (
         sb.table("content_plan_items")
         .select("*")
         .eq("tenant_id", tenant_id)
@@ -818,7 +826,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
         .order("scheduled_for", desc=False)
         .limit(2)
         .execute()
-    )
+    ))
     items_to_fill = upcoming.data or []
 
     if items_to_fill:
@@ -832,7 +840,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
 
                 # Prefer linking an existing onboarding draft with matching keyword
                 if keyword:
-                    ex = (
+                    ex = await run_db(lambda: (
                         sb.table("content_pieces")
                         .select("id")
                         .eq("tenant_id", tenant_id)
@@ -842,11 +850,11 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
                         .is_("content_plan_item_id", "null")
                         .limit(1)
                         .execute()
-                    )
+                    ))
                     if ex.data:
-                        sb.table("content_plan_items").update(
+                        await run_db(lambda: sb.table("content_plan_items").update(
                             {"status": "draft", "content_piece_id": ex.data[0]["id"]}
-                        ).eq("id", item["id"]).execute()
+                        ).eq("id", item["id"]).execute())
                         written += 1
                         continue
 
@@ -876,7 +884,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
                 first_para = next(
                     (p for p in body_md.split("\n\n") if len(p.strip()) > 60), ""
                 )
-                inserted = sb.table("content_pieces").insert({
+                inserted = await run_db(lambda: sb.table("content_pieces").insert({
                     "tenant_id": tenant_id,
                     "title": title,
                     "content": body_md,
@@ -887,19 +895,19 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
                     "word_count": word_count,
                     "status": "draft",
                     "source": "daily_refresh",
-                }).execute()
+                }).execute())
                 piece_id = ((inserted.data or [{}])[0]).get("id")
                 if piece_id:
-                    sb.table("content_plan_items").update(
+                    await run_db(lambda: sb.table("content_plan_items").update(
                         {"status": "draft", "content_piece_id": piece_id}
-                    ).eq("id", item["id"]).execute()
+                    ).eq("id", item["id"]).execute())
                 written += 1
             except Exception as e:
                 logger.warning(f"[content_refresh] write failed for item {item.get('id')}: {e}")
 
     # Step 2: add one new calendar suggestion for the day after the last scheduled entry
     try:
-        last_res = (
+        last_res = await run_db(lambda: (
             sb.table("content_plan_items")
             .select("scheduled_for")
             .eq("tenant_id", tenant_id)
@@ -907,7 +915,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
             .order("scheduled_for", desc=True)
             .limit(1)
             .execute()
-        )
+        ))
         last_row = (last_res.data or [{}])[0]
         if not last_row.get("scheduled_for"):
             return written, added
@@ -915,14 +923,14 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
         last_date = date.fromisoformat(last_row["scheduled_for"][:10])
         next_date = last_date + timedelta(days=1)
 
-        kw_res = (
+        kw_res = await run_db(lambda: (
             sb.table("content_plan_items")
             .select("target_keyword")
             .eq("tenant_id", tenant_id)
             .not_.is_("target_keyword", "null")
             .limit(200)
             .execute()
-        )
+        ))
         used_kws = {(r.get("target_keyword") or "").strip().lower() for r in (kw_res.data or [])}
 
         client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
@@ -946,7 +954,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
         except Exception:
             idea = _json.loads(raw.split("```")[1].lstrip("json").strip()) if "```" in raw else {}
 
-        sb.table("content_plan_items").insert({
+        await run_db(lambda: sb.table("content_plan_items").insert({
             "tenant_id": tenant_id,
             "title": str(idea.get("title") or "New content idea")[:300],
             "topic": str(idea.get("topic") or "")[:1000],
@@ -956,7 +964,7 @@ async def _refresh_content_for_tenant(tenant_id: str, sb) -> tuple:
             "status": "idea",
             "source": "daily_refresh",
             "scheduled_for": f"{next_date.isoformat()}T09:00:00.000Z",
-        }).execute()
+        }).execute())
         added = 1
     except Exception as e:
         logger.warning(f"[content_refresh] suggestion failed for tenant={tenant_id}: {e}")
@@ -973,12 +981,12 @@ async def _run_daily_content_refresh():
         sb = get_supabase()
 
         # Collect all tenants that have any content plan items
-        tenants_res = (
+        tenants_res = await run_db(lambda: (
             sb.table("content_plan_items")
             .select("tenant_id")
             .limit(500)
             .execute()
-        )
+        ))
         tenant_ids = list({
             r["tenant_id"] for r in (tenants_res.data or []) if r.get("tenant_id")
         })
@@ -1013,30 +1021,32 @@ async def _run_for_all_tenants(agent_name: str, schedule: str) -> None:
         from api.routes.tenant_activation import _execute_run
 
         sb = get_supabase()
-        rows = (
+        rows = await run_db(lambda: (
             sb.table("tenant_agent_config")
             .select("tenant_id")
             .eq("agent_name", agent_name)
             .eq("schedule", schedule)
             .eq("enabled", True)
             .execute()
-        )
+        ))
         tenants = [r["tenant_id"] for r in (rows.data or []) if r.get("tenant_id")]
         logger.info(f"[scheduler] {job_id}: dispatching to {len(tenants)} tenants")
 
         for tenant_id in tenants:
             run_id = None
             try:
-                ins = sb.table("agent_runs").insert({
+                ins = await run_db(lambda: sb.table("agent_runs").insert({
                     "tenant_id": tenant_id,
                     "agent_name": agent_name,
                     "status": "running",
-                }).execute()
+                }).execute())
                 if ins.data:
                     run_id = ins.data[0]["id"]
             except Exception as e:
                 logger.warning(f"[scheduler] could not record run for {tenant_id}/{agent_name}: {e}")
-            asyncio.create_task(_execute_run(run_id, tenant_id, agent_name))
+            task = asyncio.create_task(_execute_run(run_id, tenant_id, agent_name))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
         _record(job_id, "success")
     except Exception as e:
@@ -1054,21 +1064,21 @@ async def _run_publish_due_social_posts():
 
         sb = get_supabase()
         now_iso = datetime.now(timezone.utc).isoformat()
-        result = (
+        result = await run_db(lambda: (
             sb.table("social_posts")
             .select("*")
             .eq("status", "scheduled")
             .lte("scheduled_for", now_iso)
             .limit(50)
             .execute()
-        )
+        ))
         due = result.data or []
         for post in due:
             try:
                 delivery = await _publish_to_platform(
                     post["platform"], post["content"], post.get("tenant_id", "default")
                 )
-                sb.table("social_posts").update(
+                await run_db(lambda: sb.table("social_posts").update(
                     {
                         "status": "published" if delivery["delivered"] else "published_locally",
                         "published_at": now_iso,
@@ -1077,12 +1087,12 @@ async def _run_publish_due_social_posts():
                             **delivery,
                         },
                     }
-                ).eq("id", post["id"]).execute()
+                ).eq("id", post["id"]).execute())
             except Exception as e:
                 logger.warning(f"Failed to publish post {post.get('id')}: {e}")
-                sb.table("social_posts").update(
+                await run_db(lambda: sb.table("social_posts").update(
                     {"status": "failed", "engagement_data": {"error": str(e)}}
-                ).eq("id", post["id"]).execute()
+                ).eq("id", post["id"]).execute())
         _record(job_id, "ok")
     except Exception as e:
         logger.error(f"[scheduler] {job_id} failed: {e}")
@@ -1146,13 +1156,13 @@ async def _run_reload_email_schedules():
     """
     for kind, (job_id, *_defaults) in _EMAIL_JOBS.items():
         try:
-            row = _read_email_schedule(kind)
+            row = await run_db(lambda: _read_email_schedule(kind))
             cached = _email_schedule_state.get(kind) or {}
             if not row:
                 continue
             if row.get("updated_at") == cached.get("updated_at"):
                 continue
-            new_trigger = _build_email_trigger(kind)
+            new_trigger = await run_db(lambda: _build_email_trigger(kind))
             try:
                 scheduler.reschedule_job(job_id, trigger=new_trigger)
                 logger.info(

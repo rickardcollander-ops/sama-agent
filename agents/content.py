@@ -445,8 +445,9 @@ Format: Plain text, no special formatting.
         logger.info(f"🔍 Optimizing content for: {target_keyword}")
         
         sb = self._get_sb()
-        result = sb.table(CONTENT_PIECES_TABLE).select("*").eq("id", content_id).execute()
-        
+        tenant_id = getattr(self.tenant_config, "tenant_id", "default") if self.tenant_config else "default"
+        result = sb.table(CONTENT_PIECES_TABLE).select("*").eq("id", content_id).eq("tenant_id", tenant_id).execute()
+
         if not result.data:
             raise ValueError(f"Content piece {content_id} not found")
         
@@ -466,7 +467,7 @@ Format: Plain text, no special formatting.
             sb.table(CONTENT_PIECES_TABLE).update({
                 "content": optimized_content,
                 "target_keyword": target_keyword
-            }).eq("id", content_id).execute()
+            }).eq("id", content_id).eq("tenant_id", tenant_id).execute()
             
             logger.info(f"✅ Content optimized for {target_keyword}")
         
@@ -701,12 +702,13 @@ Return ONLY the optimized content in markdown format. Do not include any comment
         logger.info("Analyzing competitor content gaps")
 
         sb = self._get_sb()
+        tenant_id = getattr(self.tenant_config, "tenant_id", "default") if self.tenant_config else "default"
 
         # -- 1. Fetch our existing content --------------------------------- #
         try:
             cp_result = sb.table(CONTENT_PIECES_TABLE).select(
                 "id,title,target_keyword,content_type,word_count,status"
-            ).limit(200).execute()
+            ).eq("tenant_id", tenant_id).limit(200).execute()
             content_pieces = cp_result.data or []
         except Exception as e:
             logger.error(f"Failed to fetch content pieces: {e}")
@@ -720,7 +722,7 @@ Return ONLY the optimized content in markdown format. Do not include any comment
 
         # -- 2. Fetch SEO keywords from GSC data -------------------------- #
         try:
-            kw_result = sb.table(KEYWORDS_TABLE).select("*").execute()
+            kw_result = sb.table(KEYWORDS_TABLE).select("*").eq("tenant_id", tenant_id).execute()
             seo_keywords = kw_result.data or []
         except Exception as e:
             logger.error(f"Failed to fetch SEO keywords: {e}")
@@ -910,10 +912,12 @@ Return ONLY the optimized content in markdown format. Do not include any comment
     ) -> Dict[str, Any]:
         """Save content to Supabase (upsert by title)"""
         sb = self._get_sb()
-        
-        # Check if content with this title already exists
-        existing = sb.table(CONTENT_PIECES_TABLE).select("id").eq("title", title).execute()
-        
+
+        tenant_id = getattr(self.tenant_config, "tenant_id", "default") if self.tenant_config else "default"
+
+        # Check if content with this title already exists (scoped to this tenant)
+        existing = sb.table(CONTENT_PIECES_TABLE).select("id").eq("title", title).eq("tenant_id", tenant_id).execute()
+
         record = {
             "title": title,
             "content": content,
@@ -923,6 +927,7 @@ Return ONLY the optimized content in markdown format. Do not include any comment
             "meta_description": meta_description,
             "word_count": word_count,
             "target_url": target_url,
+            "tenant_id": tenant_id,
         }
         
         if existing.data:

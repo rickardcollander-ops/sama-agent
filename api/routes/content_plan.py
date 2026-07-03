@@ -356,7 +356,7 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
             if not _is_missing_column_error(e):
                 logger.error(f"list_plan_for_calendar pieces error: {e}")
                 return {
-                    "scheduled": _enrich_scheduled(sb, scheduled.data or []),
+                    "scheduled": _enrich_scheduled(sb, scheduled.data or [], tenant_id),
                     "published_pieces": [],
                     "error": str(e),
                 }
@@ -377,18 +377,18 @@ async def list_plan_for_calendar(request: Request, start: str, end: str):
     if pieces_published is None:
         logger.error(f"list_plan_for_calendar pieces error (all tiers failed): {last_err}")
         return {
-            "scheduled": _enrich_scheduled(sb, scheduled.data or []),
+            "scheduled": _enrich_scheduled(sb, scheduled.data or [], tenant_id),
             "published_pieces": [],
             "error": str(last_err) if last_err else "unknown",
         }
 
     return {
-        "scheduled": _enrich_scheduled(sb, scheduled.data or []),
+        "scheduled": _enrich_scheduled(sb, scheduled.data or [], tenant_id),
         "published_pieces": pieces_published.data or [],
     }
 
 
-def _enrich_scheduled(sb, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _enrich_scheduled(sb, rows: List[Dict[str, Any]], tenant_id: str) -> List[Dict[str, Any]]:
     """Add featured_image_url / article_score / slug / piece_status to each
     scheduled row whose content_piece_id resolves to an actual piece.
 
@@ -417,6 +417,7 @@ def _enrich_scheduled(sb, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             sb.table("content_pieces")
             .select(piece_cols)
             .in_("id", piece_ids)
+            .eq("tenant_id", tenant_id)
             .execute()
         )
         pieces_by_id = {str(p["id"]): p for p in (result.data or [])}
@@ -428,6 +429,7 @@ def _enrich_scheduled(sb, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     sb.table("content_pieces")
                     .select("id,status,title")
                     .in_("id", piece_ids)
+                    .eq("tenant_id", tenant_id)
                     .execute()
                 )
                 pieces_by_id = {str(p["id"]): p for p in (result.data or [])}
@@ -1202,6 +1204,7 @@ async def get_piece_lineage(piece_id: str, request: Request):
             sb.table("content_pieces")
             .select("status,created_at,target_url,title")
             .eq("id", piece_id)
+            .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
         ))

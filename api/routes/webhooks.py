@@ -120,7 +120,29 @@ async def brevo_webhook(request: Request):
     """
     Brevo (Sendinblue) webhook handler.
     Tracks email opens, clicks, and unsubscribes.
+
+    Brevo has no HMAC signing, so authenticity is a shared token carried in
+    the webhook URL (?token=...) or an X-Brevo-Token header — configure the
+    same value as BREVO_WEBHOOK_SECRET here and in the Brevo webhook URL.
+    Without it, anyone can forge click/open events and skew lead scoring.
     """
+    import os
+    secret = (os.getenv("BREVO_WEBHOOK_SECRET") or "").strip()
+    if secret:
+        presented = (
+            request.query_params.get("token")
+            or request.headers.get("X-Brevo-Token")
+            or ""
+        ).strip()
+        if not presented or not hmac.compare_digest(presented, secret):
+            raise HTTPException(status_code=401, detail="Invalid webhook token")
+    else:
+        logger.warning(
+            "brevo_webhook accepted without verification — set "
+            "BREVO_WEBHOOK_SECRET (and add ?token=... to the Brevo webhook "
+            "URL) to authenticate these events"
+        )
+
     payload = await request.json()
     event = payload.get("event", "")
     email = payload.get("email", "")

@@ -52,6 +52,7 @@ payload is fixed in middleware and never reaches a route. Writes
 - ``request.state.authenticated`` — True iff a JWT verified successfully.
 """
 
+import hmac
 import logging
 import os
 import time
@@ -114,7 +115,36 @@ _PROTECTED_PREFIXES = (
     "/api/orchestrator/",
     "/api/gtm/",
     "/api/goals/",
+    # Routers mounted after the original allowlist was written. Without these
+    # entries the enforcement block never fires for them, so a caller with no
+    # credentials at all fell through to the legacy "default" tenant.
+    "/api/tenant/",
+    "/api/approvals/",
+    "/api/integrations/",
+    "/api/analysis/",
+    "/api/site-audit/",
+    "/api/tech/",
+    "/api/dev-agent/",
+    "/api/usage/",
+    "/api/email/",
+    "/api/ai-readability/",
 )
+
+
+def _internal_token_ok(request: Request) -> bool:
+    """True when the caller presents the shared service secret.
+
+    Trusted server-to-server callers (the dashboard proxy, Vercel cron routes,
+    the publish bridge) authenticate with ``X-Sama-Internal-Token`` instead of
+    a Supabase JWT. Only then may their tenant headers be honoured verbatim.
+    """
+    expected = (os.getenv("SAMA_INTERNAL_TOKEN") or "").strip()
+    if not expected:
+        return False
+    presented = (request.headers.get("X-Sama-Internal-Token") or "").strip()
+    if not presented:
+        return False
+    return hmac.compare_digest(presented, expected)
 
 
 def _truthy(val: Optional[str]) -> bool:
@@ -221,6 +251,18 @@ def _verify_supabase_jwt(token: str) -> Optional[str]:
 class TenantMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
         path = request.url.path
+
+        # Emergency kill switch (documented in docs/security/THREAT_MODEL.md).
+        # BACKEND_PAUSED=1 halts all data/agent traffic without a redeploy —
+        # health checks and auth/webhook bypass paths stay up.
+        if _truthy(os.getenv("BACKEND_PAUSED")) and path.startswith("/api/") and not any(
+            path.startswith(p) for p in _BYPASS_PREFIXES
+        ):
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Backend paused via BACKEND_PAUSED env var"},
+            )
+
         if any(path.startswith(p) for p in _BYPASS_PREFIXES) or path == "/":
             request.state.tenant_id = DEFAULT_TENANT_ID
             request.state.account_id = None
@@ -255,8 +297,16 @@ class TenantMiddleware(BaseHTTPMiddleware):
         is_protected = any(path.startswith(p) for p in _PROTECTED_PREFIXES)
         allow_anon_fallback = _truthy(os.getenv("ALLOW_ANONYMOUS_TENANT_FALLBACK"))
         require_auth = _truthy(os.getenv("REQUIRE_AUTHENTICATED_TENANT"))
+        is_service_call = _internal_token_ok(request)
+        internal_token_configured = bool((os.getenv("SAMA_INTERNAL_TOKEN") or "").strip())
 
-        if verified_account:
+        if is_service_call:
+            # Trusted server-to-server caller (dashboard proxy / cron / publish
+            # bridge) — it has already validated the end user and resolved the
+            # tenant, so its headers are authoritative.
+            account_id = header_account_id or legacy_tid
+            authenticated = True
+        elif verified_account:
             if header_account_id and header_account_id != verified_account:
                 # The JWT user is requesting access to a different account.
                 # Allow if they are an active member of that account — this is
@@ -285,8 +335,10 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 account_id = verified_account
 
             # If client sent X-Sama-Site-Id, verify the site belongs to the
-            # authenticated account before honouring it.
-            if header_site_id and _truthy(os.getenv("STRICT_SITE_VALIDATION")):
+            # authenticated account before honouring it. On by default — a
+            # JWT-verified user for account B must not be able to select a
+            # site owned by account A. Opt out with STRICT_SITE_VALIDATION=0.
+            if header_site_id and _truthy(os.getenv("STRICT_SITE_VALIDATION", "1")):
                 if not await _site_belongs_to_account(header_site_id, account_id):
                     logger.warning(
                         "site_mismatch account=%s site=%s path=%s",
@@ -315,7 +367,35 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 legacy_tid = None
             elif legacy_tid:
                 logger.info("legacy_header_used tenant=%s path=%s", legacy_tid, path)
-            account_id = header_account_id or legacy_tid
+            if internal_token_configured:
+                # A service secret is provisioned, so every trusted caller can
+                # present it. Anyone else supplying bare X-Sama-* headers with
+                # no JWT is spoofing — ignore the headers instead of trusting
+                # them (previously this was full horizontal privilege
+                # escalation across all tenants).
+                if (header_account_id or header_site_id) and _should_log_legacy_reject(
+                    header_account_id or header_site_id or "?"
+                ):
+                    logger.warning(
+                        "unauthenticated_tenant_headers_ignored account=%s site=%s path=%s",
+                        header_account_id, header_site_id, path,
+                    )
+                header_account_id = None
+                header_site_id = None
+                account_id = legacy_tid
+            else:
+                # Migration mode: no SAMA_INTERNAL_TOKEN configured yet, so we
+                # cannot distinguish our own cron/proxy calls from spoofers.
+                # Keep the historical trust but warn loudly — set the secret on
+                # both the backend and the dashboard to close this hole.
+                if header_account_id and _should_log_legacy_reject(header_account_id):
+                    logger.warning(
+                        "UNVERIFIED tenant headers trusted (no SAMA_INTERNAL_TOKEN "
+                        "configured) account=%s path=%s — set SAMA_INTERNAL_TOKEN "
+                        "on backend + dashboard to enforce service auth",
+                        header_account_id, path,
+                    )
+                account_id = header_account_id or legacy_tid
             authenticated = False
 
         site_id = header_site_id or legacy_tid
