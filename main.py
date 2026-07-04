@@ -13,7 +13,7 @@ import traceback
 from typing import AsyncGenerator
 
 from api.routes import (
-    seo, content, ads, social, reviews, analytics, orchestrator, automation,
+    seo, content, ads, social, reviews, analytics, orchestrator,
     seo_advanced, content_advanced, ads_advanced, reviews_advanced, alerts, improvements,
     ai_visibility, dashboard, social_reddit, gtm, goals, notifications, dev_agent,
     agent_reports, agent_chat, user_settings, leads, webhooks,
@@ -263,7 +263,6 @@ app.include_router(social_reddit.router, prefix="/api/social/reddit", tags=["soc
 app.include_router(reviews.router, prefix="/api/reviews", tags=["reviews"])
 app.include_router(reviews_advanced.router, prefix="/api/reviews", tags=["reviews-advanced"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
-app.include_router(automation.router, prefix="/api/automation", tags=["automation"])
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 app.include_router(improvements.router, prefix="/api", tags=["improvements"])
 app.include_router(ai_visibility.router, prefix="/api/ai-visibility", tags=["ai-visibility"])

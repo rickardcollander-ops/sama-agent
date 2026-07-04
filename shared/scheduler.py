@@ -1100,24 +1100,6 @@ async def _run_publish_due_social_posts():
         await _notify_failure(job_id, str(e))
 
 
-async def _run_due_content_drafts():
-    """Process content_plan_items where scheduled_for <= now()."""
-    job_id = "hourly_due_content_drafts"
-    try:
-        from api.routes.content_plan import process_due_scheduled_items
-        stats = await process_due_scheduled_items()
-        if stats.get("drafted") or stats.get("published") or stats.get("failed"):
-            logger.info(
-                f"[scheduler] due-content-drafts -- drafted {stats.get('drafted',0)}, "
-                f"published {stats.get('published',0)}, failed {stats.get('failed',0)}"
-            )
-        _record(job_id, "success")
-    except Exception as e:
-        logger.error(f"[scheduler] {job_id} failed: {e}")
-        _record(job_id, "error", str(e))
-        await _notify_failure(job_id, str(e))
-
-
 async def _run_social_posts_email():
     """Send social-posts emails 24h after each article publishes.
 
@@ -1199,7 +1181,6 @@ def start():
     # The internal fan-out is kept behind a flag to avoid duplicate generation.
     if os.getenv("ENABLE_INTERNAL_CONTENT_AUTOPILOT", "").lower() in ("1", "true", "yes"):
         scheduler.add_job(_run_content_autopilot, CronTrigger(day_of_week="wed", hour=6, minute=0), id="weekly_content_autopilot", replace_existing=True)
-    scheduler.add_job(_run_due_content_drafts, CronTrigger(minute=0), id="hourly_due_content_drafts", replace_existing=True)
     scheduler.add_job(_run_daily_content_refresh, CronTrigger(hour=7, minute=30), id="daily_content_refresh", replace_existing=True)
 
     # Email jobs — cron pulled from email_schedules so admin can edit it live.

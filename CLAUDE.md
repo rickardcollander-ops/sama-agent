@@ -77,8 +77,9 @@ Intent: generate a batch of ideas and draft the best ones for manual review.
 > generate → draft → schedule/approve. The dashboard's 5-min publish cron
 > (`/api/integrations/cron` → auto-publish bridge) ingests pieces whose `piece_status`
 > is `"approved"` with a due `scheduled_for` and ships them to that tenant's own
-> destination (CMS or GitHub). The old hardcoded-GitHub publish in
-> `process_due_scheduled_items` is disabled to avoid double-publishing.
+> destination (CMS or GitHub). The backend's old hardcoded-GitHub publish
+> (`process_due_scheduled_items`) has been removed entirely to avoid
+> double-publishing.
 
 > **Critical:** `scheduled_for_days_ahead: 2` pins the article to the correct calendar
 > date. A fully-automatic piece auto-publishes on that date; a review-first piece

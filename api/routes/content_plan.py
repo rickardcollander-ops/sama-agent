@@ -1217,20 +1217,3 @@ async def get_piece_lineage(piece_id: str, request: Request):
         return {"plan_item": None, "piece": None, "error": str(e)}
 
 
-# ── Scheduler hook: process due scheduled items ──────────────────────────────
-
-async def process_due_scheduled_items() -> Dict[str, int]:
-    """Disabled: publishing is owned by the frontend publish bridge.
-
-    Historically this published due drafts straight to a hardcoded GitHub repo
-    (``successifier-homepage``). That only worked for a single tenant and raced
-    the dashboard's per-tenant publish cron, which can double-publish the same
-    piece. Publishing now lives entirely in the dashboard
-    (``/api/integrations/cron`` → ``auto-publish-bridge``), which ships each
-    article to that tenant's own destination (CMS or GitHub) and marks the piece
-    published. The backend's job stops at generate → draft → schedule/approve.
-
-    Kept as an inert no-op so the hourly scheduler hook and any callers keep
-    working without re-introducing the double-publish.
-    """
-    return {"drafted": 0, "published": 0, "failed": 0, "disabled": True}

@@ -110,7 +110,6 @@ _PROTECTED_PREFIXES = (
     "/api/alerts/",
     "/api/leads/",
     "/api/notifications/",
-    "/api/automation/",
     "/api/improvements/",
     "/api/orchestrator/",
     "/api/gtm/",
