@@ -64,7 +64,6 @@ ENDPOINT_REGISTRY: List[Dict[str, Any]] = [
     {"method": "GET", "path": "/api/alerts/pending", "name": "alerts_pending"},
 
     # Automation
-    {"method": "GET", "path": "/api/automation/status", "name": "automation_status"},
 
     # Goals
     {"method": "GET", "path": "/api/goals", "name": "goals_list"},

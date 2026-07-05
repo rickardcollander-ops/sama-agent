@@ -19,6 +19,12 @@ from shared.usage import UsageLimitExceeded, check_and_increment
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Strong references for fire-and-forget background tasks. asyncio only holds a
+# weak ref to tasks created via create_task; without keeping this set, a task
+# can be garbage-collected mid-run (e.g. during a long LLM run) before it
+# completes. Tasks remove themselves via add_done_callback when finished.
+_background_tasks: set = set()
+
 ALL_AGENTS = ["seo", "content", "social", "ads", "reviews", "analytics", "geo", "strategy"]
 
 DEFAULT_SCHEDULES = {
@@ -64,7 +70,7 @@ async def activate_tenant(request: Request):
         # 1. Load brand context from user_settings
         brand = {}
         try:
-            data = sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute()
+            data = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute())
             brand = data.data.get("settings", {}) if data.data else {}
         except Exception as e:
             logger.warning(f"Could not load brand settings for {tenant_id}: {e}")
@@ -118,11 +124,11 @@ Focus on:
                 for kw in keywords:
                     if isinstance(kw, str) and kw.strip():
                         try:
-                            sb.table("seo_keywords").insert({
+                            await run_db(lambda: sb.table("seo_keywords").insert({
                                 "keyword": kw.strip(),
                                 "tenant_id": tenant_id,
                                 "source": "ai_activation",
-                            }).execute()
+                            }).execute())
                             keywords_added += 1
                         except Exception:
                             pass  # duplicate or schema issue
@@ -171,13 +177,13 @@ For linkedin_post: body should be 100-200 words, optimized for LinkedIn.
 
             if content_result:
                 try:
-                    sb.table("content_pieces").insert({
+                    await run_db(lambda: sb.table("content_pieces").insert({
                         "tenant_id": tenant_id,
                         "title": content_result.get("title", "LinkedIn Draft"),
                         "body": content_result.get("body", ""),
                         "platform": "linkedin_post",
                         "status": "draft",
-                    }).execute()
+                    }).execute())
                     content_created = 1
                 except Exception as e:
                     logger.error(f"Failed to save content for {tenant_id}: {e}")
@@ -187,12 +193,12 @@ For linkedin_post: body should be 100-200 words, optimized for LinkedIn.
         # 4. Initialize agent configs for this tenant
         for agent_name in ALL_AGENTS:
             try:
-                sb.table("tenant_agent_config").upsert({
+                await run_db(lambda: sb.table("tenant_agent_config").upsert({
                     "tenant_id": tenant_id,
                     "agent_name": agent_name,
                     "enabled": agent_name != "ads",  # ads disabled by default
                     "schedule": DEFAULT_SCHEDULES.get(agent_name, "daily"),
-                }, on_conflict="tenant_id,agent_name").execute()
+                }, on_conflict="tenant_id,agent_name").execute())
             except Exception:
                 pass
 
@@ -218,7 +224,7 @@ async def get_agent_status(request: Request):
 
     agents = []
     try:
-        result = sb.table("tenant_agent_config").select("*").eq("tenant_id", tenant_id).execute()
+        result = await run_db(lambda: sb.table("tenant_agent_config").select("*").eq("tenant_id", tenant_id).execute())
         configs = {row["agent_name"]: row for row in (result.data or [])}
     except Exception:
         configs = {}
@@ -261,12 +267,12 @@ async def toggle_agent(agent_name: str, payload: TogglePayload, request: Request
 
     sb = get_supabase()
     try:
-        sb.table("tenant_agent_config").upsert({
+        await run_db(lambda: sb.table("tenant_agent_config").upsert({
             "tenant_id": tenant_id,
             "agent_name": agent_name,
             "enabled": payload.enabled,
             "schedule": DEFAULT_SCHEDULES.get(agent_name, "daily"),
-        }, on_conflict="tenant_id,agent_name").execute()
+        }, on_conflict="tenant_id,agent_name").execute())
         return {"success": True, "agent": agent_name, "enabled": payload.enabled}
     except Exception as e:
         logger.error(f"toggle_agent error: {e}")
@@ -323,7 +329,7 @@ async def _dispatch_agent_cycle(
     # dashboard cron jobs rely on; the generic agent factory is bypassed for it.
     if agent_name == "content":
         from shared.scheduler import _run_content_autopilot_for_tenant
-        ap_cfg = _resolve_autopilot_cfg(tenant_id, params)
+        ap_cfg = await run_db(lambda: _resolve_autopilot_cfg(tenant_id, params))
         result = await _run_content_autopilot_for_tenant(tenant_id, ap_cfg)
         return json.dumps(result)
 
@@ -432,7 +438,9 @@ async def trigger_agent(agent_name: str, request: Request):
     except Exception as e:
         logger.warning(f"Could not record agent run: {e}")
 
-    asyncio.create_task(_execute_run(run_id, tenant_id, agent_name, params))
+    task = asyncio.create_task(_execute_run(run_id, tenant_id, agent_name, params))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "success": True,
@@ -568,12 +576,12 @@ async def reap_stale_runs() -> int:
     sb = get_supabase()
     now = datetime.now(timezone.utc)
     try:
-        result = (
+        result = await run_db(lambda: (
             sb.table("agent_runs")
             .select("id, agent_name, started_at")
             .eq("status", "running")
             .execute()
-        )
+        ))
         rows = result.data or []
     except Exception as e:
         logger.warning(f"reap_stale_runs query failed: {e}")
@@ -591,11 +599,11 @@ async def reap_stale_runs() -> int:
         if now - started < _stale_after(row.get("agent_name")):
             continue
         try:
-            sb.table("agent_runs").update({
+            await run_db(lambda: sb.table("agent_runs").update({
                 "status": "failed",
                 "completed_at": now.isoformat(),
                 "error": "Run did not complete within timeout",
-            }).eq("id", row["id"]).execute()
+            }).eq("id", row["id"]).execute())
             updated += 1
         except Exception as e:
             logger.warning(f"reap_stale_runs update failed for {row.get('id')}: {e}")
@@ -618,7 +626,7 @@ async def reap_orphaned_runs_on_startup() -> int:
     sb = get_supabase()
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        result = (
+        result = await run_db(lambda: (
             sb.table("agent_runs")
             .update({
                 "status": "failed",
@@ -627,7 +635,7 @@ async def reap_orphaned_runs_on_startup() -> int:
             })
             .eq("status", "running")
             .execute()
-        )
+        ))
         n = len(result.data or [])
         if n:
             logger.warning(f"Reaped {n} orphaned agent_runs on startup")

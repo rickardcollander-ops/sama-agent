@@ -645,36 +645,37 @@ def get_agent_persona(agent_name: str) -> Dict[str, str]:
 
 # ── Domain-Specific Data ────────────────────────────────────────────────────
 
-async def _get_domain_data(agent_name: str) -> str:
+async def _get_domain_data(agent_name: str, tenant_id: str) -> str:
     """Fetch domain-specific data so the agent can reference real numbers."""
     sb = get_supabase()
     parts = []
 
     try:
         if agent_name == "seo":
-            parts.append(await _get_seo_data(sb))
+            parts.append(await _get_seo_data(sb, tenant_id))
         elif agent_name == "content":
-            parts.append(await _get_content_data(sb))
+            parts.append(await _get_content_data(sb, tenant_id))
         elif agent_name == "ads":
-            parts.append(await _get_ads_data(sb))
+            parts.append(await _get_ads_data(sb, tenant_id))
         elif agent_name == "social":
-            parts.append(await _get_social_data(sb))
+            parts.append(await _get_social_data(sb, tenant_id))
         elif agent_name == "reviews":
-            parts.append(await _get_reviews_data(sb))
+            parts.append(await _get_reviews_data(sb, tenant_id))
         elif agent_name == "analytics":
-            parts.append(await _get_analytics_data(sb))
+            parts.append(await _get_analytics_data(sb, tenant_id))
     except Exception as e:
         logger.debug(f"[agent-chat] Domain data fetch failed for {agent_name}: {e}")
 
     return "\n".join(p for p in parts if p)
 
 
-async def _get_seo_data(sb) -> str:
+async def _get_seo_data(sb, tenant_id: str) -> str:
     """SEO: keywords, rankings, audits."""
     lines = []
     try:
         kw = sb.table("seo_keywords") \
             .select("keyword,current_position,current_clicks,current_impressions,current_ctr,position_change") \
+            .eq("tenant_id", tenant_id) \
             .order("current_clicks", desc=True) \
             .limit(15) \
             .execute()
@@ -695,6 +696,7 @@ async def _get_seo_data(sb) -> str:
     try:
         audit = sb.table("seo_audits") \
             .select("audit_date,critical_issues,high_issues,lcp_score,cls_score,inp_score") \
+            .eq("tenant_id", tenant_id) \
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()
@@ -711,12 +713,13 @@ async def _get_seo_data(sb) -> str:
     return "\n\n".join(lines) if lines else ""
 
 
-async def _get_content_data(sb) -> str:
+async def _get_content_data(sb, tenant_id: str) -> str:
     """Content: articles, drafts, performance."""
     lines = []
     try:
         content = sb.table("content_pieces") \
             .select("title,content_type,status,target_keyword,impressions_30d,clicks_30d,created_at") \
+            .eq("tenant_id", tenant_id) \
             .order("created_at", desc=True) \
             .limit(15) \
             .execute()
@@ -734,8 +737,13 @@ async def _get_content_data(sb) -> str:
     return "\n".join(lines) if lines else ""
 
 
-async def _get_ads_data(sb) -> str:
-    """Ads: campaigns, spend, performance."""
+async def _get_ads_data(sb, tenant_id: str) -> str:
+    """Ads: campaigns, spend, performance.
+
+    NOTE: ad_campaigns and daily_metrics have no tenant_id column in
+    migrations/ (grepped — not found), so these two queries are left
+    unfiltered. See report for details.
+    """
     lines = []
     try:
         campaigns = sb.table("ad_campaigns") \
@@ -779,12 +787,17 @@ async def _get_ads_data(sb) -> str:
     return "\n".join(lines) if lines else ""
 
 
-async def _get_social_data(sb) -> str:
-    """Social: drafts, recent posts, engagement."""
+async def _get_social_data(sb, tenant_id: str) -> str:
+    """Social: drafts, recent posts, engagement.
+
+    NOTE: daily_metrics has no tenant_id column in migrations/ (grepped —
+    not found), so that query below is left unfiltered. See report.
+    """
     lines = []
     try:
         posts = sb.table("content_pieces") \
             .select("title,content_type,status,created_at") \
+            .eq("tenant_id", tenant_id) \
             .eq("created_by", "sama_social") \
             .order("created_at", desc=True) \
             .limit(10) \
@@ -817,12 +830,13 @@ async def _get_social_data(sb) -> str:
     return "\n".join(lines) if lines else ""
 
 
-async def _get_reviews_data(sb) -> str:
+async def _get_reviews_data(sb, tenant_id: str) -> str:
     """Reviews: recent reviews, ratings, response status."""
     lines = []
     try:
         reviews = sb.table("reviews") \
             .select("platform,rating,author,title,responded,created_at") \
+            .eq("tenant_id", tenant_id) \
             .order("created_at", desc=True) \
             .limit(15) \
             .execute()
@@ -847,8 +861,12 @@ async def _get_reviews_data(sb) -> str:
     return "\n".join(lines) if lines else ""
 
 
-async def _get_analytics_data(sb) -> str:
-    """Analytics: cross-channel metrics."""
+async def _get_analytics_data(sb, tenant_id: str) -> str:
+    """Analytics: cross-channel metrics.
+
+    NOTE: daily_metrics has no tenant_id column in migrations/ (grepped —
+    not found), so this query below is left unfiltered. See report.
+    """
     lines = []
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -894,17 +912,17 @@ async def _get_analytics_data(sb) -> str:
 
 # ── Agent Context (actions + reports + domain data) ─────────────────────────
 
-async def _get_agent_context(agent_name: str) -> str:
+async def _get_agent_context(agent_name: str, tenant_id: str) -> str:
     """Fetch activity data AND domain-specific data for the agent."""
     if agent_name == "dev":
-        return await _get_forge_context()
+        return await _get_forge_context(tenant_id)
 
     sb = get_supabase()
     since = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
     context_parts = []
 
     # Domain-specific data (the actual dashboard data)
-    domain = await _get_domain_data(agent_name)
+    domain = await _get_domain_data(agent_name, tenant_id)
     if domain:
         context_parts.append(domain)
 
@@ -913,6 +931,7 @@ async def _get_agent_context(agent_name: str) -> str:
         actions = sb.table("agent_actions") \
             .select("action_type,title,status,priority,created_at") \
             .eq("agent_name", agent_name) \
+            .eq("tenant_id", tenant_id) \
             .gte("created_at", since) \
             .order("created_at", desc=True) \
             .limit(15) \
@@ -928,6 +947,7 @@ async def _get_agent_context(agent_name: str) -> str:
         report = sb.table("agent_reports") \
             .select("summary,highlights,problems,improvements,ux_suggestions,created_at") \
             .eq("agent_name", agent_name) \
+            .eq("tenant_id", tenant_id) \
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()
@@ -944,6 +964,7 @@ async def _get_agent_context(agent_name: str) -> str:
         alerts = sb.table("alerts") \
             .select("type,severity,title,message") \
             .eq("agent", agent_name) \
+            .eq("tenant_id", tenant_id) \
             .gte("created_at", since) \
             .order("created_at", desc=True) \
             .limit(5) \
@@ -957,8 +978,8 @@ async def _get_agent_context(agent_name: str) -> str:
     return "\n\n".join(context_parts) if context_parts else "(Ingen aktivitetsdata tillgänglig just nu.)"
 
 
-async def _get_forge_context() -> str:
-    """Build context for FORGE — full system access across all agents."""
+async def _get_forge_context(tenant_id: str) -> str:
+    """Build context for FORGE — full system access across all agents (scoped to one tenant)."""
     sb = get_supabase()
     context_parts = []
     since_72h = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
@@ -975,6 +996,7 @@ async def _get_forge_context() -> str:
             report = sb.table("agent_reports") \
                 .select("summary,problems,improvements,ux_suggestions,created_at") \
                 .eq("agent_name", agent_key) \
+                .eq("tenant_id", tenant_id) \
                 .order("created_at", desc=True) \
                 .limit(1) \
                 .execute()
@@ -1000,6 +1022,7 @@ async def _get_forge_context() -> str:
     try:
         actions = sb.table("agent_actions") \
             .select("agent_name,action_type,title,status,priority,error_message,created_at") \
+            .eq("tenant_id", tenant_id) \
             .gte("created_at", since_72h) \
             .order("created_at", desc=True) \
             .limit(50) \
@@ -1029,6 +1052,8 @@ async def _get_forge_context() -> str:
         pass
 
     # ── 3. OODA-cykler: status per agent ──
+    # NOTE: agent_cycles has no tenant_id column in migrations/ (grepped —
+    # not found), so this query is left unfiltered. See report.
     try:
         cycles = sb.table("agent_cycles") \
             .select("agent_name,status,error_message,created_at,completed_at") \
@@ -1070,6 +1095,7 @@ async def _get_forge_context() -> str:
     try:
         alerts = sb.table("alerts") \
             .select("agent,type,severity,title,message,status,created_at") \
+            .eq("tenant_id", tenant_id) \
             .gte("created_at", since_72h) \
             .order("created_at", desc=True) \
             .limit(15) \
@@ -1087,6 +1113,9 @@ async def _get_forge_context() -> str:
         pass
 
     # ── 5. Health check ──
+    # NOTE: dev_agent_reports has no tenant_id column in migrations/ (grepped
+    # — not found; table isn't created by any tracked migration), so this
+    # query is left unfiltered. See report.
     try:
         health = sb.table("dev_agent_reports") \
             .select("status,health_pct,failed,created_at") \
@@ -1130,7 +1159,7 @@ async def _get_forge_context() -> str:
     # ── 8. All domain data (same data each agent sees) ──
     for domain_agent in MARKETING_AGENTS:
         try:
-            domain = await _get_domain_data(domain_agent)
+            domain = await _get_domain_data(domain_agent, tenant_id)
             if domain:
                 display = AGENT_NAME_MAP.get(domain_agent, domain_agent.upper())
                 context_parts.append(f"── {display} ({domain_agent.upper()}) DATA ──\n{domain}")
@@ -1261,18 +1290,21 @@ async def get_chat_messages(conversation_id: str) -> List[Dict[str, Any]]:
 async def chat_with_agent(
     agent_name: str,
     user_message: str,
+    tenant_id: str,
     conversation_id: Optional[str] = None,
     team_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Send a message to an agent and get a response.
+    tenant_id: the caller's tenant — scopes every data-context query so one
+    tenant's chat never sees another tenant's data.
     team_context: optional string with what other agents said (for team chat).
     """
     if not conversation_id:
         conversation_id = str(uuid4())
 
     persona = get_agent_persona(agent_name)
-    context = await _get_agent_context(agent_name)
+    context = await _get_agent_context(agent_name, tenant_id)
     history = await _get_chat_history(conversation_id)
 
     # Save user message (only if no team_context — the team router saves it)
@@ -1343,7 +1375,7 @@ Regler:
                     max_tokens=2000,
                     system=system,
                     messages=loop_messages,
-                    tenant_id="default",
+                    tenant_id=tenant_id,
                     extra_kwargs={"tools": FORGE_TOOLS},
                 )
 
@@ -1392,7 +1424,7 @@ Regler:
                 max_tokens=800,
                 system=system,
                 messages=messages,
-                tenant_id="default",
+                tenant_id=tenant_id,
             )
             reply = response.content[0].text
 
@@ -1418,7 +1450,7 @@ Regler:
 
 # ── Team Chat (Intelligent Routing) ────────────────────────────────────────
 
-async def _route_message(user_message: str, conversation_history: List[Dict]) -> List[str]:
+async def _route_message(user_message: str, conversation_history: List[Dict], tenant_id: str) -> List[str]:
     """
     Use Claude to decide which 1-3 agents should respond to this message.
     Returns a list of agent keys in order of relevance.
@@ -1469,7 +1501,7 @@ Svara BARA med JSON-arrayen, inget annat."""
             model="claude-haiku-4-5-20251001",  # Fast model for routing
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}],
-            tenant_id="default",
+            tenant_id=tenant_id,
         )
         text = response.content[0].text.strip()
         start = text.find("[")
@@ -1489,6 +1521,7 @@ Svara BARA med JSON-arrayen, inget annat."""
 
 async def chat_with_team(
     user_message: str,
+    tenant_id: str,
     conversation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -1506,7 +1539,7 @@ async def chat_with_team(
     await _save_message(conversation_id, "team", "user", user_message)
 
     # Route to relevant agents
-    relevant_agents = await _route_message(user_message, history)
+    relevant_agents = await _route_message(user_message, history, tenant_id)
     logger.info(f"[agent-chat] Team routing: '{user_message[:50]}...' → {relevant_agents}")
 
     # Each agent responds in sequence, seeing previous agents' replies
@@ -1521,6 +1554,7 @@ async def chat_with_team(
             result = await chat_with_agent(
                 agent_key,
                 user_message,
+                tenant_id,
                 conversation_id=conversation_id,
                 team_context=team_context,
             )
@@ -1548,6 +1582,7 @@ async def chat_with_team(
 
 async def chat_with_all_agents(
     user_message: str,
+    tenant_id: str,
     conversation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Broadcast a message to all agents. Kept for backwards compatibility."""
@@ -1559,7 +1594,7 @@ async def chat_with_all_agents(
     responses = []
     for agent_name in broadcast_agents:
         try:
-            result = await chat_with_agent(agent_name, user_message, f"{conversation_id}_{agent_name}")
+            result = await chat_with_agent(agent_name, user_message, tenant_id, f"{conversation_id}_{agent_name}")
             responses.append(result)
         except Exception as e:
             persona = get_agent_persona(agent_name)

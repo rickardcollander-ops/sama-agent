@@ -3,8 +3,12 @@ Google OAuth Routes
 OAuth2 flows for connecting Google Search Console, Analytics GA4, and Ads.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,6 +23,81 @@ from shared.database import get_supabase
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Signed OAuth state: prevents forged callbacks from binding an attacker's
+# Google tokens to a victim tenant. The signing key falls back to the OAuth
+# client secret, which is always present when this flow is usable at all.
+_STATE_MAX_AGE_S = 3600
+
+
+def _state_key() -> bytes:
+    key = (
+        os.getenv("SAMA_STATE_SECRET")
+        or os.getenv("SAMA_INTERNAL_TOKEN")
+        or settings.GOOGLE_CLIENT_SECRET
+        or ""
+    )
+    return key.encode()
+
+
+def _sign_state(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    body = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    sig = hmac.new(_state_key(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def _verify_state(state: str) -> Optional[dict]:
+    """Return the payload if the signature and age check out, else None."""
+    try:
+        body, sig = state.rsplit(".", 1)
+        expected = hmac.new(_state_key(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        padded = body + "=" * (-len(body) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        ts = payload.get("ts")
+        if not isinstance(ts, (int, float)) or time.time() - ts > _STATE_MAX_AGE_S:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _internal_token_ok(request: Request) -> bool:
+    expected = (os.getenv("SAMA_INTERNAL_TOKEN") or "").strip()
+    if not expected:
+        return False
+    presented = (request.headers.get("X-Sama-Internal-Token") or "").strip()
+    return bool(presented) and hmac.compare_digest(presented, expected)
+
+
+def _resolve_trusted_tenant(request: Request, requested: str) -> str:
+    """Validate the query-string tenant_id against the proxy-verified headers.
+
+    All dashboard calls to these routes arrive via the Next.js proxy, which
+    authenticates the user, resolves their tenant, and attaches the service
+    token plus X-Sama-Site-Id / X-Sama-Account-Id. When that context is
+    present, the query param may only select one of those two values —
+    otherwise any logged-in user could bind or drop Google connections for an
+    arbitrary tenant id. Without a configured service token we keep the
+    legacy trust (migration mode; the tenant middleware logs the same gap).
+    """
+    if not _internal_token_ok(request):
+        return requested
+    site_id = request.headers.get("X-Sama-Site-Id") or ""
+    account_id = request.headers.get("X-Sama-Account-Id") or ""
+    allowed = {v for v in (site_id, account_id) if v}
+    if requested in allowed:
+        return requested
+    fallback = site_id or account_id
+    if not fallback:
+        raise HTTPException(status_code=403, detail="No verified tenant context")
+    logger.warning(
+        "google_oauth tenant override: requested=%s not in verified context, using %s",
+        requested, fallback,
+    )
+    return fallback
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -104,6 +183,7 @@ async def _fetch_google_account_email(access_token: str) -> Optional[str]:
 
 @router.get("/connect")
 async def google_connect(
+    request: Request,
     service: str = Query(..., description="One of: search_console, analytics, ads"),
     tenant_id: str = Query("default"),
     return_url: Optional[str] = Query(None, description="Where to redirect after OAuth completes"),
@@ -116,11 +196,13 @@ async def google_connect(
         raise HTTPException(status_code=500, detail="Google OAuth credentials not configured on server")
 
     safe_return = _safe_return_url(return_url)
+    tenant_id = _resolve_trusted_tenant(request, tenant_id)
 
-    state = json.dumps({
+    state = _sign_state({
         "tenant_id": tenant_id,
         "service": service,
         "return_url": safe_return,
+        "ts": int(time.time()),
     })
 
     params = {
@@ -159,13 +241,14 @@ async def google_callback(
     state_ok = False
 
     if state:
-        try:
-            state_data = json.loads(state)
+        state_data = _verify_state(state)
+        if state_data is not None:
             tenant_id = state_data.get("tenant_id")
             service = state_data.get("service")
             return_url = _safe_return_url(state_data.get("return_url"))
             state_ok = bool(tenant_id and service)
-        except (json.JSONDecodeError, TypeError):
+        else:
+            logger.warning("google_callback: state signature/age check failed")
             state_ok = False
 
     if error:
@@ -250,12 +333,14 @@ async def google_callback(
 
 @router.delete("/disconnect")
 async def google_disconnect(
+    request: Request,
     service: str = Query(..., description="One of: search_console, analytics, ads"),
     tenant_id: str = Query("default"),
 ):
     """Remove stored tokens for a Google service."""
     if service not in VALID_SERVICES:
         raise HTTPException(status_code=400, detail=f"Invalid service '{service}'")
+    tenant_id = _resolve_trusted_tenant(request, tenant_id)
 
     try:
         sb = get_supabase()
@@ -271,12 +356,13 @@ async def google_disconnect(
 # ── Connection status ───────────────────────────────────────────────────────
 
 @router.get("/status")
-async def google_status(tenant_id: str = Query("default")):
+async def google_status(request: Request, tenant_id: str = Query("default")):
     """Return connection status for each Google service.
 
     Includes the connected Google account's email when available so the
     dashboard can show "Connected as alice@example.com — switch account".
     """
+    tenant_id = _resolve_trusted_tenant(request, tenant_id)
     status = {svc: {"connected": False} for svc in VALID_SERVICES}
 
     try:

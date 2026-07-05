@@ -2,7 +2,7 @@
 Agent Chat API — chat with individual agents, team discussions, or broadcast
 """
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 from typing import Optional
 import logging
@@ -42,24 +42,27 @@ async def get_history(conversation_id: str):
 
 
 @router.post("/chat/team")
-async def team_chat(req: ChatRequest):
+async def team_chat(req: ChatRequest, request: Request):
     """
     Intelligent team chat — routes the message to the most relevant 1-3 agents.
     Agents respond in sequence, each seeing what the previous ones said.
     """
-    result = await chat_with_team(req.message, req.conversation_id)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    result = await chat_with_team(req.message, tenant_id, req.conversation_id)
     return result
 
 
 @router.post("/chat/broadcast")
-async def broadcast_message(req: ChatRequest):
+async def broadcast_message(req: ChatRequest, request: Request):
     """Send a message to all agents and collect responses."""
-    result = await chat_with_all_agents(req.message, req.conversation_id)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    result = await chat_with_all_agents(req.message, tenant_id, req.conversation_id)
     return result
 
 
 @router.post("/chat/{agent_name}")
-async def send_chat_message(agent_name: str, req: ChatRequest):
+async def send_chat_message(agent_name: str, req: ChatRequest, request: Request):
     """Send a message to a specific agent."""
-    result = await chat_with_agent(agent_name, req.message, req.conversation_id)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    result = await chat_with_agent(agent_name, req.message, tenant_id, req.conversation_id)
     return result
