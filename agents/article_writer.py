@@ -40,6 +40,12 @@ from .article_images import (
 )
 from .article_score import compute_article_score
 from .brand_voice import BrandVoice, BrandVoiceNotFoundError, TenantBrandVoice
+from shared.language import (
+    language_instruction,
+    language_name,
+    slugify as _slugify_localized,
+    structural_labels,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -79,19 +85,32 @@ intro_md, section body_md, takeaways, FAQ answers, meta_description):
   like an AI wrote it, rewrite it."""
 
 
-def _build_outline_system(voice: Optional[TenantBrandVoice]) -> str:
+def _build_outline_system(
+    voice: Optional[TenantBrandVoice],
+    *,
+    language: str = "en",
+    brand_name: str = "",
+) -> str:
     """Compose the outline system prompt with the tenant's brand voice
     prepended so the article inherits the company's tone instead of a
     generic SEO-writer voice. Falls back to the base prompt only when
     no voice is available.
+
+    The site's language directive goes last so it is the final instruction the
+    model reads. Without it every site got English articles regardless of its
+    ``content_language``.
     """
     if voice is None:
-        return _OUTLINE_SYSTEM_BASE
-    try:
-        voice_prompt = voice.get_system_prompt(content_type="blog")
-    except Exception:
-        return _OUTLINE_SYSTEM_BASE
-    return f"{voice_prompt}\n\n---\n\n{_OUTLINE_SYSTEM_BASE}"
+        parts = [_OUTLINE_SYSTEM_BASE]
+    else:
+        try:
+            parts = [voice.get_system_prompt(content_type="blog", brand_name=brand_name), _OUTLINE_SYSTEM_BASE]
+        except Exception:
+            parts = [_OUTLINE_SYSTEM_BASE]
+    directive = language_instruction(language)
+    if directive:
+        parts.append(directive)
+    return "\n\n---\n\n".join(parts)
 
 
 def _outline_prompt(
@@ -102,10 +121,12 @@ def _outline_prompt(
     pillar: str,
     word_count_target: int,
     inline_image_slots: int,
+    language: str = "en",
 ) -> str:
+    lang_line = f"Output language: {language_name(language)} ({language}). Every string below must be written in it.\n"
     return f"""Plan and write a comprehensive article.
 
-Title (may refine): {title}
+{lang_line}Title (may refine): {title}
 Topic: {topic}
 Primary keyword: {primary_keyword or '(infer from title)'}
 Content pillar: {pillar or '(general)'}
@@ -152,6 +173,9 @@ Requirements:
   - external_link_anchors must point to real, well-known, evergreen sources
     (industry reports, vendor docs, established media). Never invent URLs.
   - Keep tone confident, specific, and free of hype words.
+  - Every string value must be in {language_name(language)}, including the slug
+    source wording, keywords, headings, image queries and FAQ entries. The only
+    exception is external link URLs, which stay as-is.
 """
 
 
@@ -161,9 +185,13 @@ Requirements:
 
 
 def _slugify(text: str) -> str:
-    text = re.sub(r"[^a-z0-9\s-]", "", (text or "").lower()).strip()
-    text = re.sub(r"[\s_-]+", "-", text)
-    return text[:80] or "article"
+    """Slug for an article URL.
+
+    Delegates to the shared transliterating slugifier so Nordic letters survive:
+    the old regex deleted them outright, turning "kundnöjdhet" into "kundnjdhet"
+    in every Swedish site's URLs.
+    """
+    return _slugify_localized(text)
 
 
 def _strip_json_fence(text: str) -> str:
@@ -287,13 +315,14 @@ def _inject_external_links(body_md: str, anchors: List[Dict[str, Any]]) -> tuple
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _render_markdown(outline: Dict[str, Any]) -> str:
+def _render_markdown(outline: Dict[str, Any], language: str = "en") -> str:
     """Assemble the rendered markdown the dashboard will display.
 
     The dashboard ALSO consumes the structured payload (article_data) for
     the right-hand panel, but it renders this markdown body for the
     main article column.
     """
+    labels = structural_labels(language)
     parts: List[str] = []
     title = outline.get("title", "Untitled")
     parts.append(f"# {title}\n")
@@ -305,7 +334,7 @@ def _render_markdown(outline: Dict[str, Any]) -> str:
     # Table of contents
     toc = outline.get("table_of_contents") or []
     if toc:
-        parts.append("## Table of Contents\n")
+        parts.append(f"## {labels['toc']}\n")
         for entry in toc:
             label = entry.get("label", "")
             anchor = entry.get("id") or _slugify(label)
@@ -315,8 +344,8 @@ def _render_markdown(outline: Dict[str, Any]) -> str:
     # Key takeaways table
     takeaways = outline.get("key_takeaways") or []
     if takeaways:
-        parts.append("## Key Takeaways\n")
-        parts.append("| Point | Details |")
+        parts.append(f"## {labels['takeaways']}\n")
+        parts.append(f"| {labels['point']} | {labels['details']} |")
         parts.append("| --- | --- |")
         for t in takeaways:
             point = (t.get("point") or "").replace("|", "\\|")
@@ -344,7 +373,7 @@ def _render_markdown(outline: Dict[str, Any]) -> str:
     # FAQ
     faq = outline.get("faq") or []
     if faq:
-        parts.append("## Frequently Asked Questions\n")
+        parts.append(f"## {labels['faq']}\n")
         for entry in faq:
             q = entry.get("q") or ""
             a = entry.get("a") or ""
@@ -410,6 +439,9 @@ async def generate_premium_article(
     tenant_id: str = "default",
     word_count_target: int = 2000,
     inline_image_slots: Optional[int] = None,
+    language: Optional[str] = None,
+    brand_name: str = "",
+    site_domain: str = "",
 ) -> Dict[str, Any]:
     """Generate a fully-structured article and return a payload ready to
     persist into ``content_pieces``.
@@ -446,14 +478,40 @@ async def generate_premium_article(
     """
     inline_slots = settings.PREMIUM_ARTICLE_INLINE_IMAGES if inline_image_slots is None else inline_image_slots
 
+    # Language, brand and domain are per-site. Callers that already hold a
+    # TenantConfig pass them in; anyone else resolves them here so a direct
+    # call still writes in the site's own language instead of English.
+    if language is None or not brand_name or not site_domain:
+        try:
+            from shared.tenant import get_tenant_config
+            cfg = await get_tenant_config(tenant_id)
+            if language is None:
+                language = cfg.language
+            brand_name = brand_name or cfg.brand_name
+            site_domain = site_domain or cfg.domain
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Tenant config load failed for %s (%s)", tenant_id, exc)
+    language = language or "en"
+
     # Load tenant brand voice so the article inherits the company tone
-    # instead of a generic SEO-writer voice. Fall back to Successifier
-    # defaults if the tenant has no voice row yet.
+    # instead of a generic SEO-writer voice.
+    #
+    # A missing voice row must NOT fall back to BrandVoice.for_tenant("default"):
+    # that is the Successifier profile, so every other site (supportifier.se,
+    # a customer's own domain) was being written with Successifier's messaging
+    # pillars, persona and proof points ("$79/month", "14-day free trial").
+    # The neutral base prompt is the correct fallback — generic, but never
+    # another brand's copy.
     voice: Optional[TenantBrandVoice]
     try:
         voice = BrandVoice.for_tenant(tenant_id)
     except BrandVoiceNotFoundError:
-        voice = BrandVoice.for_tenant("default")
+        logger.info(
+            "No brand voice row for tenant=%s; using the neutral writer prompt "
+            "(run brand_voice_scraper to give this site its own voice)",
+            tenant_id,
+        )
+        voice = None
     except Exception as exc:  # noqa: BLE001
         logger.info("Brand voice load failed (%s); using base prompt", exc)
         voice = None
@@ -467,12 +525,13 @@ async def generate_premium_article(
         pillar=pillar,
         word_count_target=word_count_target,
         inline_image_slots=inline_slots,
+        language=language,
     )
     message = await asyncio.to_thread(
         client.messages.create,
         model=settings.CLAUDE_MODEL,
         max_tokens=8000,
-        system=_build_outline_system(voice),
+        system=_build_outline_system(voice, language=language, brand_name=brand_name),
         messages=[{"role": "user", "content": user_prompt}],
     )
     raw = message.content[0].text
@@ -551,7 +610,7 @@ async def generate_premium_article(
         external_inserted += n_ext
 
     # 4. Final markdown ──────────────────────────────────────────────────
-    markdown = BrandVoice.cleanup_ai_tells(_render_markdown(outline))
+    markdown = BrandVoice.cleanup_ai_tells(_render_markdown(outline, language))
     word_count = len(re.findall(r"\b\w+\b", markdown))
 
     # 5. Score ───────────────────────────────────────────────────────────
@@ -563,10 +622,14 @@ async def generate_premium_article(
         key_takeaways=outline.get("key_takeaways"),
         faq=outline.get("faq"),
         image_count=image_count,
-        internal_domain=settings.SUCCESSIFIER_DOMAIN,
+        # This site's own domain — scoring every tenant against
+        # settings.SUCCESSIFIER_DOMAIN meant a site's real internal links
+        # counted as external and its score was penalised.
+        internal_domain=site_domain or settings.SUCCESSIFIER_DOMAIN,
     )
 
     article_data = {
+        "language": language,
         "primary_keyword": outline.get("primary_keyword", ""),
         "secondary_keywords": outline.get("secondary_keywords", []),
         "intro_md": outline.get("intro_md", ""),
@@ -588,6 +651,7 @@ async def generate_premium_article(
     return {
         "title": outline["title"],
         "slug": outline["slug"],
+        "language": language,
         "meta_title": outline.get("meta_title", outline["title"])[:60],
         "meta_description": outline.get("meta_description", ""),
         "content": markdown,

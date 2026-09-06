@@ -16,6 +16,7 @@ from typing import Any, Dict
 from anthropic import Anthropic
 
 from shared.config import settings
+from shared.language import language_instruction, language_name
 from .brand_voice import BrandVoice, TenantBrandVoice
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,13 @@ async def generate_for_article(
     article_summary: str,
     platform: str,
     link_placeholder: str = "{{ARTICLE_URL}}",
+    language: str = "en",
 ) -> Dict[str, Any]:
-    """Generate a platform-specific social post for `article`. Returns {content, platform}."""
+    """Generate a platform-specific social post for `article`. Returns {content, platform}.
+
+    ``language`` is the site's own content language: a post promoting a Swedish
+    article has to be Swedish too, or the site's social feed ends up bilingual.
+    """
     platform = (platform or "").lower().strip()
     if platform not in _PLATFORM_INSTRUCTIONS:
         raise ValueError(f"unsupported platform: {platform}")
@@ -66,6 +72,10 @@ async def generate_for_article(
 
     system_prompt = voice.get_system_prompt(f"social_{platform}", brand_name=brand_name)
     instruction = _PLATFORM_INSTRUCTIONS[platform]
+    _directive = language_instruction(language)
+    _lang_line = f"Write the post in {language_name(language)}.\n" if _directive else ""
+    if _directive:
+        system_prompt = f"{system_prompt}\n\n---\n\n{_directive}"
 
     user_prompt = f"""You're going to promote a new article on {platform}.
 
@@ -77,7 +87,7 @@ Instructions: {instruction}
 
 Return ONLY the post text -- no JSON, no markdown headings, no commentary, no quotation marks around the whole post. Use {link_placeholder} as the placeholder for the article URL; the real URL will be substituted before sending.
 Reminder: NEVER use em-dashes. Use a comma or period instead.
-"""
+{_lang_line}"""
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
     def _call():

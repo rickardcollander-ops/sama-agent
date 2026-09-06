@@ -266,7 +266,8 @@ async def _run_weekly_content_analysis():
 
 async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, Any]) -> Dict[str, int]:
     from api.routes.content_analyze_ooda import run_content_analysis_with_ooda
-    from shared.database import get_supabase
+    from shared.database import get_supabase, insert_content_piece
+    from shared.language import language_instruction, language_name
     from shared.llm import call_claude
     from shared.publishing import heuristic_checks
 
@@ -325,45 +326,80 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
         except Exception as e:
             logger.warning(f"[autopilot {tenant_id}] analyze failed: {e}")
 
+    # ── Site context ──────────────────────────────────────────────────────
+    # Resolved before the generation try-block, not inside it: the drafting
+    # stage further down reads brand, language and client too, so a failure in
+    # idea generation used to leave those names unbound and take drafting down
+    # with it.
+    from shared.config import settings as _settings
+    import anthropic
+    import json as _json
+
+    # Content is keyed by site_id, so the brand profile lives in user_sites
+    # (per-site), NOT user_settings (per-user). For a secondary site
+    # (site_id != user_id) the old user_settings lookup returned nothing, so
+    # generation ran with an empty brand and drifted to the wrong domain
+    # (e.g. a consultancy got Customer-Success topics). Read the site row
+    # first, then fall back to the owner's user_settings for primary/legacy
+    # sites.
+    brand = {}
     try:
-        from shared.config import settings as _settings
-        import anthropic
-        ideas_count = max(1, min(int(ap_cfg.get("ideas_per_run", 6)), 12))
-
-        # Content is keyed by site_id, so the brand profile lives in user_sites
-        # (per-site), NOT user_settings (per-user). For a secondary site
-        # (site_id != user_id) the old user_settings lookup returned nothing, so
-        # generation ran with an empty brand and drifted to the wrong domain
-        # (e.g. a consultancy got Customer-Success topics). Read the site row
-        # first, then fall back to the owner's user_settings for primary/legacy
-        # sites.
-        brand = {}
+        site_row = await run_db(lambda: (
+            sb.table("user_sites").select("user_id,settings").eq("id", tenant_id).single().execute()
+        ))
+        site_settings = (site_row.data or {}).get("settings") or {}
+        if site_settings.get("brand_name"):
+            brand = site_settings
+        else:
+            owner_id = (site_row.data or {}).get("user_id") or tenant_id
+            us = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", owner_id).single().execute())
+            brand = (us.data or {}).get("settings") or {}
+    except Exception:
         try:
-            site_row = await run_db(lambda: (
-                sb.table("user_sites").select("user_id,settings").eq("id", tenant_id).single().execute()
-            ))
-            site_settings = (site_row.data or {}).get("settings") or {}
-            if site_settings.get("brand_name"):
-                brand = site_settings
-            else:
-                owner_id = (site_row.data or {}).get("user_id") or tenant_id
-                us = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", owner_id).single().execute())
-                brand = (us.data or {}).get("settings") or {}
+            us = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute())
+            brand = (us.data or {}).get("settings") or {}
         except Exception:
-            try:
-                us = await run_db(lambda: sb.table("user_settings").select("settings").eq("user_id", tenant_id).single().execute())
-                brand = (us.data or {}).get("settings") or {}
-            except Exception:
-                brand = {}
+            brand = {}
 
+    # Language is per-site too, and it was the one piece of brand context
+    # nothing on this path ever used: every autopilot run wrote English, so a
+    # .se site got English articles while its onboarding plan (which does
+    # honour the language) was Swedish. TenantConfig resolves
+    # settings.content_language and falls back to the domain's country-code
+    # TLD, so ".se" gives Swedish even before the field is filled in.
+    language = "en"
+    site_domain = str(brand.get("domain") or "")
+    try:
+        from shared.tenant import get_tenant_config
+        tcfg = await get_tenant_config(tenant_id)
+        language = tcfg.language
+        site_domain = site_domain or tcfg.domain
+    except Exception as e:
+        logger.warning(f"[autopilot {tenant_id}] language lookup failed: {e}")
+    lang_directive = language_instruction(language)
+
+    # Constructing the client raises when ANTHROPIC_API_KEY is unset. It used to
+    # sit inside the generation try-block, so keep that failure contained: the
+    # run reports nothing generated rather than propagating out of the autopilot.
+    try:
         client = anthropic.Anthropic(api_key=_settings.ANTHROPIC_API_KEY)
+    except Exception as e:
+        logger.error(f"[autopilot {tenant_id}] no LLM client: {e}")
+        return {**stats, "skipped": True, "reason": "llm_client_unavailable"}
+
+    try:
+        ideas_count = max(1, min(int(ap_cfg.get("ideas_per_run", 6)), 12))
         prompt = (
-            f"You are a B2B SaaS content strategist. Generate {ideas_count} content ideas.\n"
+            f"You are a content strategist. Generate {ideas_count} content ideas.\n"
             f"Brand: {brand.get('brand_name','')}\n"
             f"Description: {brand.get('brand_description','')}\n"
             f"Audience: {brand.get('target_audience','')}\n"
             f"Mix: 60% blog_article, 25% linkedin_post, 15% email.\n"
-            'Return ONLY a JSON array of objects {title, topic, content_type, target_keyword, pillar, priority, reason}.'
+            f"Every idea must be about what this brand actually sells; do not drift "
+            f"to a neighbouring industry.\n"
+            + (f"{lang_directive}\nTitles, topics, target keywords and pillars must all be "
+               f"in {language_name(language)}.\n" if lang_directive else "")
+            + 'Return ONLY a JSON array of objects {title, topic, content_type, target_keyword, pillar, priority, reason}.'
         )
         # Route through call_claude so the (otherwise blocking) sync SDK call is
         # offloaded to a thread — without this the worker's whole event loop is
@@ -376,7 +412,6 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
             messages=[{"role": "user", "content": prompt}],
             tenant_id=tenant_id,
         )
-        import json as _json
         text = msg.content[0].text.strip()
         try:
             ideas = _json.loads(text)
@@ -443,6 +478,9 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             primary_keyword=item.get("target_keyword") or "",
                             pillar=item.get("pillar") or "",
                             tenant_id=tenant_id,
+                            language=language,
+                            brand_name=str(brand.get("brand_name") or ""),
+                            site_domain=site_domain,
                         )
                         piece_data = {
                             "tenant_id": tenant_id,
@@ -458,6 +496,7 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             "featured_image_alt": article.get("featured_image_alt"),
                             "article_score": article.get("article_score"),
                             "article_data": article.get("article_data"),
+                            "language": language,
                             "status": "draft",
                         }
                     else:
@@ -467,7 +506,8 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             f"Title: {item.get('title','')}\nTopic: {item.get('topic','')}\n"
                             f"Target keyword: {item.get('target_keyword','')}\n"
                             f"Pillar: {item.get('pillar','')}\nLength: {target_words}.\n"
-                            'Return ONLY a JSON object {title, content, meta_title, meta_description, word_count}.'
+                            + (f"{lang_directive}\n" if lang_directive else "")
+                            + 'Return ONLY a JSON object {title, content, meta_title, meta_description, word_count}.'
                         )
                         m = await call_claude(
                             client=client,
@@ -490,9 +530,10 @@ async def _run_content_autopilot_for_tenant(tenant_id: str, ap_cfg: Dict[str, An
                             "meta_description": article.get("meta_description") or "",
                             "target_keyword": item.get("target_keyword") or "",
                             "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+                            "language": language,
                             "status": "draft",
                         }
-                    inserted = await run_db(lambda: sb.table("content_pieces").insert(piece_data).execute())
+                    inserted = await insert_content_piece(sb, piece_data)
                     piece = (inserted.data or [{}])[0]
                     piece_id = piece.get("id")
                     plan_update = {"status": "draft", "content_piece_id": piece_id}

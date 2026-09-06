@@ -85,6 +85,32 @@ Intent: generate a batch of ideas and draft the best ones for manual review.
 > date. A fully-automatic piece auto-publishes on that date; a review-first piece
 > publishes within ~5 min of approval.
 
+### Per-site language and brand voice
+
+Every tenant is one **site**, and each site has its own language and its own
+brand. The generation paths honour both:
+
+* **Language** comes from `TenantConfig.language` — `user_sites.settings.content_language`
+  first, then the domain's country-code TLD (`.se` → `sv`, `.no` → `nb`, `.dk` → `da`),
+  then `"en"`. So `supportifier.se` writes Swedish before anyone opens the
+  language selector. `shared/language.py` holds the prompt directive
+  (`language_instruction`), the readable name for prompts (`language_name`),
+  the localized headings the renderer emits itself (`structural_labels` — table
+  of contents, key takeaways, FAQ), and a `slugify` that transliterates Nordic
+  letters instead of deleting them (`kundnöjdhet` → `kundnojdhet`, not
+  `kundnjdhet`).
+* The drafted `content_pieces` row records the language it was written in
+  (`migrations/2026_09_content_piece_language.sql`). Inserts go through
+  `shared.database.insert_content_piece`, which retries without the column if
+  the migration has not been applied yet.
+* **Brand voice** falls back to `BrandVoice.neutral(tenant_id)` when a site has
+  no `tenant_brand_voices` row. Never `BrandVoice.for_tenant("default")` — that
+  is Successifier's own profile (its messaging pillars, persona, and proof
+  points like "$79/month"), and using it for another site put one brand's
+  claims into another brand's articles.
+* Article scoring measures internal links against **the site's own domain**,
+  not `settings.SUCCESSIFIER_DOMAIN`.
+
 ### Ops scripts
 
 | Script | Purpose |
