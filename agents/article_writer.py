@@ -507,11 +507,14 @@ async def generate_premium_article(
         voice = BrandVoice.for_tenant(tenant_id)
     except BrandVoiceNotFoundError:
         logger.info(
-            "No brand voice row for tenant=%s; using the neutral writer prompt "
-            "(run brand_voice_scraper to give this site its own voice)",
+            "No brand voice row for tenant=%s; using the neutral voice "
+            "(run brand_voice_scraper to give this site its own)",
             tenant_id,
         )
-        voice = None
+        # The neutral voice still carries this site's brand name and the
+        # craft rules; only the base prompt would leave the model writing
+        # for nobody in particular.
+        voice = BrandVoice.neutral(tenant_id)
     except Exception as exc:  # noqa: BLE001
         logger.info("Brand voice load failed (%s); using base prompt", exc)
         voice = None
