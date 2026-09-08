@@ -285,19 +285,41 @@ def _resolve_autopilot_cfg(tenant_id: str, params: Optional[dict]) -> dict:
     """Merge request-body params over the tenant's saved content_autopilot
     settings, falling back to the cron-contract defaults. The resulting dict
     uses the same keys that ``_run_content_autopilot_for_tenant`` reads."""
+    # Autopilot config is per SITE. tenant_id here is the site id, and the
+    # dashboard's autopilot panel writes to user_sites.settings — so the old
+    # user_settings lookup only ever matched the primary site (where
+    # site_id == user_id) and every secondary site silently fell back to the
+    # hard-coded defaults. Read user_sites first, then the owner's
+    # user_settings for legacy single-site installs.
+    sb = get_supabase()
     saved = {}
+    owner_id = None
     try:
         row = (
-            get_supabase()
-            .table("user_settings")
-            .select("settings")
-            .eq("user_id", tenant_id)
+            sb.table("user_sites")
+            .select("user_id,settings")
+            .eq("id", tenant_id)
             .single()
             .execute()
         )
-        saved = ((row.data or {}).get("settings") or {}).get("content_autopilot") or {}
+        site_settings = (row.data or {}).get("settings") or {}
+        owner_id = (row.data or {}).get("user_id")
+        saved = site_settings.get("content_autopilot") or {}
     except Exception:
         saved = {}
+
+    if not saved:
+        try:
+            row = (
+                sb.table("user_settings")
+                .select("settings")
+                .eq("user_id", owner_id or tenant_id)
+                .single()
+                .execute()
+            )
+            saved = ((row.data or {}).get("settings") or {}).get("content_autopilot") or {}
+        except Exception:
+            saved = {}
 
     p = params or {}
 

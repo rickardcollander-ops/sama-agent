@@ -901,8 +901,27 @@ async def _materialise_social_child(
 
     sb.table("content_plan_items").update({"status": "drafting"}).eq("id", child_id).execute()
 
-    voice = BrandVoice.for_tenant("default")
-    brand_name = parent_piece.get("title") and tenant_id or tenant_id
+    # Per-site voice, brand and language. The previous code used
+    # BrandVoice.for_tenant("default") — Successifier's own profile — for every
+    # tenant, and passed the tenant UUID as the brand name, so a social post for
+    # any other site was written as Successifier and addressed to nobody.
+    from agents.brand_voice import BrandVoiceNotFoundError
+    from shared.tenant import get_tenant_config
+
+    try:
+        voice = BrandVoice.for_tenant(tenant_id)
+    except BrandVoiceNotFoundError:
+        voice = BrandVoice.neutral(tenant_id)
+
+    brand_name = ""
+    language = "en"
+    try:
+        tcfg = await get_tenant_config(tenant_id)
+        brand_name = tcfg.brand_name
+        language = tcfg.language
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"_materialise_social_child: tenant config load failed: {e}")
+
     social = await generate_for_article(
         tenant_id=tenant_id,
         voice=voice,
@@ -911,6 +930,7 @@ async def _materialise_social_child(
         article_summary=(parent_piece.get("content") or "")[:1500],
         platform=platform,
         link_placeholder="{{ARTICLE_URL}}",
+        language=language,
     )
 
     body = social.get("content") or ""
@@ -951,6 +971,18 @@ async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[st
 
     ctype = item.get("content_type") or "blog_article"
 
+    # The site's own language. Content is keyed per site, and a .se site writes
+    # Swedish while a .com site writes English; without this every manually
+    # drafted short-form piece came out in English regardless.
+    from shared.language import language_instruction, language_name
+    from shared.tenant import get_tenant_config
+    try:
+        _tcfg = await get_tenant_config(tenant_id)
+        piece_language = _tcfg.language
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"_materialise_idea: tenant config load failed: {exc}")
+        piece_language = "en"
+
     # Long-form articles go through the structured "premium" writer (TOC,
     # key takeaways, FAQ, hybrid imagery, internal/external link
     # injection, scored). Other content types still use the lightweight
@@ -964,6 +996,7 @@ async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[st
                 primary_keyword=item.get("target_keyword") or "",
                 pillar=item.get("pillar") or "",
                 tenant_id=tenant_id,
+                language=piece_language,
             )
         except Exception as exc:
             logger.error(
@@ -985,6 +1018,7 @@ async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[st
             "featured_image_alt": article.get("featured_image_alt"),
             "article_score": article.get("article_score"),
             "article_data": article.get("article_data"),
+            "language": piece_language,
             "status": "draft",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -995,13 +1029,15 @@ async def _materialise_idea(sb, tenant_id: str, item: Dict[str, Any]) -> Dict[st
             "120-180 words" if ctype == "linkedin_post" else
             "300-500 words"
         )
-        prompt = f"""You are an expert B2B SaaS marketer. Write a {ctype.replace('_', ' ')}.
+        _lang_directive = language_instruction(piece_language)
+        prompt = f"""You are an expert marketer. Write a {ctype.replace('_', ' ')}.
 
 Title: {item.get('title') or ''}
 Topic: {item.get('topic') or ''}
 Target keyword: {item.get('target_keyword') or ''}
 Pillar: {item.get('pillar') or ''}
 Length: {target_words}.
+{_lang_directive}
 
 Return ONLY a JSON object (no markdown fences):
 {{
@@ -1039,11 +1075,15 @@ Return ONLY a JSON object (no markdown fences):
             "meta_description": article.get("meta_description") or "",
             "target_keyword": item.get("target_keyword") or "",
             "word_count": int(article.get("word_count") or len((article.get("content") or "").split())),
+            "language": piece_language,
             "status": "draft",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    piece_result = sb.table("content_pieces").insert(piece_data).execute()
+    # Tolerant insert: falls back to a language-less row if the database has
+    # not yet run migrations/2026_09_content_piece_language.sql.
+    from shared.database import insert_content_piece
+    piece_result = await insert_content_piece(sb, piece_data)
     piece = (piece_result.data or [{}])[0]
     piece_id = piece.get("id")
 

@@ -443,6 +443,40 @@ FACEBOOK POST REQUIREMENTS:
         return TenantBrandVoice(tenant_id=tenant_id, voice_json=result.data["voice_json"] or {})
 
     @classmethod
+    def neutral(cls, tenant_id: str) -> "TenantBrandVoice":
+        """A brand-agnostic voice for a site that has no voice row yet.
+
+        This is the correct fallback for a real tenant. ``for_tenant("default")``
+        is NOT: it returns the Successifier profile, so every site without its
+        own scraped voice was being written with Successifier's messaging
+        pillars, persona and proof points ("$79/month", "14-day free trial").
+        On a multi-site account — successifier.com, successifier.se and
+        supportifier.se under one owner — that put one brand's claims into
+        another brand's articles.
+
+        The neutral voice keeps the craft rules (tone guidance and the AI-tell
+        avoid list, which are brand-independent) and drops everything that
+        asserts anything about a specific company.
+        """
+        return TenantBrandVoice(
+            tenant_id=tenant_id,
+            voice_json={
+                "tone": {
+                    "overall": (
+                        "Professional but approachable. Expert without being "
+                        "academic. Confident without being arrogant."
+                    ),
+                    "do": list(cls.TONE["do"]),
+                    "dont": list(cls.TONE["dont"]),
+                },
+                "vocabulary": {"preferred": {}, "avoid": list(cls.AI_TELLS)},
+                "messaging_pillars": [],
+                "proof_points": {},
+                "target_persona": {},
+            },
+        )
+
+    @classmethod
     def _default_voice_dict(cls) -> Dict[str, Any]:
         return {
             "tone": {

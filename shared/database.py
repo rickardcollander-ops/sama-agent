@@ -224,3 +224,28 @@ class SupabaseDB:
 
 # Global DB helper
 db = SupabaseDB()
+
+
+async def insert_content_piece(sb, piece_data: dict):
+    """Insert a ``content_pieces`` row, tolerating a database that predates the
+    ``language`` column.
+
+    ``migrations/2026_09_content_piece_language.sql`` adds the column, but the
+    backend and the database are deployed separately. Sending ``language`` to a
+    database that has not run the migration would make PostgREST reject the
+    insert, so every draft would silently fail. Retry once without the column
+    instead: for long-form pieces the language is also inside ``article_data``,
+    and the dashboard still falls back to the site's ``content_language``.
+    """
+    try:
+        return await run_db(lambda: sb.table("content_pieces").insert(piece_data).execute())
+    except Exception as e:
+        if "language" not in str(e) or "language" not in piece_data:
+            raise
+        logger.warning(
+            "content_pieces.language column missing (%s); inserting without it. "
+            "Apply migrations/2026_09_content_piece_language.sql.",
+            e,
+        )
+        fallback = {k: v for k, v in piece_data.items() if k != "language"}
+        return await run_db(lambda: sb.table("content_pieces").insert(fallback).execute())

@@ -31,6 +31,7 @@ from anthropic import Anthropic
 
 from shared.config import settings
 from shared.database import get_supabase
+from shared.language import language_name
 from shared.tenant import get_tenant_config
 from .brand_voice import BrandVoice, BrandVoiceNotFoundError, TenantBrandVoice
 from . import brand_voice_scraper
@@ -42,33 +43,9 @@ SUPPORTED_PLATFORMS = {"linkedin", "x", "instagram", "facebook"}
 DEFAULT_WEEKDAY = 1  # Tuesday (Mon=0)
 MODEL = getattr(settings, "CLAUDE_MODEL", "claude-sonnet-4-6")
 
-# Maps the ISO-639-1 codes TenantConfig.language returns to a human-readable
-# name we can use in the LLM prompt. Anything not listed falls back to the
-# code itself so the model still knows which language to target.
-_LANGUAGE_NAMES: Dict[str, str] = {
-    "sv": "Swedish",
-    "nb": "Norwegian (Bokmål)",
-    "no": "Norwegian",
-    "da": "Danish",
-    "fi": "Finnish",
-    "de": "German",
-    "fr": "French",
-    "es": "Spanish",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pt": "Portuguese",
-    "pl": "Polish",
-    "cs": "Czech",
-    "ru": "Russian",
-    "ja": "Japanese",
-    "zh": "Chinese",
-    "en": "English",
-}
-
-
-def _language_name(code: str) -> str:
-    code = (code or "en").lower()
-    return _LANGUAGE_NAMES.get(code, code)
+# Human-readable language name for prompts. Shared with the article writer and
+# the autopilot so every generation path phrases the language the same way.
+_language_name = language_name
 
 
 async def _ensure_voice(tenant_id: str, domain: str, brand_name: str) -> TenantBrandVoice:
@@ -90,7 +67,7 @@ async def _ensure_voice(tenant_id: str, domain: str, brand_name: str) -> TenantB
             "using default voice",
             tenant_id,
         )
-        return BrandVoice.for_tenant("default")
+        return BrandVoice.neutral(tenant_id)
 
     logger.info(f"content_plan_creator: scraping voice for tenant={tenant_id}")
     try:
@@ -105,12 +82,12 @@ async def _ensure_voice(tenant_id: str, domain: str, brand_name: str) -> TenantB
             "(%s); falling back to default voice",
             tenant_id, e,
         )
-        return BrandVoice.for_tenant("default")
+        return BrandVoice.neutral(tenant_id)
 
     try:
         return BrandVoice.for_tenant(tenant_id)
     except BrandVoiceNotFoundError:
-        return BrandVoice.for_tenant("default")
+        return BrandVoice.neutral(tenant_id)
 
 
 def _load_tenant_brand_context(tenant_id: str) -> Dict[str, Any]:
@@ -837,13 +814,16 @@ async def create_plan_from_analysis(
     target_locations = list(tenant_config.target_locations) if tenant_config else []
 
     # 3. Voice for title generation. Use the tenant's own voice when one
-    # has been scraped/persisted; otherwise fall back to the default voice
+    # has been scraped/persisted; otherwise fall back to the NEUTRAL voice
     # (no scrape during plan creation -- that would slow it down too much).
-    # The full tone-matched draft still happens later, in _materialise_idea.
+    # Not the "default" voice: that is Successifier's own profile, and using
+    # it here put Successifier's pillars and proof points into other sites'
+    # titles. The full tone-matched draft still happens later, in
+    # _materialise_idea.
     try:
         voice = BrandVoice.for_tenant(tenant_id)
     except BrandVoiceNotFoundError:
-        voice = BrandVoice.for_tenant("default")
+        voice = BrandVoice.neutral(tenant_id)
 
     # 4. Extract + bucket topics. If the analysis surfaced no gaps (clean
     # audit, very narrow site, fresh onboarding), seed topics directly from
